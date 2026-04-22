@@ -1,7 +1,7 @@
 {
   "name": "minty",
-  "version": "0.1.0",
-  "description": "Privacy-first personal CRM — unifies WhatsApp, Gmail, LinkedIn, Telegram, and SMS locally on your machine.",
+  "version": "0.2.0",
+  "description": "Privacy-first personal CRM — unifies WhatsApp, Gmail, LinkedIn, Telegram, SMS, and Google Contacts locally. Surfaces who you should reach out to, and why.",
   "type": "commonjs",
   "license": "AGPL-3.0-only",
   "author": "Sree Sanakkayala",
@@ -16,13 +16,15 @@
   "keywords": [
     "crm",
     "personal-crm",
+    "prm",
     "self-hosted",
     "privacy",
     "whatsapp",
     "gmail",
     "linkedin",
     "telegram",
-    "relationship-intelligence"
+    "relationship-intelligence",
+    "network"
   ],
   "engines": {
     "node": ">=20"
@@ -39,7 +41,11 @@
     "stats": "node crm/query.js stats",
     "search": "node crm/query.js search",
     "review": "node crm/review-server.js",
-    "enrich": "node sources/apollo/enrich.js"
+    "enrich": "node sources/apollo/enrich.js",
+    "analyze": "node crm/analyze.js",
+    "digest": "node crm/digest.js",
+    "index": "node crm/index.js",
+    "test": "node --test tests/unit/schema.test.js tests/unit/utils.test.js tests/unit/scoring.test.js tests/unit/contact-index.test.js tests/unit/sync.test.js tests/unit/sync-utils.test.js tests/unit/health-ring.test.js tests/unit/goals.test.js tests/unit/reconnect.test.js tests/unit/calendar.test.js tests/unit/network-query.test.js tests/unit/staleness.test.js"
   },
   "dependencies": {
     "qrcode": "^1.5.4",

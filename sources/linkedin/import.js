@@ -16,7 +16,7 @@ const { parse } = require('csv-parse/sync');
 
 const EXPORT_DIR = process.env.LINKEDIN_EXPORT_DIR
     || path.join(__dirname, '../../data/linkedin/export');
-const OUT_DIR = path.join(__dirname, '../../data/linkedin');
+const OUT_DIR = process.env.LINKEDIN_OUT_DIR || path.join(__dirname, '../../data/linkedin');
 
 function readCsv(filename, opts = {}) {
     const filepath = path.join(EXPORT_DIR, filename);

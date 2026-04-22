@@ -29,7 +29,7 @@ const path = require('path');
 
 const EXPORT_DIR = process.env.SMS_EXPORT_DIR
     || path.join(__dirname, '../../data/sms/export');
-const OUT_DIR = path.join(__dirname, '../../data/sms');
+const OUT_DIR = process.env.SMS_OUT_DIR || path.join(__dirname, '../../data/sms');
 
 // type attribute: 1=received, 2=sent
 const TYPE_RECEIVED = '1';

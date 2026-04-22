@@ -16,7 +16,7 @@ const path = require('path');
 
 const TELEGRAM_EXPORT_FILE = process.env.TELEGRAM_EXPORT_FILE
     || path.join(__dirname, '../../data/telegram/export/result.json');
-const OUT_DIR = path.join(__dirname, '../../data/telegram');
+const OUT_DIR = process.env.TELEGRAM_OUT_DIR || path.join(__dirname, '../../data/telegram');
 
 function run() {
     if (!fs.existsSync(TELEGRAM_EXPORT_FILE)) {

@@ -71,10 +71,10 @@ For each candidate pair (one WhatsApp, one LinkedIn), reason over these signals:
 | Signal | Weight | Notes |
 |---|---|---|
 | Cleaned first name exact match | High | Case-insensitive |
-| Last name match (after cleaning) | High | Fuzzy ok — "Micheletti" vs "Micheletti 宁远" |
+| Last name match (after cleaning) | High | Fuzzy ok — "Rivera" vs "Rivera 山田" |
 | Phone country code matches LinkedIn location | Medium | +44 → UK, +91 → India, etc. |
-| LinkedIn company matches WhatsApp suffix | Medium | "Revolut" in WA name + Revolut on LinkedIn |
-| LinkedIn position matches context | Low | "UCL CS" → student at UCL → LinkedIn shows UCL |
+| LinkedIn company matches WhatsApp suffix | Medium | "Acme" in WA name + Acme on LinkedIn |
+| LinkedIn position matches context | Low | "Uni CS" → student at that uni → LinkedIn shows same uni |
 | First name is very common (Ali, James, Sara) | Negative | Lower confidence without corroborating signal |
 
 Classify each pair as:

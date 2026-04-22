@@ -2,6 +2,8 @@
  * Cross-source contact matching.
  * Follows crm/MATCHING.md — blocks by first name, scores pairs, writes match_overrides.json.
  *
+ * Covers: WhatsApp↔LinkedIn, LinkedIn↔SMS, LinkedIn↔GoogleContacts
+ *
  * Usage: node crm/match.js
  */
 
@@ -10,8 +12,9 @@
 const fs = require('fs');
 const path = require('path');
 
-const DATA = path.join(__dirname, '../data');
-const OVERRIDES_PATH = path.join(DATA, 'unified/match_overrides.json');
+const DATA = process.env.CRM_DATA_DIR || path.join(__dirname, '../data');
+const OUT_DIR = process.env.CRM_OUT_DIR || path.join(DATA, 'unified');
+const OVERRIDES_PATH = path.join(OUT_DIR, 'match_overrides.json');
 
 // Very common first names → lower confidence without corroboration
 const COMMON_NAMES = new Set([
@@ -36,7 +39,7 @@ const COMMON_NAMES = new Set([
     'ken', 'sid', 'vik', 'neil', 'neel', 'nik', 'nick',
 ]);
 
-// Institution / company abbreviations to strip from WA names
+// Institution / company abbreviations to strip from WA/GC/SMS names
 const INSTITUTION_ABBREVS = new Set([
     'ucl', 'mit', 'lse', 'nyu', 'iit', 'stanford', 'oxford', 'cambridge',
     'imperial', 'kcl', 'lbs', 'insead', 'hec', 'esade', 'ie',
@@ -55,25 +58,18 @@ const RELATION_WORDS = new Set([
 ]);
 
 /**
- * Strip WhatsApp nickname suffixes to recover the "real" name.
- * Returns { firstName, lastName, cleaned } where cleaned is first+last.
+ * Strip WhatsApp/GC/SMS nickname suffixes to recover the "real" name.
+ * Returns { firstName, lastName, cleaned }
  */
 function cleanWaName(name) {
     if (!name) return { firstName: null, lastName: null, cleaned: null };
 
-    // Remove parenthetical annotations: "(UCL)", "(SF, ABNB)", "(Billy)"
     let s = name.replace(/\(.*?\)/g, '').trim();
-
-    // Remove emoji at start
     s = s.replace(/^[\u{1F300}-\u{1FFFF}]+\s*/u, '').trim();
 
     const words = s.split(/\s+/).filter(Boolean);
     if (!words.length) return { firstName: null, lastName: null, cleaned: null };
 
-    // Keep stripping from the end while the last word is:
-    // - all-caps (likely abbreviation), length 1-6
-    // - known institution/company abbrev
-    // - a relation word
     let kept = [...words];
     while (kept.length > 1) {
         const last = kept[kept.length - 1].toLowerCase().replace(/[^a-z]/g, '');
@@ -89,7 +85,6 @@ function cleanWaName(name) {
         }
     }
 
-    // If only 1 word left, it's the first name
     const firstName = kept[0] ? kept[0].toLowerCase() : null;
     const lastName = kept.length > 1 ? kept.slice(1).join(' ').toLowerCase() : null;
     const cleaned = kept.join(' ').toLowerCase();
@@ -98,20 +93,16 @@ function cleanWaName(name) {
 }
 
 /**
- * Extract a clean first name from a LinkedIn name.
+ * Extract a clean first name from a LinkedIn/Email name.
  * Handles: "🦔 sam jones", "Alex Rivera 山田", "Jamie (JJ) Patel"
  */
 function cleanLiName(name) {
     if (!name) return { firstName: null, lastName: null, cleaned: null };
 
-    // Remove leading emoji
     let s = name.replace(/^[\u{1F300}-\u{1FFFF}\u{2600}-\u{26FF}]+\s*/u, '').trim();
 
-    // Remove parenthetical nickname: "(JJ)"
     let nickname = null;
     s = s.replace(/\(([^)]+)\)/g, (_, n) => { nickname = n.toLowerCase(); return ''; }).trim();
-
-    // Remove Chinese / CJK characters (they're aliases appended for context)
     s = s.replace(/[\u4E00-\u9FFF\u3400-\u4DBF]+/g, '').trim();
 
     const words = s.split(/\s+/).filter(Boolean);
@@ -124,7 +115,13 @@ function cleanLiName(name) {
     return { firstName, lastName, cleaned, nickname, words };
 }
 
-/** Levenshtein distance (simple) */
+/** Clean a name based on source type */
+function cleanBySource(name, sourceKey) {
+    if (sourceKey === 'linkedin' || sourceKey === 'email') return cleanLiName(name);
+    return cleanWaName(name); // whatsapp, sms, googleContacts
+}
+
+/** Levenshtein distance */
 function lev(a, b) {
     if (!a || !b) return 99;
     if (a === b) return 0;
@@ -147,115 +144,6 @@ function fuzzyMatch(a, b) {
     const dist = lev(a, b);
     const maxLen = Math.max(a.length, b.length);
     return dist <= Math.max(1, Math.floor(maxLen * 0.2));
-}
-
-/**
- * Score a (waContact, liContact) candidate pair.
- * Returns { score, confidence, reasons }
- */
-function scorePair(wa, li) {
-    const waClean = cleanWaName(wa.name);
-    const liClean = cleanLiName(li.name);
-
-    const reasons = [];
-    let score = 0;
-
-    // --- First name match ---
-    const waFirst = waClean.firstName;
-    const liFirst = liClean.firstName;
-    const liNick = liClean.nickname;
-
-    let firstMatch = false;
-    if (waFirst && liFirst) {
-        if (waFirst === liFirst) {
-            firstMatch = true;
-            reasons.push(`First name exact: '${waFirst}'`);
-            score += 40;
-        } else if (fuzzyMatch(waFirst, liFirst)) {
-            firstMatch = true;
-            reasons.push(`First name fuzzy: '${waFirst}' ~ '${liFirst}'`);
-            score += 30;
-        } else if (liNick && waFirst === liNick) {
-            firstMatch = true;
-            reasons.push(`WA first name matches LI nickname '${liNick}'`);
-            score += 35;
-        } else if (liNick && fuzzyMatch(waFirst, liNick)) {
-            firstMatch = true;
-            reasons.push(`WA first name fuzzy-matches LI nickname '${liNick}'`);
-            score += 25;
-        }
-    }
-
-    if (!firstMatch) return { score: 0, confidence: 'skip', reasons: ['First name mismatch'] };
-
-    // --- Last name match ---
-    const waLast = waClean.lastName;
-    const liLast = liClean.lastName;
-
-    if (waLast && liLast) {
-        if (waLast === liLast) {
-            reasons.push(`Last name exact: '${waLast}'`);
-            score += 40;
-        } else if (fuzzyMatch(waLast, liLast)) {
-            reasons.push(`Last name fuzzy: '${waLast}' ~ '${liLast}'`);
-            score += 30;
-        } else {
-            // Last name present on both sides but mismatch — negative signal
-            reasons.push(`Last name mismatch: '${waLast}' vs '${liLast}'`);
-            score -= 20;
-        }
-    } else if (waLast && !liLast) {
-        // WA has last name but LI doesn't — slight negative
-        score -= 5;
-    }
-
-    // --- Company/context match ---
-    const waOriginal = (wa.name || '').toLowerCase();
-    const liCompany = (li.sources.linkedin.company || '').toLowerCase();
-    const liPosition = (li.sources.linkedin.position || '').toLowerCase();
-
-    if (liCompany) {
-        // Check if any word of the company appears in WA name
-        const companyWords = liCompany.split(/[\s,\/&]+/).filter(w => w.length > 3);
-        for (const w of companyWords) {
-            if (waOriginal.includes(w)) {
-                reasons.push(`Company '${li.sources.linkedin.company}' appears in WA name`);
-                score += 20;
-                break;
-            }
-        }
-    }
-
-    // --- Phone country code vs. LI profile URL domain / position hints ---
-    // (No location field, but we can sometimes infer from position/company)
-    const waPhone = wa.phones && wa.phones[0];
-    if (waPhone) {
-        // +44 UK, +91 India, +1 US/CA, +90 Turkey, +971 UAE, etc.
-        // Check if position/company mentions a location consistent with phone prefix
-        const phoneCountry = inferCountryFromPhone(waPhone);
-        if (phoneCountry) {
-            const combinedLi = (liCompany + ' ' + liPosition).toLowerCase();
-            if (phoneCountry.keywords.some(kw => combinedLi.includes(kw))) {
-                reasons.push(`Phone prefix ${phoneCountry.code} consistent with LI context`);
-                score += 10;
-            }
-        }
-    }
-
-    // --- Common name penalty ---
-    if (waFirst && COMMON_NAMES.has(waFirst)) {
-        reasons.push(`Common first name '${waFirst}' — lower confidence without corroboration`);
-        score -= 15;
-    }
-
-    // --- Classify ---
-    let confidence;
-    if (score >= 70) confidence = 'confirmed';
-    else if (score >= 45) confidence = 'likely';
-    else if (score >= 20) confidence = 'possible';
-    else confidence = 'skip';
-
-    return { score, confidence, reasons };
 }
 
 function inferCountryFromPhone(phone) {
@@ -281,133 +169,334 @@ function inferCountryFromPhone(phone) {
     return null;
 }
 
-// --- Main ---
+/**
+ * Extract relevant fields from a contact for a given source.
+ */
+function getFields(contact, sourceKey) {
+    const src = contact.sources[sourceKey];
+    return {
+        name: contact.name,
+        phones: contact.phones || [],
+        emails: contact.emails || [],
+        company: (sourceKey === 'linkedin' ? src?.company :
+                  sourceKey === 'googleContacts' ? src?.org : null) || null,
+        position: sourceKey === 'linkedin' ? src?.position || null : null,
+        about: sourceKey === 'whatsapp' ? src?.about || null : null,
+        profileUrl: sourceKey === 'linkedin' ? src?.profileUrl || null : null,
+        phone: sourceKey === 'sms' ? src?.phone || null :
+               sourceKey === 'whatsapp' ? (src?.number ? `+${src.number}` : null) : null,
+    };
+}
 
-function run() {
-    console.log('Loading unified contacts...');
-    const contacts = JSON.parse(fs.readFileSync(path.join(DATA, 'unified/contacts.json'), 'utf8'));
+/**
+ * Generic pair scorer — works for any two sources.
+ * Both contacts must share a first name (blocking already done by caller).
+ */
+function scoreGenericPair(contactA, srcA, contactB, srcB) {
+    const cleanA = cleanBySource(contactA.name, srcA);
+    const cleanB = cleanBySource(contactB.name, srcB);
 
-    const waOnly = contacts.filter(c => c.sources.whatsapp && c.sources.linkedin === null && c.name);
-    const liOnly = contacts.filter(c => c.sources.linkedin && c.sources.whatsapp === null && c.name);
+    const reasons = [];
+    let score = 0;
 
-    console.log(`WA-only (named): ${waOnly.length}, LI-only (named): ${liOnly.length}`);
+    // --- First name match ---
+    const firstA = cleanA.firstName;
+    const firstB = cleanB.firstName;
+    const nickB = cleanB.nickname;
 
-    // Block by first name (first word, lowercased, after cleaning)
-    const liByFirst = {};
-    for (const li of liOnly) {
-        const { firstName, nickname } = cleanLiName(li.name);
+    let firstMatch = false;
+    if (firstA && firstB) {
+        if (firstA === firstB) {
+            firstMatch = true;
+            reasons.push(`First name exact: '${firstA}'`);
+            score += 40;
+        } else if (fuzzyMatch(firstA, firstB)) {
+            firstMatch = true;
+            reasons.push(`First name fuzzy: '${firstA}' ~ '${firstB}'`);
+            score += 30;
+        } else if (nickB && firstA === nickB) {
+            firstMatch = true;
+            reasons.push(`Name A matches nickname '${nickB}'`);
+            score += 35;
+        } else if (nickB && fuzzyMatch(firstA, nickB)) {
+            firstMatch = true;
+            reasons.push(`Name A fuzzy-matches nickname '${nickB}'`);
+            score += 25;
+        }
+    }
+
+    if (!firstMatch) return { score: 0, confidence: 'skip', reasons: ['First name mismatch'] };
+
+    // --- Last name match ---
+    const lastA = cleanA.lastName;
+    const lastB = cleanB.lastName;
+
+    if (lastA && lastB) {
+        if (lastA === lastB) {
+            reasons.push(`Last name exact: '${lastA}'`);
+            score += 40;
+        } else if (fuzzyMatch(lastA, lastB)) {
+            reasons.push(`Last name fuzzy: '${lastA}' ~ '${lastB}'`);
+            score += 30;
+        } else {
+            reasons.push(`Last name mismatch: '${lastA}' vs '${lastB}'`);
+            score -= 20;
+        }
+    } else if (lastA && !lastB) {
+        score -= 5;
+    }
+
+    // --- Company / org match ---
+    const fieldsA = getFields(contactA, srcA);
+    const fieldsB = getFields(contactB, srcB);
+    const compA = (fieldsA.company || '').toLowerCase();
+    const compB = (fieldsB.company || '').toLowerCase();
+
+    if (compA && compB) {
+        const wordsA = compA.split(/[\s,\/&]+/).filter(w => w.length > 3);
+        const wordsB = compB.split(/[\s,\/&]+/).filter(w => w.length > 3);
+        if (wordsA.some(w => compB.includes(w)) || wordsB.some(w => compA.includes(w))) {
+            reasons.push(`Company/org match: '${fieldsA.company}' ~ '${fieldsB.company}'`);
+            score += 25;
+        }
+    } else if (compA || compB) {
+        // One side has company — check if it appears in the other contact's raw name
+        const nameOther = ((compA ? contactB.name : contactA.name) || '').toLowerCase();
+        const comp = (compA || compB).toLowerCase();
+        const compWords = comp.split(/[\s,\/&]+/).filter(w => w.length > 3);
+        for (const w of compWords) {
+            if (nameOther.includes(w)) {
+                reasons.push(`Company '${compA || compB}' appears in other name`);
+                score += 20;
+                break;
+            }
+        }
+    }
+
+    // --- Phone country code vs LI context ---
+    const liFields = srcA === 'linkedin' ? fieldsA : (srcB === 'linkedin' ? fieldsB : null);
+    const nonLiFields = srcA !== 'linkedin' ? fieldsA : fieldsB;
+    const phone = nonLiFields?.phone || nonLiFields?.phones?.[0];
+
+    if (liFields && phone) {
+        const phoneCountry = inferCountryFromPhone(phone);
+        if (phoneCountry) {
+            const liContext = ((liFields.company || '') + ' ' + (liFields.position || '')).toLowerCase();
+            if (phoneCountry.keywords.some(kw => liContext.includes(kw))) {
+                reasons.push(`Phone prefix ${phoneCountry.code} consistent with LI context`);
+                score += 10;
+            }
+        }
+    }
+
+    // --- Common name penalty ---
+    if (firstA && COMMON_NAMES.has(firstA)) {
+        reasons.push(`Common first name '${firstA}' — lower confidence without corroboration`);
+        score -= 15;
+    }
+
+    let confidence;
+    if (score >= 70) confidence = 'confirmed';
+    else if (score >= 45) confidence = 'likely';
+    else if (score >= 20) confidence = 'possible';
+    else confidence = 'skip';
+
+    return { score, confidence, reasons };
+}
+
+/**
+ * Original WA↔LI scorer — kept for backward compat with existing override entries.
+ * Delegates to scoreGenericPair.
+ */
+function scorePair(wa, li) {
+    return scoreGenericPair(wa, 'whatsapp', li, 'linkedin');
+}
+
+/**
+ * Match two groups of contacts (each lacking the other's source) by first name.
+ * Returns array of match objects with confidence/score/reasons/sourceA/sourceB.
+ */
+function matchGroups(groupA, srcA, groupB, srcB, locationById = {}) {
+    // Build blocking index for group B by first name
+    const bByFirst = {};
+    for (const b of groupB) {
+        const { firstName, nickname } = cleanBySource(b.name, srcB);
         const keys = new Set();
         if (firstName) keys.add(firstName);
         if (nickname) keys.add(nickname);
         for (const key of keys) {
-            if (!liByFirst[key]) liByFirst[key] = [];
-            liByFirst[key].push(li);
+            if (!bByFirst[key]) bByFirst[key] = [];
+            bByFirst[key].push(b);
         }
     }
 
-    // Load existing overrides. IDs are now stable so we can use them directly for dedup.
-    // Existing decisions (skip/unsure/confirmed/likely) are preserved — only new pairs are added.
+    let candidatePairs = 0;
+    const allMatches = [];
+
+    for (const a of groupA) {
+        const { firstName } = cleanBySource(a.name, srcA);
+        if (!firstName || firstName.length < 2) continue;
+
+        const candidates = bByFirst[firstName] || [];
+        for (const b of candidates) {
+            candidatePairs++;
+            const { score: baseScore, confidence: baseConf, reasons } = scoreGenericPair(a, srcA, b, srcB);
+            if (baseConf === 'skip') continue;
+
+            // Location bonus: if both contacts have inferred city and they agree, boost score
+            let score = baseScore;
+            const locA = locationById[a.id];
+            const locB = locationById[b.id];
+            if (locA && locB) {
+                if (locA === locB) {
+                    reasons.push(`Location match: both ${locA}`);
+                    score += 15;
+                } else {
+                    // Confirmed different countries → strong negative signal
+                    reasons.push(`Location mismatch: ${locA} vs ${locB}`);
+                    score -= 25;
+                }
+            }
+
+            let confidence;
+            if (score >= 70) confidence = 'confirmed';
+            else if (score >= 45) confidence = 'likely';
+            else if (score >= 20) confidence = 'possible';
+            else confidence = 'skip';
+            if (confidence === 'skip') continue;
+
+            allMatches.push({ confidence, score, aId: a.id, bId: b.id, aName: a.name, bName: b.name, reason: reasons.join('; '), sourceA: srcA, sourceB: srcB });
+        }
+    }
+
+    // Keep best match per A contact
+    const byA = {};
+    for (const m of allMatches) {
+        if (!byA[m.aId] || byA[m.aId].score < m.score) byA[m.aId] = m;
+    }
+
+    // Per B contact: keep matches within 15 score points of the best
+    const byB = {};
+    for (const m of Object.values(byA)) {
+        if (!byB[m.bId]) byB[m.bId] = [];
+        byB[m.bId].push(m);
+    }
+
+    const deduped = [];
+    for (const bMatches of Object.values(byB)) {
+        bMatches.sort((a, b) => b.score - a.score);
+        const best = bMatches[0].score;
+        for (const m of bMatches) {
+            if (best - m.score <= 15) deduped.push(m);
+        }
+    }
+
+    return { matches: deduped, candidatePairs };
+}
+
+// --- Main ---
+
+function run() {
+    console.log('Loading unified contacts...');
+    let contacts = JSON.parse(fs.readFileSync(path.join(OUT_DIR, 'contacts.json'), 'utf8'));
+
+    // Exclude the user's own contact(s)
+    const usersJsonPath = path.join(__dirname, '../data/users.json');
+    if (fs.existsSync(usersJsonPath)) {
+        const users = JSON.parse(fs.readFileSync(usersJsonPath, 'utf8'));
+        const selfIds = new Set(Object.values(users).flatMap(u => u.selfIds || []));
+        if (selfIds.size) {
+            const before = contacts.length;
+            contacts = contacts.filter(c => !selfIds.has(c.id));
+            if (before !== contacts.length) console.log(`Excluded ${before - contacts.length} self-contact(s)`);
+        }
+    }
+
+    // Load inferred location from query-index (built by npm run index)
+    let locationById = {};
+    const qiPath = path.join(OUT_DIR, 'query-index.json');
+    if (fs.existsSync(qiPath)) {
+        const qi = JSON.parse(fs.readFileSync(qiPath, 'utf8'));
+        for (const entry of qi) {
+            if (entry.id && entry.city) locationById[entry.id] = entry.city;
+        }
+        console.log(`Loaded location for ${Object.keys(locationById).length} contacts from query-index`);
+    }
+
+    // Load existing overrides
     let existing = [];
     if (fs.existsSync(OVERRIDES_PATH)) {
         existing = JSON.parse(fs.readFileSync(OVERRIDES_PATH, 'utf8'));
     }
     const existingPairs = new Set(existing.map(o => o.ids.slice().sort().join('|')));
 
-    // Score all candidate pairs
-    let candidatePairs = 0;
-    const allMatches = [];
+    const allNew = [];
 
-    for (const wa of waOnly) {
-        const { firstName } = cleanWaName(wa.name);
-        if (!firstName || firstName.length < 2) continue;
-
-        const candidates = liByFirst[firstName] || [];
-        for (const li of candidates) {
-            candidatePairs++;
-            const { score, confidence, reasons } = scorePair(wa, li);
-            if (confidence === 'skip') continue;
-            allMatches.push({
-                confidence,
-                score,
-                waId: wa.id,
-                liId: li.id,
-                waName: wa.name,
-                liName: li.name,
-                reason: reasons.join('; '),
-            });
-        }
+    // --- WhatsApp ↔ LinkedIn ---
+    {
+        const waOnly = contacts.filter(c => c.sources.whatsapp && c.sources.linkedin === null && c.name && !c.isGroup);
+        const liOnly = contacts.filter(c => c.sources.linkedin && c.sources.whatsapp === null && c.name && !c.isGroup);
+        console.log(`WA-only: ${waOnly.length}, LI-only: ${liOnly.length}`);
+        const { matches, candidatePairs } = matchGroups(waOnly, 'whatsapp', liOnly, 'linkedin', locationById);
+        console.log(`  WA↔LI candidate pairs: ${candidatePairs}, matches: ${matches.length}`);
+        allNew.push(...matches);
     }
 
-    // For each WA contact, keep only the best LI match.
-    // Exception: WA duplicates (same name, different IDs) may both map to the same LI contact.
-    const byWa = {};
-    for (const m of allMatches) {
-        if (!byWa[m.waId] || byWa[m.waId].score < m.score) {
-            byWa[m.waId] = m;
-        }
+    // --- LinkedIn ↔ SMS ---
+    {
+        const liNoSms = contacts.filter(c => c.sources.linkedin && !c.sources.sms && !c.sources.whatsapp && c.name && !c.isGroup);
+        const smsNoLi = contacts.filter(c => c.sources.sms && !c.sources.linkedin && !c.sources.whatsapp && c.name && !c.isGroup);
+        console.log(`LI-no-SMS: ${liNoSms.length}, SMS-no-LI: ${smsNoLi.length}`);
+        const { matches, candidatePairs } = matchGroups(liNoSms, 'linkedin', smsNoLi, 'sms', locationById);
+        console.log(`  LI↔SMS candidate pairs: ${candidatePairs}, matches: ${matches.length}`);
+        allNew.push(...matches);
     }
 
-    // For each LI contact that has multiple WA matches, keep only matches within
-    // 15 score points of the best (likely genuine WA duplicates of the same person).
-    // Drop clearly inferior WA matches (likely false positives sharing only a first name).
-    const byLi = {};
-    for (const m of Object.values(byWa)) {
-        if (!byLi[m.liId]) byLi[m.liId] = [];
-        byLi[m.liId].push(m);
+    // --- LinkedIn ↔ Google Contacts ---
+    {
+        const liNoGc = contacts.filter(c => c.sources.linkedin && !c.sources.googleContacts && !c.sources.whatsapp && !c.sources.sms && c.name && !c.isGroup);
+        const gcNoLi = contacts.filter(c => c.sources.googleContacts && !c.sources.linkedin && !c.sources.whatsapp && !c.sources.sms && c.name && !c.isGroup);
+        console.log(`LI-no-GC: ${liNoGc.length}, GC-no-LI: ${gcNoLi.length}`);
+        const { matches, candidatePairs } = matchGroups(liNoGc, 'linkedin', gcNoLi, 'googleContacts', locationById);
+        console.log(`  LI↔GC candidate pairs: ${candidatePairs}, matches: ${matches.length}`);
+        allNew.push(...matches);
     }
 
-    const dedupedMatches = [];
-    for (const liMatches of Object.values(byLi)) {
-        liMatches.sort((a, b) => b.score - a.score);
-        const best = liMatches[0];
-        for (const m of liMatches) {
-            if (best.score - m.score <= 15) dedupedMatches.push(m);
-        }
-    }
-
-    // Filter out pairs that already have a decision
-    const newMatches = dedupedMatches.filter(m => {
-        const pairKey = [m.waId, m.liId].sort().join('|');
+    // Filter out already-decided pairs
+    const newMatches = allNew.filter(m => {
+        const pairKey = [m.aId, m.bId].sort().join('|');
         return !existingPairs.has(pairKey);
     });
 
-    console.log(`Candidate pairs evaluated: ${candidatePairs}`);
-    console.log(`New matches found: ${newMatches.length}`);
-
-    // Sort by score desc for readability
     newMatches.sort((a, b) => b.score - a.score);
 
     const summary = { confirmed: 0, likely: 0, possible: 0 };
-    for (const m of newMatches) {
-        if (m.confidence in summary) summary[m.confidence]++;
-    }
-    console.log(`  confirmed: ${summary.confirmed}, likely: ${summary.likely}, possible: ${summary.possible}`);
+    for (const m of newMatches) { if (m.confidence in summary) summary[m.confidence]++; }
+    console.log(`\nNew matches: ${newMatches.length} (confirmed: ${summary.confirmed}, likely: ${summary.likely}, possible: ${summary.possible})`);
 
     if (newMatches.length === 0) {
         console.log('No new matches — nothing to write.');
         return;
     }
 
-    // Append new pairs to existing overrides — existing decisions are untouched.
-    const toWrite = newMatches.map(({ score, waId, liId, waName, liName, ...rest }) => ({
+    const toWrite = newMatches.map(({ score, aId, bId, aName, bName, ...rest }) => ({
         ...rest,
-        ids: [waId, liId],
-        names: [waName, liName],
+        ids: [aId, bId],
+        names: [aName, bName],
     }));
     const combined = [...existing, ...toWrite];
     fs.writeFileSync(OVERRIDES_PATH, JSON.stringify(combined, null, 2));
-    console.log(`Wrote ${combined.length} total overrides to data/unified/match_overrides.json`);
+    console.log(`Wrote ${combined.length} total overrides to ${OVERRIDES_PATH}`);
 
-    // Print confirmed/likely for quick review
     console.log('\n--- Confirmed matches ---');
     newMatches.filter(m => m.confidence === 'confirmed').forEach(m => {
-        console.log(`  [${m.score}] ${m.waName} ↔ ${m.liName}`);
+        console.log(`  [${m.score}] ${m.aName} (${m.sourceA}) ↔ ${m.bName} (${m.sourceB})`);
         console.log(`       ${m.reason}`);
     });
 
     console.log('\n--- Likely matches ---');
     newMatches.filter(m => m.confidence === 'likely').forEach(m => {
-        console.log(`  [${m.score}] ${m.waName} ↔ ${m.liName}`);
+        console.log(`  [${m.score}] ${m.aName} (${m.sourceA}) ↔ ${m.bName} (${m.sourceB})`);
         console.log(`       ${m.reason}`);
     });
 }

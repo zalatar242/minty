@@ -11,29 +11,22 @@
 
 const fs = require('fs');
 const path = require('path');
-const { createContact, createInteraction } = require('./schema');
+const { createInteraction } = require('./schema');
+const {
+    normalizePhone,
+    normalizeEmail,
+    normalizeName,
+    recencyScore,
+    frequencyScore,
+    channelScore,
+    ContactIndex,
+} = require('./utils');
 
-const DATA = path.join(__dirname, '../data');
+const DATA = process.env.CRM_DATA_DIR || path.join(__dirname, '../data');
 
 function load(filepath) {
     if (!fs.existsSync(filepath)) return null;
     return JSON.parse(fs.readFileSync(filepath, 'utf8'));
-}
-
-function normalizePhone(phone) {
-    if (!phone) return null;
-    let p = phone.replace(/[^0-9+]/g, '');
-    // Convert international dialing prefix (011...) to + format
-    if (p.startsWith('011') && p.length > 11) p = '+' + p.slice(3);
-    return p;
-}
-
-// Normalize a name to "firstname lastname" (first two words, lowercased)
-// Used for fuzzy cross-source name matching
-function normalizeName(name) {
-    if (!name) return null;
-    const words = name.toLowerCase().trim().split(/\s+/);
-    return words.slice(0, 2).join(' ');
 }
 
 // Build a map of normalizedName -> [phones] from ImportedContacts.
@@ -55,90 +48,7 @@ function buildPhoneBridge(linkedinContacts) {
     return bridge;
 }
 
-function normalizeEmail(email) {
-    if (!email) return null;
-    return email.toLowerCase().trim();
-}
-
-// --- Indexing helpers ---
-
-class ContactIndex {
-    constructor() {
-        this.contacts = [];
-        this.byId    = {};   // id -> contact
-        this.byPhone = {};   // normalizedPhone -> contact
-        this.byEmail = {};   // normalizedEmail -> contact
-        this.byName  = {};   // lowerName -> contact
-        this._nextId = 1;
-    }
-
-    // Fallback sequential ID for contacts whose source has no stable identifier
-    _newId() { return `c_${String(this._nextId++).padStart(4, '0')}`; }
-
-    find(phones, emails, name) {
-        for (const p of phones) {
-            const n = normalizePhone(p);
-            if (n && this.byPhone[n]) return this.byPhone[n];
-        }
-        for (const e of emails) {
-            const n = normalizeEmail(e);
-            if (n && this.byEmail[n]) return this.byEmail[n];
-        }
-        if (name) {
-            const key = name.toLowerCase().trim();
-            if (key.length > 2 && this.byName[key]) return this.byName[key];
-        }
-        return null;
-    }
-
-    add(contact) {
-        this.contacts.push(contact);
-        this.byId[contact.id] = contact;
-        for (const p of contact.phones) {
-            const n = normalizePhone(p);
-            if (n) this.byPhone[n] = contact;
-        }
-        for (const e of contact.emails) {
-            const n = normalizeEmail(e);
-            if (n) this.byEmail[n] = contact;
-        }
-        if (contact.name) {
-            const key = contact.name.toLowerCase().trim();
-            if (key.length > 2) this.byName[key] = contact;
-        }
-        return contact;
-    }
-
-    // stableId: caller-supplied ID derived from source data (preferred over sequential)
-    upsert(phones, emails, name, stableId = null) {
-        let c = this.find(phones, emails, name);
-        if (!c) {
-            c = createContact(stableId || this._newId());
-            this.add(c);
-        }
-        // Merge new phones/emails in
-        for (const p of phones) {
-            const n = normalizePhone(p);
-            if (n && !c.phones.includes(n)) {
-                c.phones.push(n);
-                this.byPhone[n] = c;
-            }
-        }
-        for (const e of emails) {
-            const n = normalizeEmail(e);
-            if (n && !c.emails.includes(n)) {
-                c.emails.push(n);
-                this.byEmail[n] = c;
-            }
-        }
-        if (!c.name && name) {
-            c.name = name;
-            const key = name.toLowerCase().trim();
-            if (key.length > 2) this.byName[key] = c;
-        }
-        return c;
-    }
-}
+// ContactIndex and all normalization helpers live in crm/utils.js (imported above).
 
 // --- Stable ID derivation ---
 
@@ -147,7 +57,7 @@ function waStableId(number) {
     return number ? `wa_${number}` : null;
 }
 
-// "https://www.linkedin.com/in/nicolo-m" -> "li_nicolo-m"
+// "https://www.linkedin.com/in/alex-r" -> "li_alex-r"
 function liStableId(profileUrl) {
     if (!profileUrl) return null;
     const slug = profileUrl
@@ -163,17 +73,21 @@ function liStableId(profileUrl) {
 function loadWhatsApp(index) {
     const contacts = load(path.join(DATA, 'whatsapp/contacts.json'));
     if (!contacts) { console.log('whatsapp/contacts.json not found, skipping'); return; }
+    let groups = 0;
     for (const [id, c] of Object.entries(contacts)) {
         // @lid entries are WhatsApp internal device IDs, not real phone numbers
         const isLid = id.endsWith('@lid');
-        const phone = (!isLid && c.number) ? `+${c.number}` : null;
-        const stableId = !isLid ? waStableId(c.number) : null;
+        // @g.us entries are WhatsApp group chats — track separately, not as people
+        const isGroup = id.endsWith('@g.us');
+        const phone = (!isLid && !isGroup && c.number) ? `+${c.number}` : null;
+        const stableId = !isLid ? waStableId(c.number || id.replace(/@.*/, '')) : null;
         const contact = index.upsert(phone ? [phone] : [], [], c.name, stableId);
         // Keep first source data — @lid entries for the same person are merged by name
         if (!contact.sources.whatsapp) contact.sources.whatsapp = { id, ...c };
         if (!contact.name) contact.name = c.name;
+        if (isGroup) { contact.isGroup = true; groups++; }
     }
-    console.log(`Merged ${Object.keys(contacts).length} WhatsApp contacts`);
+    console.log(`Merged ${Object.keys(contacts).length} WhatsApp contacts (${groups} group chats tagged)`);
 }
 
 function loadLinkedIn(index) {
@@ -361,7 +275,8 @@ function applyApolloEnrichment(index) {
 // --- Match overrides (from crm/MATCHING.md + Claude Code matching runs) ---
 
 function applyOverrides(index) {
-    const overridesPath = path.join(DATA, 'unified/match_overrides.json');
+    const outDir = process.env.CRM_OUT_DIR || path.join(DATA, 'unified');
+    const overridesPath = path.join(outDir, 'match_overrides.json');
     if (!fs.existsSync(overridesPath)) return;
 
     const overrides = JSON.parse(fs.readFileSync(overridesPath));
@@ -396,10 +311,136 @@ function applyOverrides(index) {
     console.log(`Applied ${applied} overrides (${skipped} "possible" skipped — needs review)`);
 }
 
+// --- Relationship strength scoring ---
+
+function buildInteractionIndex(interactions) {
+    const idx = { byChatId: {}, byFrom: {}, byEmail: {}, byLiName: {} };
+    for (const i of interactions) {
+        if (i.chatId) {
+            if (!idx.byChatId[i.chatId]) idx.byChatId[i.chatId] = [];
+            idx.byChatId[i.chatId].push(i);
+        }
+        if (i.from && typeof i.from === 'string' && i.from !== 'me') {
+            if (!idx.byFrom[i.from]) idx.byFrom[i.from] = [];
+            idx.byFrom[i.from].push(i);
+        }
+        if (i.source === 'linkedin' && i.chatName) {
+            for (const name of i.chatName.split(',').map(n => n.trim())) {
+                if (!idx.byLiName[name]) idx.byLiName[name] = [];
+                idx.byLiName[name].push(i);
+            }
+        }
+        if (i.source === 'email') {
+            const addrs = [i.from, ...(Array.isArray(i.to) ? i.to : [i.to])].filter(Boolean);
+            for (const addr of addrs) {
+                if (!idx.byEmail[addr]) idx.byEmail[addr] = [];
+                idx.byEmail[addr].push(i);
+            }
+        }
+    }
+    return idx;
+}
+
+function getContactInteractionStats(contact, idx) {
+    const seen = new Set();
+    const matched = [];
+    const sources = new Set();
+
+    function add(list, source) {
+        for (const i of (list || [])) {
+            const key = i.id || `${i.source}:${i.timestamp}:${String(i.body || '').slice(0, 20)}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                matched.push(i);
+                sources.add(i.source);
+            }
+        }
+    }
+
+    if (contact.sources.whatsapp) {
+        const waId = contact.sources.whatsapp.id;
+        add(idx.byChatId[waId]);
+        add(idx.byFrom[waId]);
+    }
+    if (contact.sources.linkedin && contact.sources.linkedin.name) {
+        add(idx.byLiName[contact.sources.linkedin.name]);
+    }
+    for (const email of contact.emails) {
+        add(idx.byEmail[email]);
+    }
+    if (contact.sources.sms) {
+        const phone = contact.sources.sms.phone;
+        add(idx.byChatId[phone]);
+    }
+    if (contact.sources.telegram && contact.sources.telegram.userId) {
+        add(idx.byChatId[String(contact.sources.telegram.userId)]);
+    }
+
+    // Find most recent interaction timestamp
+    let lastTs = null;
+    for (const i of matched) {
+        if (!i.timestamp) continue;
+        const t = new Date(i.timestamp);
+        if (!isNaN(t) && (!lastTs || t > lastTs)) lastTs = t;
+    }
+
+    return {
+        interactionCount: matched.length,
+        lastContactedAt: lastTs ? lastTs.toISOString() : null,
+        activeChannels: [...sources],
+    };
+}
+
+function computeRelationshipScores(index, interactions) {
+    const idx = buildInteractionIndex(interactions);
+    const now = Date.now();
+
+    // Collect all interaction counts to compute frequency percentile
+    // Skip group chats — they are communities, not individual relationships
+    const counts = [];
+    const statsMap = new Map();
+    for (const contact of index.contacts) {
+        if (contact.isGroup) continue;
+        const stats = getContactInteractionStats(contact, idx);
+        statsMap.set(contact.id, stats);
+        counts.push(stats.interactionCount);
+    }
+
+    // p90 for log-normalizing frequency
+    const sorted = [...counts].sort((a, b) => a - b);
+    const p90 = sorted[Math.floor(sorted.length * 0.9)] || 1;
+
+    for (const contact of index.contacts) {
+        if (contact.isGroup) { contact.relationshipScore = 0; continue; }
+        const stats = statsMap.get(contact.id);
+        contact.interactionCount = stats.interactionCount;
+        contact.lastContactedAt = stats.lastContactedAt || contact.lastContactedAt || null;
+        contact.activeChannels = stats.activeChannels;
+
+        // Days since last contact
+        let daysSince = null;
+        if (contact.lastContactedAt) {
+            daysSince = Math.floor((now - new Date(contact.lastContactedAt)) / (1000 * 60 * 60 * 24));
+        }
+        contact.daysSinceContact = daysSince;
+
+        const recency = recencyScore(daysSince);
+        const freq    = frequencyScore(stats.interactionCount, p90);
+        const channel = channelScore(stats.activeChannels);
+
+        contact.relationshipScore = Math.round(recency * 0.5 + freq * 0.3 + channel * 0.2);
+    }
+
+    const scored = index.contacts.filter(c => c.relationshipScore > 0).length;
+    console.log(`Relationship scores computed for ${scored} contacts (p90 interaction count: ${p90})`);
+    if (index._phoneCollisions > 0)
+        console.log(`Phone collision merges: ${index._phoneCollisions} (contacts unified via phone-number normalization)`);
+}
+
 // --- Main ---
 
 function run() {
-    const outDir = path.join(DATA, 'unified');
+    const outDir = process.env.CRM_OUT_DIR || path.join(DATA, 'unified');
     fs.mkdirSync(outDir, { recursive: true });
 
     const index = new ContactIndex();
@@ -412,6 +453,9 @@ function run() {
     applyOverrides(index);
     applyApolloEnrichment(index);
 
+    const interactions = buildInteractions();
+    computeRelationshipScores(index, interactions);
+
     const now = new Date().toISOString();
     index.contacts.forEach(c => { c.updatedAt = now; });
 
@@ -421,7 +465,6 @@ function run() {
     );
     console.log(`\nUnified contacts: ${index.contacts.length} → data/unified/contacts.json`);
 
-    const interactions = buildInteractions();
     fs.writeFileSync(
         path.join(outDir, 'interactions.json'),
         JSON.stringify(interactions, null, 2)

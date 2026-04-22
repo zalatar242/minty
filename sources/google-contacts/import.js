@@ -24,7 +24,7 @@ const path = require('path');
 
 const CONTACTS_FILE = process.env.GOOGLE_CONTACTS_FILE
     || path.join(__dirname, '../../data/google-contacts/export/contacts.vcf');
-const OUT_DIR = path.join(__dirname, '../../data/google-contacts');
+const OUT_DIR = process.env.GOOGLE_CONTACTS_OUT_DIR || path.join(__dirname, '../../data/google-contacts');
 
 /**
  * Parse a VCF file into an array of vCard property maps.
