@@ -1,0 +1,17 @@
+node_modules/
+
+# WhatsApp session (contains auth cookies)
+.wwebjs_auth/
+.wwebjs_cache/
+
+# Exported data (personal, often large)
+data/
+
+# Env / secrets
+.env
+*.env
+
+# Misc
+*.png
+*.jpg
+.DS_Store
