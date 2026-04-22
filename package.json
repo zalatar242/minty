@@ -49,6 +49,6 @@
   "optionalDependencies": {
     "csv-parse": "^5.5.6",
     "imap": "^0.8.19",
-    "mailparser": "^3.7.1"
+    "mailparser": "^3.9.8"
   }
 }
