@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-23
+
+### Fixed
+- **People view runaway scroll.** A small scroll on the contacts list could trigger the browser's scroll-anchoring heuristic to fight with the virtual scroller: every `vsRender` DOM swap inside the viewport made the browser re-anchor, overshoot, fire another scroll event, and drive `scrollTop` hundreds or thousands of pixels further than the user scrolled. The list is now annotated with `overflow-anchor: none` so the browser stops trying to pin content during a virtual-scroll render. Rows are also fixed at `height: 64px` (was `min-height`) to keep the virtual scroller's math exact, and the list no longer leaks overscroll to the page.
+
 ## [0.3.0] - 2026-04-23
 
 Resilient WhatsApp sync with live, visible progress. The previous exporter held every chat in memory and wrote `chats.json` once at the end — a tab close, memory spike, or server restart on a large account threw away hours of work and left the dashboard empty. Now every chat is saved as it finishes, the first run only pulls 50 messages per chat so big accounts complete in minutes, and a global progress toast follows you across every view while the import runs.
