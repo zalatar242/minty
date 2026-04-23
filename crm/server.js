@@ -945,7 +945,9 @@ function handleGetSources(req, res, params, paths, uuid) {
         if (hasData) {
             try {
                 const contacts = JSON.parse(fs.readFileSync(contactsPath, 'utf8'));
-                sourceMeta.contactCount = Array.isArray(contacts) ? contacts.length : 0;
+                sourceMeta.contactCount = Array.isArray(contacts)
+                    ? contacts.length
+                    : (contacts && typeof contacts === 'object' ? Object.keys(contacts).length : 0);
             } catch { sourceMeta.contactCount = 0; }
         }
         result[s] = sourceMeta;

@@ -1,6 +1,6 @@
 {
   "name": "minty",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Privacy-first personal CRM — unifies WhatsApp, Gmail, LinkedIn, Telegram, SMS, and Google Contacts locally. Surfaces who you should reach out to, and why.",
   "type": "commonjs",
   "license": "AGPL-3.0-only",
