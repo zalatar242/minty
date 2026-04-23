@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-04-23
+
+### Fixed
+- Sources view now shows the correct WhatsApp contact count. The counter was hard-coded to read array-shaped contact files and silently reported `0` for WhatsApp, whose `contacts.json` is keyed by phone ID. All other sources continue to count as before.
+
 ## [0.2.0] - TBD
 
 First major feature drop. Relationship-intelligence features land: goal-oriented home view, natural-language network query, reconnect composer, calendar integration, stale data detection, mobile-responsive layout, and a background sync daemon. Test suite added.
