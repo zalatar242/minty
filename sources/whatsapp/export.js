@@ -108,12 +108,25 @@ client.on('ready', async () => {
     const chats = await client.getChats();
     console.log(`Found ${chats.length} chats. Exporting...`);
 
-    const result = { ...existingChats };
-    for (const chat of chats) {
-        console.log(`  Exporting: ${chat.name}`);
-        const messages = await chat.fetchMessages({ limit: 2000 });
+    const firstRun = Object.keys(existingChats).length === 0 && !lastExportUnix;
+    const fetchLimit = firstRun ? 50 : 2000;
+    if (firstRun) console.log(`First run — using ${fetchLimit} msgs/chat. Re-run later to backfill more.`);
 
-        // In incremental mode, only keep messages newer than last export
+    const result = { ...existingChats };
+    let totalMsgs = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);
+
+    for (let i = 0; i < chats.length; i++) {
+        const chat = chats[i];
+        process.stdout.write(`\r  [${i + 1}/${chats.length}] ${chat.name || chat.id?._serialized}                    `);
+
+        let messages;
+        try {
+            messages = await chat.fetchMessages({ limit: fetchLimit });
+        } catch (e) {
+            console.log(`\n  skipped (${e.message})`);
+            continue;
+        }
+
         const newMessages = lastExportUnix
             ? messages.filter(m => m.timestamp > lastExportUnix)
             : messages;
@@ -145,19 +158,20 @@ client.on('ready', async () => {
         };
 
         const existing = result[chat.name];
-        if (existing && lastExportUnix) {
-            // Merge and deduplicate by message id
+        if (existing) {
             const existingIds = new Set(existing.messages.map(m => m.id));
-            result[chat.name] = {
-                meta: chatMeta,
-                messages: [...existing.messages, ...formatted.filter(m => !existingIds.has(m.id))],
-            };
+            const toAppend = formatted.filter(m => !existingIds.has(m.id));
+            result[chat.name] = { meta: chatMeta, messages: [...existing.messages, ...toAppend] };
+            totalMsgs += toAppend.length;
         } else {
             result[chat.name] = { meta: chatMeta, messages: formatted };
+            totalMsgs += formatted.length;
         }
-    }
 
-    fs.writeFileSync(CHATS_PATH, JSON.stringify(result, null, 2));
+        // Incremental save — progress survives Ctrl-C or crashes
+        fs.writeFileSync(CHATS_PATH, JSON.stringify(result, null, 2));
+    }
+    console.log(`\n  ${totalMsgs.toLocaleString()} messages saved`);
 
     const now = Math.floor(Date.now() / 1000);
     fs.writeFileSync(META_PATH, JSON.stringify({
