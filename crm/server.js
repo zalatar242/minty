@@ -1524,16 +1524,27 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     client.on('ready', async () => {
         waClients[uuid].status = 'ready';
         console.log(`WhatsApp ready for user ${uuid}, exporting...`);
+        const mergeOut = paths.contacts ? path.dirname(paths.contacts) : path.join(dataDir, 'unified');
+        fs.mkdirSync(mergeOut, { recursive: true });
+        const runIncrementalMerge = () => {
+            try {
+                runMerge(dataDir, mergeOut);
+                delete _interactionIndex[uuid];
+                delete _searchIndex[uuid];
+            } catch (e) { console.error('[whatsapp] incremental merge failed:', e.message); }
+        };
         try {
-            await exportWhatsapp(client, waDir, (progress) => { waClients[uuid].progress = progress; });
-            const mergeOut = paths.contacts ? path.dirname(paths.contacts) : path.join(dataDir, 'unified');
-            fs.mkdirSync(mergeOut, { recursive: true });
-            runMerge(dataDir, mergeOut);
-            delete _interactionIndex[uuid];
-            delete _searchIndex[uuid];
+            await exportWhatsapp(
+                client,
+                waDir,
+                (progress) => { waClients[uuid].progress = progress; },
+                { onChatDone: ({ index, total }) => {
+                    if (index === 1 || index === total || index % 25 === 0) runIncrementalMerge();
+                } },
+            );
+            runIncrementalMerge();
             updateUserSource(uuid, 'whatsapp', { status: 'connected', connectedAt: new Date().toISOString() });
             waClients[uuid].status = 'done';
-            // Attach live sync listener now that export is complete
             ensureSyncDaemon(uuid).attachWhatsApp(client);
         } catch (e) {
             console.error('WhatsApp export error:', e);
@@ -1551,19 +1562,45 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     json(res, { status: 'starting' });
 }
 
+function readExportProgress(uuid) {
+    try {
+        const dataDir = getUserDataDir(uuid);
+        const progressPath = path.join(dataDir, 'whatsapp', '.export-progress.json');
+        if (!fs.existsSync(progressPath)) return null;
+        return JSON.parse(fs.readFileSync(progressPath, 'utf8'));
+    } catch { return null; }
+}
+
 function handleWhatsappStatus(req, res, params, paths, uuid) {
     const session = waClients[uuid];
     if (!session) {
-        // Check if already connected from a previous server run
         const dataDir = getUserDataDir(uuid);
         const hasData = fs.existsSync(path.join(dataDir, 'whatsapp', 'contacts.json'));
-        return json(res, { status: hasData ? 'done' : 'not_started' });
+        return json(res, { status: hasData ? 'done' : 'not_started', progress: readExportProgress(uuid) });
     }
-    json(res, { status: session.status, qr: session.status === 'qr_pending' ? session.qr : null, progress: session.progress || null });
+    json(res, {
+        status: session.status,
+        qr: session.status === 'qr_pending' ? session.qr : null,
+        progress: session.progress || readExportProgress(uuid) || null,
+    });
 }
 
-async function exportWhatsapp(client, waDir, onProgress = () => {}) {
-    onProgress({ step: 'contacts', message: 'Loading contacts...' });
+function handleWhatsappProgress(req, res, params, paths, uuid) {
+    const session = waClients[uuid];
+    const progress = session?.progress || readExportProgress(uuid);
+    const active = !!progress && progress.step !== 'done';
+    json(res, { active, progress: progress || null });
+}
+
+async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
+    const chatsPath = path.join(waDir, 'chats.json');
+    const progressPath = path.join(waDir, '.export-progress.json');
+    const writeProgress = (p) => {
+        onProgress(p);
+        try { fs.writeFileSync(progressPath, JSON.stringify({ ...p, updatedAt: new Date().toISOString() })); } catch {}
+    };
+
+    writeProgress({ step: 'contacts', message: 'Loading contacts...' });
     const contacts = await client.getContacts();
     const contactMap = {};
     for (const c of contacts) {
@@ -1577,24 +1614,73 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}) {
     }
     fs.writeFileSync(path.join(waDir, 'contacts.json'), JSON.stringify(contactMap, null, 2));
 
-    onProgress({ step: 'chats', message: 'Loading chats list...' });
+    writeProgress({ step: 'chats', message: 'Loading chat list...' });
     const chats = await client.getChats();
     const total = chats.length;
-    const result = {};
+
+    let result = {};
+    const existingIds = {};
+    let resuming = false;
+    if (fs.existsSync(chatsPath)) {
+        try {
+            result = JSON.parse(fs.readFileSync(chatsPath, 'utf8')) || {};
+            resuming = Object.keys(result).length > 0;
+            for (const [name, chat] of Object.entries(result)) {
+                existingIds[name] = new Set((chat.messages || []).map(m => m.id));
+            }
+        } catch { result = {}; }
+    }
+
+    const firstRun = !resuming;
+    const limit = opts.limit ?? (firstRun ? 50 : 500);
+    let msgCount = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);
+
     for (let i = 0; i < chats.length; i++) {
         const chat = chats[i];
-        onProgress({ step: 'messages', current: i + 1, total, message: `Fetching messages (${i + 1}/${total})...` });
-        const messages = await chat.fetchMessages({ limit: 500 });
-        result[chat.name] = {
-            meta: { id: chat.id._serialized, isGroup: chat.isGroup },
-            messages: messages.map(m => ({
+        const name = chat.name || chat.id?._serialized || `chat-${i}`;
+        writeProgress({
+            step: 'messages',
+            current: i + 1,
+            total,
+            messageCount: msgCount,
+            firstRun,
+            chatName: name,
+            message: `Syncing ${i + 1}/${total}: ${name}`,
+        });
+
+        let fetched;
+        try {
+            fetched = await chat.fetchMessages({ limit });
+        } catch (e) {
+            console.error(`[whatsapp] fetchMessages failed for ${name}:`, e.message);
+            continue;
+        }
+
+        const seen = existingIds[name] || new Set();
+        const newMessages = fetched
+            .filter(m => !seen.has(m.id._serialized))
+            .map(m => ({
                 id: m.id._serialized,
                 timestamp: new Date(m.timestamp * 1000).toISOString(),
                 from: m.from, body: m.body, type: m.type,
-            })),
+            }));
+
+        const existing = result[name];
+        result[name] = {
+            meta: { id: chat.id._serialized, isGroup: chat.isGroup },
+            messages: existing ? [...(existing.messages || []), ...newMessages] : newMessages,
         };
+        msgCount += newMessages.length;
+
+        fs.writeFileSync(chatsPath, JSON.stringify(result, null, 2));
+
+        if (opts.onChatDone) {
+            try { await opts.onChatDone({ index: i + 1, total, messageCount: msgCount }); } catch {}
+        }
     }
-    fs.writeFileSync(path.join(waDir, 'chats.json'), JSON.stringify(result, null, 2));
+
+    writeProgress({ step: 'done', current: total, total, messageCount: msgCount, message: `Imported ${msgCount.toLocaleString()} messages` });
+    try { fs.unlinkSync(progressPath); } catch {}
     client.destroy();
 }
 
@@ -1864,6 +1950,7 @@ const ROUTES = [
     ['POST', /^\/api\/sources\/google-contacts\/sync$/,       handleSyncGoogleContacts],
     ['POST', /^\/api\/sources\/whatsapp\/start$/,         handleWhatsappStart],
     ['GET',  /^\/api\/sources\/whatsapp\/status$/,        handleWhatsappStatus],
+    ['GET',  /^\/api\/sources\/whatsapp\/progress$/,      handleWhatsappProgress],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
     ['GET',  /^\/api\/contacts\/([^/]+)\/insights$/,     handleGetInsights],
@@ -2420,6 +2507,35 @@ nav {
 .sync-warn-banner svg { flex-shrink: 0; margin-top: 1px; }
 .sync-warn-icon { width: 14px; height: 14px; }
 
+/* Global sync toast (shown while a background import is running) */
+.sync-toast {
+  position: fixed; top: 14px; right: 14px; z-index: 60;
+  display: flex; align-items: center; gap: 10px;
+  background: rgba(17, 24, 39, 0.92); backdrop-filter: blur(8px);
+  border: 1px solid rgba(99,102,241,0.35);
+  padding: 10px 14px 10px 12px; border-radius: 10px;
+  font-size: 0.78rem; color: #e5e7eb;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.3);
+  max-width: 360px; cursor: pointer;
+  transition: opacity 180ms ease, transform 180ms ease;
+}
+.sync-toast:hover { transform: translateY(-1px); }
+.sync-toast.success { border-color: rgba(52,211,153,0.4); }
+.sync-toast.success .sync-toast-spinner { animation: none; border-top-color: #34d399; border-color: #34d399; }
+.sync-toast-text { line-height: 1.35; }
+.sync-toast-spinner {
+  width: 12px; height: 12px; border-radius: 50%;
+  border: 2px solid rgba(167,139,250,0.3); border-top-color: #a78bfa;
+  animation: sync-toast-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes sync-toast-spin { to { transform: rotate(360deg); } }
+.sync-toast-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 2px; background: rgba(99,102,241,0.12); border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; overflow: hidden; }
+.sync-toast-bar-fill { height: 100%; width: 0%; background: #a78bfa; transition: width 0.3s ease; }
+@media (max-width: 720px) {
+  .sync-toast { top: auto; bottom: 76px; right: 10px; left: 10px; max-width: none; }
+}
+
 /* Pulse section */
 .pulse-item {
   display: flex; align-items: center; gap: 12px; padding: 10px 14px;
@@ -2896,6 +3012,12 @@ body { background: var(--bg); }
 </head>
 <body>
 
+<div id="sync-toast" class="sync-toast" style="display:none" onclick="showView('sources')" role="status" aria-live="polite">
+  <span class="sync-toast-spinner" aria-hidden="true"></span>
+  <span class="sync-toast-text" id="sync-toast-text">Syncing WhatsApp…</span>
+  <div class="sync-toast-bar"><div class="sync-toast-bar-fill" id="sync-toast-fill"></div></div>
+</div>
+
 <nav>
   <div class="nav-logo">
     <span class="nav-logo-icon" aria-hidden="true">M</span>
@@ -3286,9 +3408,62 @@ let staleSources = new Set(); // Set of source names (e.g. 'linkedin', 'whatsapp
 // ============================================================
 // Startup
 // ============================================================
+let syncToastPoller = null;
+let syncToastLastDoneAt = 0;
+async function pollSyncToast() {
+  try {
+    const r = await fetch(BASE + '/api/sources/whatsapp/progress');
+    if (!r.ok) return;
+    const data = await r.json();
+    const toast = document.getElementById('sync-toast');
+    const text = document.getElementById('sync-toast-text');
+    const fill = document.getElementById('sync-toast-fill');
+    if (!toast || !text || !fill) return;
+    const p = data.progress;
+    if (data.active && p) {
+      toast.style.display = 'flex';
+      toast.classList.remove('success');
+      let label = p.message || 'Syncing WhatsApp…';
+      if (p.step === 'messages' && p.total) {
+        const pct = Math.round((p.current / p.total) * 100);
+        const msgCount = p.messageCount ? p.messageCount.toLocaleString() + ' msgs · ' : '';
+        label = \`Syncing WhatsApp · \${p.current}/\${p.total} chats · \${msgCount}\${pct}%\`;
+        fill.style.width = pct + '%';
+      } else if (p.step === 'contacts') {
+        fill.style.width = '5%';
+      } else if (p.step === 'chats') {
+        fill.style.width = '10%';
+      }
+      text.textContent = label;
+    } else if (p && p.step === 'done' && Date.now() - syncToastLastDoneAt < 8000) {
+      toast.classList.add('success');
+      toast.style.display = 'flex';
+      text.textContent = p.message || 'WhatsApp sync complete';
+      fill.style.width = '100%';
+    } else {
+      if (toast.classList.contains('success')) syncToastLastDoneAt = 0;
+      if (p && p.step === 'done' && !syncToastLastDoneAt) {
+        syncToastLastDoneAt = Date.now();
+        toast.classList.add('success');
+        toast.style.display = 'flex';
+        text.textContent = p.message || 'WhatsApp sync complete';
+        fill.style.width = '100%';
+        setTimeout(() => { toast.style.display = 'none'; }, 8000);
+      } else if (!p) {
+        toast.style.display = 'none';
+      }
+    }
+  } catch {}
+}
+
 async function init() {
   // Show Today immediately — contacts load in background
   showView('today');
+  // Start global sync toast poller (runs regardless of view)
+  if (!syncToastPoller) {
+    pollSyncToast();
+    syncToastPoller = setInterval(pollSyncToast, 2000);
+  }
 
   // Load contacts in background and populate People view when ready
   const listEl = document.getElementById('contact-list');
