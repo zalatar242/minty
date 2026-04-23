@@ -2177,10 +2177,12 @@ nav {
 .sf.active { background: #1e2740; border-color: #4f46e5; color: #a78bfa; }
 .list-count { font-size: 0.75rem; color: #4a5568; }
 
-.contact-list { flex: 1; overflow-y: auto; }
+.contact-list { flex: 1; overflow-y: auto; overscroll-behavior: contain; overflow-anchor: none; }
+.contact-list * { overflow-anchor: none; }
 .contact-item { display: flex; align-items: center; gap: 12px; padding: 0 16px;
                 border-bottom: 1px solid rgba(30,45,69,0.5); cursor: pointer;
-                min-height: 64px; }
+                box-sizing: border-box;
+                height: 64px; overflow: hidden; }
 .contact-item:hover { background: var(--bg-hover); transform: translateX(2px); }
 .contact-item.kb-cursor { background: #1a2540 !important; outline: 1px solid var(--accent); outline-offset: -1px; }
 
