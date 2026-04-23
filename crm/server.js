@@ -1681,7 +1681,9 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
 
     writeProgress({ step: 'done', current: total, total, messageCount: msgCount, message: `Imported ${msgCount.toLocaleString()} messages` });
     try { fs.unlinkSync(progressPath); } catch {}
-    client.destroy();
+    // NOTE: don't destroy() here — the caller attaches a live message
+    // listener to this same client after export completes. Destroying
+    // breaks the listener and "Live — receiving messages" becomes a lie.
 }
 
 // ---------------------------------------------------------------------------
