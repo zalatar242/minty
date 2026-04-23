@@ -109,7 +109,7 @@ Minty is **offline by default**. The only network traffic:
 - Email importer talks to your IMAP / Gmail API (required for that source)
 - Optional: Google Calendar API if you opt in to the calendar integration
 - Optional: Apollo enrichment (only if you explicitly set `APOLLO_API_KEY`)
-- Optional: Ollama or Claude Code CLI, both of which run locally
+- Optional: Ollama (runs locally) or Claude Code CLI (sends prompts to Anthropic's cloud when you invoke an AI pipeline). For fully-offline AI, set `AI_BACKEND=ollama`.
 
 Everything else — contacts, messages, insights, timelines — lives in `data/` on your disk. No telemetry, no analytics, no phone-home. See [SECURITY.md](./SECURITY.md).
 
@@ -148,7 +148,7 @@ data/                # your local data (gitignored)
 
 Minty deliberately avoids runtime LLM fees. Two supported backends:
 
-- **Claude Code CLI** (default) — if you have `claude` on your PATH, Minty calls it via `claude --print` for insights and ranking. Free if you're already a Claude user.
+- **Claude Code CLI** (default) — if you have `claude` on your PATH, Minty calls it via `claude --print` for insights and ranking. Free if you're already a Claude user. Note: this backend sends your prompts (which include message snippets from the contacts being analyzed) to Anthropic's servers. Convenient if you trust Anthropic; choose Ollama below if you don't.
 - **Ollama** — set `AI_BACKEND=ollama` in `.env` and run a local model like `qwen2.5:7b`. Fully offline.
 
 AI outputs (insights, digest, reconnect drafts, query rankings) are pre-computed and cached in `data/unified/*.json`. The web server reads those static files — no API calls at request time.

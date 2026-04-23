@@ -85,6 +85,7 @@ function loadSyncState(statePath) {
 
 function saveSyncState(statePath, state) {
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+    try { fs.chmodSync(statePath, 0o600); } catch { /* ignore */ }
 }
 
 function deepMerge(target, source) {
@@ -683,6 +684,7 @@ function startSyncDaemon(uuid, userDataDir) {
                 if (u2[uuid]?.sources?.email?.accounts) {
                     u2[uuid].sources.email.accounts = accts;
                     fs.writeFileSync(usersPath, JSON.stringify(u2, null, 2));
+                    try { fs.chmodSync(usersPath, 0o600); } catch { /* ignore */ }
                 }
             } catch (e) {
                 console.error(`[sync] Gmail poll error for ${account.email}:`, e.message);
@@ -740,6 +742,7 @@ function startSyncDaemon(uuid, userDataDir) {
                 if (u2[uuid]?.sources?.email?.accounts) {
                     u2[uuid].sources.email.accounts = accts;
                     fs.writeFileSync(usersPath, JSON.stringify(u2, null, 2));
+                    try { fs.chmodSync(usersPath, 0o600); } catch { /* ignore */ }
                 }
             } catch (e) {
                 console.error(`[sync] Google Contacts poll error for ${account.email}:`, e.message);
@@ -793,6 +796,7 @@ function startSyncDaemon(uuid, userDataDir) {
             if (u2[uuid]?.sources?.email?.accounts) {
                 u2[uuid].sources.email.accounts = accts;
                 fs.writeFileSync(usersPath, JSON.stringify(u2, null, 2));
+                try { fs.chmodSync(usersPath, 0o600); } catch { /* ignore */ }
             }
         } catch (e) {
             console.error(`[sync] Calendar poll error for ${account.email}:`, e.message);

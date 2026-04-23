@@ -857,6 +857,9 @@ function loadSourcesMeta() {
 
 function saveSourcesMeta(meta) {
     fs.writeFileSync(SOURCES_META_PATH, JSON.stringify(meta, null, 2));
+    // Contains OAuth access + refresh tokens. Restrict to owner on POSIX;
+    // on Windows this is a no-op but harmless.
+    try { fs.chmodSync(SOURCES_META_PATH, 0o600); } catch { /* ignore */ }
 }
 
 function updateUserSource(uuid, source, info) {
@@ -1988,7 +1991,43 @@ const ROUTES = [
 // Single-user mode: every request uses this synthetic uuid as the cache key.
 const SINGLE_USER_UUID = 'default';
 
+// DNS-rebinding defence: accept only requests whose Host header matches an
+// IP literal or loopback name that we actually listen on (or an entry the
+// user explicitly allowlisted via MINTY_ALLOWED_HOSTS). The attacker needs
+// a DOMAIN name to rebind, so IP-literal-only is the cheapest effective fix.
+function buildAllowedHosts() {
+    const set = new Set();
+    const add = (h) => {
+        if (!h) return;
+        const low = h.toLowerCase();
+        set.add(low);
+        if (!/:\d+$/.test(low)) set.add(`${low}:${PORT}`);
+    };
+    add('localhost');
+    add('127.0.0.1');
+    add('[::1]');
+    const nets = os.networkInterfaces();
+    for (const name of Object.keys(nets)) {
+        for (const ni of nets[name] || []) {
+            if (ni.family === 'IPv4' || ni.family === 4) add(ni.address);
+            else if (ni.family === 'IPv6' || ni.family === 6) add(`[${ni.address}]`);
+        }
+    }
+    for (const h of (process.env.MINTY_ALLOWED_HOSTS || '').split(',')) {
+        add(h.trim());
+    }
+    return set;
+}
+const ALLOWED_HOSTS = buildAllowedHosts();
+
 const server = http.createServer(async (req, res) => {
+    const hostHeader = (req.headers.host || '').toLowerCase();
+    if (!ALLOWED_HOSTS.has(hostHeader)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain' });
+        res.end(`Forbidden: host "${hostHeader}" not in allowlist. Set MINTY_ALLOWED_HOSTS to include it.`);
+        return;
+    }
+
     const url = new URL(req.url, `http://localhost:${PORT}`);
     const p = url.pathname;
 
@@ -4477,7 +4516,7 @@ function renderContactDetail(c) {
       </div>
     </div>
     <div class="quick-actions">
-      <button class="qa-btn" onclick="copyName('\${esc(c.name || '')}')">
+      <button class="qa-btn" onclick="copyName('\${jsAttr(c.name || '')}')">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
         Copy name
       </button>
@@ -4485,11 +4524,11 @@ function renderContactDetail(c) {
         <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M16 8a6 6 0 0 1 6 6v7h-4v-7a2 2 0 0 0-2-2 2 2 0 0 0-2 2v7h-4v-7a6 6 0 0 1 6-6z"/><rect x="2" y="9" width="4" height="12"/><circle cx="4" cy="4" r="2"/></svg>
         LinkedIn
       </button>\` : ''}
-      <button class="qa-btn" onclick="openDraftPanel('\${esc(c.id)}','\${esc(c.name || '')}')">
+      <button class="qa-btn" onclick="openDraftPanel('\${jsAttr(c.id)}','\${jsAttr(c.name || '')}')">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
         Draft message
       </button>
-      <button class="qa-btn" onclick="toggleScoreOverride('\${c.id}', \${baseScore}, \${overrideScore ?? liveScore})">
+      <button class="qa-btn" onclick="toggleScoreOverride('\${jsAttr(c.id)}', \${baseScore}, \${overrideScore ?? liveScore})">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/><path d="M4.93 4.93a10 10 0 0 0 0 14.14"/></svg>
         Edit score
       </button>
@@ -4497,8 +4536,8 @@ function renderContactDetail(c) {
         <input type="range" min="0" max="100" value="\${overrideScore ?? liveScore}" id="score-slider"
                oninput="document.getElementById('score-slider-val').textContent=this.value" style="width:100px">
         <span id="score-slider-val" style="font-size:0.8rem;color:var(--text-secondary)">\${overrideScore ?? liveScore}</span>
-        <button onclick="saveScoreOverride('\${c.id}', document.getElementById('score-slider').value)" style="background:var(--accent);border:none;color:white;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.72rem;font-family:inherit">Save</button>
-        \${overrideScore ? \`<button onclick="clearScoreOverride('\${c.id}')" style="background:none;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.72rem;font-family:inherit">Clear</button>\` : ''}
+        <button onclick="saveScoreOverride('\${jsAttr(c.id)}', document.getElementById('score-slider').value)" style="background:var(--accent);border:none;color:white;border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.72rem;font-family:inherit">Save</button>
+        \${overrideScore ? \`<button onclick="clearScoreOverride('\${jsAttr(c.id)}')" style="background:none;border:1px solid var(--border);color:var(--text-muted);border-radius:4px;padding:2px 8px;cursor:pointer;font-size:0.72rem;font-family:inherit">Clear</button>\` : ''}
       </div>
     </div>
     <div class="detail-body">
@@ -4753,7 +4792,7 @@ async function loadReconnect() {
       <div class="reconnect-bottom">
         <div class="source-dots">\${dots}</div>
         <div class="reconnect-actions">
-          <button class="btn-reconnect" onclick="copyName('\${esc(c.name)}')">Copy name</button>
+          <button class="btn-reconnect" onclick="copyName('\${jsAttr(c.name)}')">Copy name</button>
           <button class="btn-reconnect" onclick="openContact('\${esc(c.id)}')">View profile</button>
         </div>
       </div>
@@ -5057,7 +5096,7 @@ async function loadIntros() {
           <div class="intro-role">\${esc(bRole)}</div>
         </div>
       </div>
-      <button class="btn-copy-intro" id="intro-btn-\${idx}" onclick="copyIntro(\${idx}, '\${esc(s.template)}')">
+      <button class="btn-copy-intro" id="intro-btn-\${idx}" onclick="copyIntro(\${idx}, '\${jsAttr(s.template)}')">
         Copy intro message
       </button>
     </div>\`;
@@ -5290,7 +5329,7 @@ function showNetworkDetail(d) {
   detail.innerHTML = \`
     <div class="net-detail-company">\${esc(d.name)}</div>
     <div class="net-detail-meta">\${d.count} contact\${d.count===1?'':'s'} · avg score \${d.avgScore}
-      <span style="cursor:pointer;color:#60a5fa;margin-left:8px" onclick="filterByCompany('\${esc(d.name)}')" title="Show in Contacts">↗ contacts</span>
+      <span style="cursor:pointer;color:#60a5fa;margin-left:8px" onclick="filterByCompany('\${jsAttr(d.name)}')" title="Show in Contacts">↗ contacts</span>
     </div>
     \${contactRows}
   \`;
@@ -5329,7 +5368,7 @@ function renderNetworkList(companies) {
   const svgEl = document.getElementById('network-graph');
   svgEl.innerHTML = '';
   detail.innerHTML = companies.slice(0,20).map(co =>
-    \`<div class="net-detail-contact" onclick="filterByCompany('\${esc(co.name)}')">
+    \`<div class="net-detail-contact" onclick="filterByCompany('\${jsAttr(co.name)}')">
       <div class="net-score-dot" style="background:\${co.avgScore>=70?'#34d399':co.avgScore>=40?'#fbbf24':'#374151'}"></div>
       <div><div class="net-detail-name">\${esc(co.name)}</div><div class="net-detail-role">\${co.count} contacts</div></div>
     </div>\`).join('');
@@ -5771,6 +5810,23 @@ function sourceLabel(s) {
 
 function esc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Safe for interpolation inside a JS single-quoted string inside an HTML
+// double-quoted attribute, e.g. onclick="fn('\${jsAttr(x)}')". The browser
+// HTML-decodes the attribute before the JS parser sees it, so we JS-escape
+// first, then HTML-escape. esc() alone is NOT safe in this position.
+function jsAttr(s) {
+  const jsEscaped = String(s||'')
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n');
+  return jsEscaped
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
 }
 
 // ============================================================
