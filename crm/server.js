@@ -297,6 +297,62 @@ function handleGetIntroPaths(req, res, [id], paths , ) {
     });
 }
 
+/**
+ * GET /api/intros/find?q=<query>&limit=<n>
+ * Fuzzy-match a target across contacts (name/company/position) and, for each
+ * top candidate, compute warm-intro paths. Powers the intro finder UI.
+ */
+function handleFindIntroTargets(req, res, _params, paths) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const q = (url.searchParams.get('q') || '').trim();
+    const limit = Math.max(1, Math.min(10, Number(url.searchParams.get('limit')) || 3));
+    if (q.length < 2) return json(res, { query: q, targets: [] });
+
+    const { scoreString } = require('./palette');
+    const contacts = loadContacts(paths);
+    const memberships = loadGroupMemberships();
+    const viewerId = getViewerContactId(paths);
+    const excludeIds = [];
+    if (viewerId) excludeIds.push(viewerId);
+    if (paths.selfIds?.size) excludeIds.push(...paths.selfIds);
+
+    const hits = [];
+    for (const c of contacts) {
+        if (c.isGroup) continue;
+        const name = c.name || '';
+        const company = c.sources?.linkedin?.company || c.sources?.googleContacts?.org || '';
+        const position = c.sources?.linkedin?.position || c.sources?.googleContacts?.title || '';
+        const score = Math.max(
+            scoreString(name, q) * 1.5,
+            scoreString(company, q),
+            scoreString(position, q) * 0.9,
+        );
+        if (score > 0) hits.push({ c, score });
+    }
+    hits.sort((a, b) => b.score - a.score);
+
+    const targets = [];
+    for (const { c, score } of hits.slice(0, limit)) {
+        const pathsFound = findIntroPaths(c.id, contacts, memberships, {
+            maxPaths: 5,
+            maxGroupSize: 200,
+            excludeIds,
+        });
+        targets.push({
+            target: {
+                id: c.id, name: c.name,
+                company: c.sources?.linkedin?.company || c.sources?.googleContacts?.org || null,
+                position: c.sources?.linkedin?.position || c.sources?.googleContacts?.title || null,
+                relationshipScore: c.relationshipScore || 0,
+                daysSinceContact: c.daysSinceContact ?? null,
+            },
+            matchScore: score,
+            paths: pathsFound,
+        });
+    }
+    json(res, { query: q, targets });
+}
+
 function handleGetInteractions(req, res, [id], paths, uuid) {
     const contact = loadContacts(paths).find(c => c.id === id);
     if (!contact) return json(res, { error: 'not found' }, 404);
@@ -2518,6 +2574,7 @@ const ROUTES = [
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
     ['GET',  /^\/api\/contacts\/([^/]+)\/insights$/,     handleGetInsights],
     ['GET',  /^\/api\/contacts\/([^/]+)\/intro-paths$/,  handleGetIntroPaths],
+    ['GET',  /^\/api\/intros\/find$/,                    handleFindIntroTargets],
     ['POST', /^\/api\/contacts\/([^/]+)\/regenerate-draft$/, handleRegenerateDraft],
     ['POST', /^\/api\/contacts\/([^/]+)\/notes$/,        handleSaveNotes],
     ['GET',  /^\/api\/contacts\/([^/]+)$/,               handleGetContact],
@@ -3341,6 +3398,57 @@ nav {
 
 /* ---- Intros ---- */
 #view-intros { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.intro-finder-wrap {
+  display: flex; align-items: center; gap: 10px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 10px 14px;
+}
+#intro-find-input {
+  flex: 1; background: transparent; border: 0; outline: 0;
+  color: var(--text-primary); font-size: 14px; font-family: inherit;
+}
+#intro-find-input::placeholder { color: var(--text-muted); }
+.intro-target-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 14px; margin-bottom: 10px;
+}
+.intro-target-head {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 8px;
+  cursor: pointer;
+}
+.intro-target-name { font-size: 15px; font-weight: 500; color: var(--text-primary); letter-spacing: -0.02em; }
+.intro-target-role { font-size: 11px; color: var(--text-secondary); margin-top: 2px; }
+.intro-paths-head {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--text-muted); font-weight: 600; margin: 10px 0 6px;
+}
+.intro-path-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  margin-bottom: 6px;
+  cursor: pointer;
+  transition: border-color 180ms ease;
+}
+.intro-path-row:hover { border-color: var(--accent); }
+.intro-path-avatar {
+  width: 32px; height: 32px; border-radius: 50%;
+  background: linear-gradient(135deg, #4f46e5, #818cf8);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600; color: white; flex-shrink: 0;
+}
+.intro-path-body { flex: 1; min-width: 0; }
+.intro-path-groups {
+  font-size: 11px; color: var(--text-muted); margin-top: 2px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.intro-path-score {
+  font-size: 11px; color: var(--text-secondary);
+  background: rgba(99,102,241,0.1); padding: 2px 8px; border-radius: 10px;
+  flex-shrink: 0;
+}
+.intro-no-paths {
+  font-size: 12px; color: var(--text-muted); font-style: italic; padding: 8px 0;
+}
 .intro-card { background: #1a1f2e; border: 1px solid #1e2740; border-radius: 10px;
               padding: 14px 16px; margin: 10px 20px; }
 .intro-pair { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
@@ -4019,8 +4127,17 @@ body { background: var(--bg); }
   <!-- Intros -->
   <div id="view-intros" style="display:none">
     <div class="groups-header">
-      <h2>Introduction Opportunities</h2>
-      <p>People in your network who should know each other — click to copy draft intro.</p>
+      <h2>Intros</h2>
+      <p>Find the warmest path to anyone in your network, or browse pairs who should already know each other.</p>
+    </div>
+    <div class="intro-finder" style="padding: 14px 20px; border-bottom: 1px solid var(--border); flex-shrink: 0;">
+      <div class="intro-finder-wrap">
+        <svg width="16" height="16" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-secondary);flex-shrink:0">
+          <circle cx="8" cy="8" r="5.5"/><path d="M13 13l3 3"/>
+        </svg>
+        <input id="intro-find-input" type="text" placeholder="Who do you want to reach? (e.g. 'Hana at Stripe', 'Priya')" />
+      </div>
+      <div id="intro-find-results" style="margin-top: 12px;"></div>
     </div>
     <div id="intros-list" style="flex:1;overflow-y:auto"><div class="loading">Loading…</div></div>
   </div>
@@ -6063,7 +6180,81 @@ async function loadDigest() {
 // ============================================================
 // Intros
 // ============================================================
+let introFindDebounce = null;
+function wireIntroFinder() {
+  const input = document.getElementById('intro-find-input');
+  if (!input || input.dataset.wired) return;
+  input.dataset.wired = '1';
+  input.addEventListener('input', () => {
+    clearTimeout(introFindDebounce);
+    const q = input.value.trim();
+    introFindDebounce = setTimeout(() => runIntroFind(q), 150);
+  });
+}
+
+async function runIntroFind(q) {
+  const el = document.getElementById('intro-find-results');
+  if (!el) return;
+  if (q.length < 2) { el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="loading" style="padding:10px 0;font-size:12px">Finding paths…</div>';
+  try {
+    const r = await fetch(BASE + '/api/intros/find?q=' + encodeURIComponent(q) + '&limit=3').then(r => r.json());
+    renderIntroFindResults(el, r);
+  } catch (e) {
+    el.innerHTML = '<div class="loading" style="color:#ef4444">Error: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderIntroFindResults(el, data) {
+  if (!data.targets || data.targets.length === 0) {
+    el.innerHTML = '<div class="intro-no-paths">No contacts match that query.</div>';
+    return;
+  }
+  el.innerHTML = data.targets.map(t => {
+    const role = [t.target.position, t.target.company].filter(Boolean).join(' · ');
+    const initials = esc(getInitials(t.target.name || '?'));
+    const col = avatarColor(t.target.id);
+    const warmth = t.target.relationshipScore;
+    const warmBadge = warmth >= 50
+      ? '<span class="intro-path-score" style="background:rgba(34,197,94,0.15);color:#86efac">You already know — score ' + warmth + '</span>'
+      : warmth > 0
+      ? '<span class="intro-path-score">Known, score ' + warmth + '</span>'
+      : '<span class="intro-path-score">Cold</span>';
+    const pathsHtml = t.paths.length === 0
+      ? '<div class="intro-no-paths">No warm paths via shared groups. Try reaching out directly if they\\'re in your contacts, or import more sources to uncover more paths.</div>'
+      : t.paths.map(p => {
+          const tier = p.intermediaryScore >= 70 ? 'strong' : p.intermediaryScore >= 40 ? 'good' : p.intermediaryScore >= 20 ? 'warm' : 'fading';
+          const iInitials = esc(getInitials(p.intermediaryName || '?'));
+          const groups = p.sharedGroupsWithTarget.map(g => '#' + esc(g.name) + ' (' + g.size + ')').join(' · ');
+          const roleText = [p.intermediaryTitle, p.intermediaryCompany].filter(Boolean).join(' · ');
+          return '<div class="intro-path-row" onclick="openContact(\\'' + esc(p.intermediaryId) + '\\')">'
+            + '<div class="intro-path-avatar">' + iInitials + '</div>'
+            + '<div class="intro-path-body">'
+              + '<div class="intro-target-name">' + esc(p.intermediaryName) + '</div>'
+              + '<div class="intro-target-role">' + esc(roleText || '—') + '</div>'
+              + '<div class="intro-path-groups">via ' + groups + '</div>'
+            + '</div>'
+            + '<span class="palette-score-ring ' + tier + '"></span>'
+            + '<span class="intro-path-score">score ' + p.intermediaryScore + '</span>'
+          + '</div>';
+        }).join('');
+    return '<div class="intro-target-card">'
+      + '<div class="intro-target-head" onclick="openContact(\\'' + esc(t.target.id) + '\\')">'
+        + '<div class="intro-path-avatar" style="width:36px;height:36px;background:' + col.bg + '">' + initials + '</div>'
+        + '<div style="flex:1">'
+          + '<div class="intro-target-name">' + esc(t.target.name || 'Unnamed') + '</div>'
+          + '<div class="intro-target-role">' + esc(role || '—') + '</div>'
+        + '</div>'
+        + warmBadge
+      + '</div>'
+      + '<div class="intro-paths-head">Warm paths (' + t.paths.length + ')</div>'
+      + pathsHtml
+    + '</div>';
+  }).join('');
+}
+
 async function loadIntros() {
+  wireIntroFinder();
   const el = document.getElementById('intros-list');
   el.innerHTML = '<div class="loading">Detecting introduction opportunities…</div>';
   const d = await fetch(BASE + '/api/intros').then(r => r.json());
