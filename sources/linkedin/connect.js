@@ -191,19 +191,37 @@ async function firstMatching(page, selectors, { timeout = 5000 } = {}) {
     return null;
 }
 
-async function isLoggedIn(page) {
-    const url = page.url();
-    for (const p of SELECTORS.LOGIN.successUrlPatterns) {
-        if (url.includes(p)) return true;
+/**
+ * Pure-function URL classifier. Exported for tests.
+ *
+ * Returns one of:
+ *   'loggedIn'  — URL matches a post-login landing pattern
+ *   'challenge' — URL matches a known challenge / interstitial pattern
+ *   'unknown'   — anything else (including the login page, errors, etc)
+ *
+ * Uses substring matching against `SELECTORS.LOGIN.successUrlPatterns` and
+ * `SELECTORS.CHALLENGE.urlPatterns`. Patterns are stable enough (path-based,
+ * not query-string) that bare substring matching is sufficient. Challenge
+ * check runs first because a successful redirect eventually lands in /feed;
+ * we only want 'loggedIn' when there's no pending challenge.
+ */
+function classifyLoginUrl(url) {
+    if (typeof url !== 'string' || !url) return 'unknown';
+    for (const p of SELECTORS.CHALLENGE.urlPatterns) {
+        if (url.includes(p)) return 'challenge';
     }
-    return false;
+    for (const p of SELECTORS.LOGIN.successUrlPatterns) {
+        if (url.includes(p)) return 'loggedIn';
+    }
+    return 'unknown';
+}
+
+async function isLoggedIn(page) {
+    return classifyLoginUrl(page.url()) === 'loggedIn';
 }
 
 async function isChallengeActive(page) {
-    const url = page.url();
-    for (const p of SELECTORS.CHALLENGE.urlPatterns) {
-        if (url.includes(p)) return true;
-    }
+    if (classifyLoginUrl(page.url()) === 'challenge') return true;
     // Also detect a TOTP input on the current page (URL patterns aren't
     // exhaustive — LinkedIn sometimes keeps you on /login for challenges).
     return !!(await firstMatching(page, SELECTORS.CHALLENGE.totpInput, { timeout: 1000 }));
@@ -318,6 +336,37 @@ async function run(opts) {
     const syncStatePath = path.join(dataDir, DEFAULT_SYNC_STATE_REL);
     const profileDir = resolveProfileDir(dataDir);
 
+    // 0. Credential-management shortcuts that DON'T need a browser.
+    //   LINKEDIN_SAVE_CREDS_ONLY=1   → prompt + save, THEN exit (no browser)
+    //   LINKEDIN_FORGET_CREDS=1      → delete stored creds, then fall through
+    // These run before the Playwright guard so `npm run linkedin:save-creds`
+    // works the moment the repo is cloned — you don't have to run
+    // `npm run linkedin:setup` first just to stash your password. The
+    // verifying variant (LINKEDIN_SAVE_CREDS=1) still flows through the
+    // regular browser path below because its whole point is end-to-end
+    // verification that the creds work.
+    if (process.env.LINKEDIN_FORGET_CREDS === '1') {
+        try {
+            credentials.remove(dataDir);
+            stdout.write('Stored LinkedIn credentials removed.\n');
+        } catch (err) {
+            stderr.write('failed to remove credentials: ' + (err.message || err) + '\n');
+        }
+    }
+    const saveOnly = process.env.LINKEDIN_SAVE_CREDS_ONLY === '1';
+    if (saveOnly) {
+        try {
+            const entered = await promptForCreds(stdin, stdout);
+            credentials.write(dataDir, entered);
+            stdout.write('✓ Credentials saved to ' + credentials.credPath(dataDir) + ' (mode 0600).\n');
+        } catch (err) {
+            stderr.write('✖ credential setup failed: ' + (err.message || err) + '\n');
+            return 1;
+        }
+        stdout.write('Skipping browser launch (LINKEDIN_SAVE_CREDS_ONLY=1).\n');
+        return 0;
+    }
+
     // 1. Playwright guard.
     let playwright;
     try {
@@ -376,19 +425,13 @@ async function run(opts) {
         }
     }
 
-    // 4.5. Credentials: offer to save, or load existing. Three env toggles:
-    //   LINKEDIN_SAVE_CREDS=1  → interactive prompt, write to creds store
-    //   LINKEDIN_FORGET_CREDS=1→ delete stored creds, then fall through
+    // 4.5. Credentials: load or prompt+save for the verifying flow.
+    //   LINKEDIN_SAVE_CREDS=1  → prompt + save, THEN auto-login below
+    //                            (verifies creds work end-to-end)
     //   LINKEDIN_MANUAL=1      → force manual flow even if stored creds exist
+    // (LINKEDIN_SAVE_CREDS_ONLY=1 and LINKEDIN_FORGET_CREDS=1 are handled
+    // earlier, before Playwright is required.)
     let storedCreds = null;
-    if (process.env.LINKEDIN_FORGET_CREDS === '1') {
-        try {
-            credentials.remove(dataDir);
-            stdout.write('Stored LinkedIn credentials removed.\n');
-        } catch (err) {
-            stderr.write('failed to remove credentials: ' + (err.message || err) + '\n');
-        }
-    }
     if (process.env.LINKEDIN_SAVE_CREDS === '1') {
         try {
             const entered = await promptForCreds(stdin, stdout);
@@ -560,6 +603,7 @@ module.exports = {
     updateLinkedInState,
     ensureProfileDir,
     resolveProfileDir,
+    classifyLoginUrl,
     // Exposed for introspection / tests.
     INSTRUCTIONS,
 };
