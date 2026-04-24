@@ -239,26 +239,46 @@ async function fetchEmailsViaMicrosoftGraph(accessToken) {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 async function run() {
+  const P = require('../_shared/progress');
+  const DATA_DIR = process.env.CRM_DATA_DIR || path.join(__dirname, '../../data');
+  P.startProgress(DATA_DIR, 'email', { step: 'init', message: 'Connecting…' });
+
   fs.mkdirSync(OUT_DIR, { recursive: true });
 
   let result;
-  if (process.env.EMAIL_ACCESS_TOKEN && process.env.EMAIL_TOKEN_TYPE === 'microsoft') {
-    console.log('Using Microsoft Graph API (OAuth)...');
-    result = await fetchEmailsViaMicrosoftGraph(process.env.EMAIL_ACCESS_TOKEN);
-  } else if (process.env.EMAIL_ACCESS_TOKEN) {
-    console.log('Using Gmail API (OAuth)...');
-    result = await fetchEmailsViaGmailAPI(process.env.EMAIL_ACCESS_TOKEN);
-  } else {
-    const missing = ['EMAIL_HOST', 'EMAIL_USER', 'EMAIL_PASS'].filter(k => !process.env[k]);
-    if (missing.length) { console.error('Missing:', missing.join(', ')); process.exit(1); }
-    console.log(`Connecting via IMAP to ${process.env.EMAIL_HOST}...`);
-    result = await fetchEmailsViaIMAP();
+  try {
+    if (process.env.EMAIL_ACCESS_TOKEN && process.env.EMAIL_TOKEN_TYPE === 'microsoft') {
+      console.log('Using Microsoft Graph API (OAuth)...');
+      P.updateProgress(DATA_DIR, 'email', { step: 'messages', message: 'Fetching via Microsoft Graph…' });
+      result = await fetchEmailsViaMicrosoftGraph(process.env.EMAIL_ACCESS_TOKEN);
+    } else if (process.env.EMAIL_ACCESS_TOKEN) {
+      console.log('Using Gmail API (OAuth)...');
+      P.updateProgress(DATA_DIR, 'email', { step: 'messages', message: 'Fetching via Gmail API…' });
+      result = await fetchEmailsViaGmailAPI(process.env.EMAIL_ACCESS_TOKEN);
+    } else {
+      const missing = ['EMAIL_HOST', 'EMAIL_USER', 'EMAIL_PASS'].filter(k => !process.env[k]);
+      if (missing.length) {
+        const msg = 'Missing env: ' + missing.join(', ');
+        P.failProgress(DATA_DIR, 'email', new Error(msg));
+        console.error(msg); process.exit(1);
+      }
+      console.log(`Connecting via IMAP to ${process.env.EMAIL_HOST}...`);
+      P.updateProgress(DATA_DIR, 'email', { step: 'messages', message: `IMAP → ${process.env.EMAIL_HOST}` });
+      result = await fetchEmailsViaIMAP();
+    }
+  } catch (e) {
+    P.failProgress(DATA_DIR, 'email', e);
+    throw e;
   }
 
   fs.writeFileSync(path.join(OUT_DIR, 'contacts.json'), JSON.stringify(result.contacts, null, 2));
   console.log(`Saved ${result.contacts.length} email contacts`);
   fs.writeFileSync(path.join(OUT_DIR, 'messages.json'), JSON.stringify(result.messages, null, 2));
   console.log(`Saved ${result.messages.length} email messages`);
+  P.finishProgress(DATA_DIR, 'email', {
+    message: `Imported ${result.contacts.length} contacts and ${result.messages.length} messages.`,
+    current: result.messages.length, total: result.messages.length, itemsProcessed: result.messages.length,
+  });
 }
 
 run().catch(err => { console.error(err); process.exit(1); });

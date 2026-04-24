@@ -13,10 +13,12 @@
 const fs = require('fs');
 const path = require('path');
 const { parse } = require('csv-parse/sync');
+const P = require('../_shared/progress');
 
 const EXPORT_DIR = process.env.LINKEDIN_EXPORT_DIR
     || path.join(__dirname, '../../data/linkedin/export');
 const OUT_DIR = process.env.LINKEDIN_OUT_DIR || path.join(__dirname, '../../data/linkedin');
+const DATA_DIR = process.env.CRM_DATA_DIR || path.join(__dirname, '../../data');
 
 function readCsv(filename, opts = {}) {
     const filepath = path.join(EXPORT_DIR, filename);
@@ -152,36 +154,56 @@ function importInvitations() {
 }
 
 function run() {
+    P.startProgress(DATA_DIR, 'linkedin', { step: 'init', message: 'Reading LinkedIn export…' });
     if (!fs.existsSync(EXPORT_DIR)) {
-        console.error(`LinkedIn export directory not found: ${EXPORT_DIR}`);
+        const msg = `LinkedIn export directory not found: ${EXPORT_DIR}`;
+        P.failProgress(DATA_DIR, 'linkedin', new Error(msg));
+        console.error(msg);
         console.error('Set LINKEDIN_EXPORT_DIR env var or place export in ./linkedin_export/');
         process.exit(1);
     }
 
     fs.mkdirSync(OUT_DIR, { recursive: true });
 
+    P.updateProgress(DATA_DIR, 'linkedin', {
+        step: 'contacts', message: 'Parsing connections…',
+        current: 0, total: 4,
+    });
     console.log('Importing LinkedIn connections...');
     const connections = importConnections();
     console.log(`  ${connections.length} connections`);
+    P.updateProgress(DATA_DIR, 'linkedin', { current: 1, total: 4 });
 
     console.log('Importing LinkedIn imported contacts...');
     const importedContacts = importImportedContacts();
     console.log(`  ${importedContacts.length} imported contacts`);
+    P.updateProgress(DATA_DIR, 'linkedin', { current: 2, total: 4, message: 'Parsing messages…' });
 
     const allContacts = [...connections, ...importedContacts];
     fs.writeFileSync(path.join(OUT_DIR, 'contacts.json'), JSON.stringify(allContacts, null, 2));
     console.log(`  -> data/linkedin/contacts.json (${allContacts.length} total)`);
 
+    P.updateProgress(DATA_DIR, 'linkedin', { step: 'messages', message: 'Parsing messages…' });
     console.log('Importing LinkedIn messages...');
     const conversations = importMessages();
     const totalMessages = conversations.reduce((n, c) => n + c.messages.length, 0);
     fs.writeFileSync(path.join(OUT_DIR, 'messages.json'), JSON.stringify(conversations, null, 2));
     console.log(`  -> data/linkedin/messages.json (${conversations.length} conversations, ${totalMessages} messages)`);
+    P.updateProgress(DATA_DIR, 'linkedin', { current: 3, total: 4, message: 'Parsing invitations…' });
 
     console.log('Importing LinkedIn invitations...');
     const invitations = importInvitations();
     fs.writeFileSync(path.join(OUT_DIR, 'invitations.json'), JSON.stringify(invitations, null, 2));
     console.log(`  -> data/linkedin/invitations.json (${invitations.length} invitations)`);
+
+    P.finishProgress(DATA_DIR, 'linkedin', {
+        message: `Imported ${allContacts.length} contacts, ${totalMessages} messages, ${invitations.length} invitations.`,
+        current: 4, total: 4, itemsProcessed: totalMessages,
+    });
 }
 
-run();
+if (require.main === module) {
+    try { run(); } catch (e) { P.failProgress(DATA_DIR, 'linkedin', e); throw e; }
+}
+
+module.exports = { run };

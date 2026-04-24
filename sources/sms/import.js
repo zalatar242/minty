@@ -26,10 +26,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const P = require('../_shared/progress');
 
 const EXPORT_DIR = process.env.SMS_EXPORT_DIR
     || path.join(__dirname, '../../data/sms/export');
 const OUT_DIR = process.env.SMS_OUT_DIR || path.join(__dirname, '../../data/sms');
+const DATA_DIR = process.env.CRM_DATA_DIR || path.join(__dirname, '../../data');
 
 // type attribute: 1=received, 2=sent
 const TYPE_RECEIVED = '1';
@@ -163,8 +165,11 @@ function groupByPhone(messages) {
 }
 
 function run() {
+    P.startProgress(DATA_DIR, 'sms', { step: 'init', message: 'Locating XML exports…' });
     if (!fs.existsSync(EXPORT_DIR)) {
-        console.error(`SMS export directory not found: ${EXPORT_DIR}`);
+        const msg = `SMS export directory not found: ${EXPORT_DIR}`;
+        P.failProgress(DATA_DIR, 'sms', new Error(msg));
+        console.error(msg);
         console.error('');
         console.error('To export your SMS messages:');
         console.error('  1. Install "SMS Backup & Restore" from the Play Store (by SyncTech)');
@@ -180,18 +185,30 @@ function run() {
         .map(f => path.join(EXPORT_DIR, f));
 
     if (xmlFiles.length === 0) {
-        console.error(`No XML files found in ${EXPORT_DIR}`);
+        const msg = `No XML files found in ${EXPORT_DIR}`;
+        P.failProgress(DATA_DIR, 'sms', new Error(msg));
+        console.error(msg);
         process.exit(1);
     }
 
     console.log(`Found ${xmlFiles.length} XML file(s)`);
     fs.mkdirSync(OUT_DIR, { recursive: true });
 
+    P.updateProgress(DATA_DIR, 'sms', {
+        step: 'messages', message: 'Parsing XML…',
+        current: 0, total: xmlFiles.length,
+    });
+
     let allMessages = [];
-    for (const file of xmlFiles) {
+    for (let i = 0; i < xmlFiles.length; i++) {
+        const file = xmlFiles[i];
         const msgs = parseXmlFile(file);
         console.log(`  ${path.basename(file)}: ${msgs.length} messages`);
         allMessages = allMessages.concat(msgs);
+        P.updateProgress(DATA_DIR, 'sms', {
+            current: i + 1, total: xmlFiles.length,
+            message: `Parsed ${path.basename(file)}`,
+        });
     }
 
     // Deduplicate by phone+timestamp+body (in case of overlapping backups)
@@ -224,6 +241,15 @@ function run() {
     // messages.json: all threads with messages
     fs.writeFileSync(path.join(OUT_DIR, 'messages.json'), JSON.stringify(threadList, null, 2));
     console.log(`Saved ${threadList.length} threads → data/sms/messages.json`);
+
+    P.finishProgress(DATA_DIR, 'sms', {
+        message: `Imported ${contacts.length} contacts and ${allMessages.length} messages from ${xmlFiles.length} file(s).`,
+        current: xmlFiles.length, total: xmlFiles.length, itemsProcessed: allMessages.length,
+    });
 }
 
-run();
+if (require.main === module) {
+    try { run(); } catch (e) { P.failProgress(DATA_DIR, 'sms', e); throw e; }
+}
+
+module.exports = { run };

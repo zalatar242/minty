@@ -19,6 +19,7 @@ const {
     findIntroPaths,
     computeGroupSignalScores,
 } = require('./people-graph');
+const sourceProgress = require('../sources/_shared/progress');
 
 const PORT = Number(process.env.PORT) || 3456;
 const HOST = process.env.HOST || '127.0.0.1'; // set HOST=0.0.0.0 to expose on LAN
@@ -1746,6 +1747,46 @@ function handleWhatsappProgress(req, res, params, paths, uuid) {
     json(res, { active, progress: progress || null });
 }
 
+/**
+ * Generic per-source progress endpoint: /api/sources/<key>/progress.
+ * For `whatsapp`, preserves the live in-memory session progress so the toast
+ * updates in real time during the current import.
+ */
+function handleSourceProgress(req, res, params, paths, uuid) {
+    const key = params[0];
+    if (!sourceProgress.SOURCE_DIR[key]) {
+        res.writeHead(404); res.end('unknown source'); return;
+    }
+    const dataDir = getUserDataDir(uuid);
+    let progress = sourceProgress.readProgress(dataDir, key);
+    if (key === 'whatsapp') {
+        // Prefer live in-memory progress when a session is running
+        const session = waClients[uuid];
+        if (session && session.progress) progress = session.progress;
+    }
+    const active = sourceProgress.isActive(progress);
+    json(res, { active, progress: progress || null, percent: sourceProgress.percent(progress) });
+}
+
+/**
+ * Global sync progress: every source with any progress record, keyed by source.
+ * The UI uses this to drive a rolling toast: "Importing LinkedIn — 2/4" etc.
+ */
+function handleSyncProgress(req, res, params, paths, uuid) {
+    const dataDir = getUserDataDir(uuid);
+    const all = sourceProgress.listProgress(dataDir);
+    // Overlay live WhatsApp session progress
+    const session = waClients[uuid];
+    if (session && session.progress) {
+        all.whatsapp = { ...(all.whatsapp || {}), source: 'whatsapp', ...session.progress };
+    }
+    const active = {};
+    for (const [k, v] of Object.entries(all)) {
+        if (sourceProgress.isActive(v)) active[k] = { ...v, percent: sourceProgress.percent(v) };
+    }
+    json(res, { active, all });
+}
+
 async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
     const chatsPath = path.join(waDir, 'chats.json');
     const progressPath = path.join(waDir, '.export-progress.json');
@@ -2350,6 +2391,8 @@ const ROUTES = [
     ['POST', /^\/api\/sources\/whatsapp\/start$/,         handleWhatsappStart],
     ['GET',  /^\/api\/sources\/whatsapp\/status$/,        handleWhatsappStatus],
     ['GET',  /^\/api\/sources\/whatsapp\/progress$/,      handleWhatsappProgress],
+    ['GET',  /^\/api\/sources\/([a-zA-Z]+)\/progress$/,  handleSourceProgress],
+    ['GET',  /^\/api\/sync\/progress$/,                   handleSyncProgress],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -3849,48 +3892,84 @@ let staleSources = new Set(); // Set of source names (e.g. 'linkedin', 'whatsapp
 // ============================================================
 let syncToastPoller = null;
 let syncToastLastDoneAt = 0;
+let syncToastLastDoneSource = null;
+const SOURCE_LABELS = {
+  whatsapp: 'WhatsApp', linkedin: 'LinkedIn', telegram: 'Telegram',
+  email: 'Email', sms: 'SMS', googleContacts: 'Google Contacts', apollo: 'Apollo',
+};
+function labelForSource(key) { return SOURCE_LABELS[key] || key; }
+
 async function pollSyncToast() {
   try {
-    const r = await fetch(BASE + '/api/sources/whatsapp/progress');
+    const r = await fetch(BASE + '/api/sync/progress');
     if (!r.ok) return;
     const data = await r.json();
     const toast = document.getElementById('sync-toast');
     const text = document.getElementById('sync-toast-text');
     const fill = document.getElementById('sync-toast-fill');
     if (!toast || !text || !fill) return;
-    const p = data.progress;
-    if (data.active && p) {
+
+    const active = data.active || {};
+    const activeKeys = Object.keys(active);
+
+    if (activeKeys.length > 0) {
+      // Prefer WhatsApp (live, real-time) first, else the oldest-started
+      activeKeys.sort((a, b) => {
+        if (a === 'whatsapp') return -1;
+        if (b === 'whatsapp') return 1;
+        return (active[a].startedAt || '').localeCompare(active[b].startedAt || '');
+      });
+      const key = activeKeys[0];
+      const p = active[key];
       toast.style.display = 'flex';
       toast.classList.remove('success');
-      let label = p.message || 'Syncing WhatsApp…';
-      if (p.step === 'messages' && p.total) {
-        const pct = Math.round((p.current / p.total) * 100);
+      let label = 'Syncing ' + labelForSource(key) + '…';
+      let pct = p.percent;
+      if (typeof pct !== 'number' && p.total > 0) pct = Math.round((p.current / p.total) * 100);
+      if (pct != null && p.total) {
         const msgCount = p.messageCount ? p.messageCount.toLocaleString() + ' msgs · ' : '';
-        label = \`Syncing WhatsApp · \${p.current}/\${p.total} chats · \${msgCount}\${pct}%\`;
+        label = 'Syncing ' + labelForSource(key) + ' · ' + p.current + '/' + p.total + ' · ' + msgCount + pct + '%';
         fill.style.width = pct + '%';
-      } else if (p.step === 'contacts') {
+      } else if (p.step === 'init' || p.step === 'contacts') {
         fill.style.width = '5%';
-      } else if (p.step === 'chats') {
+        if (p.message) label = labelForSource(key) + ' — ' + p.message;
+      } else if (p.message) {
         fill.style.width = '10%';
+        label = labelForSource(key) + ' — ' + p.message;
       }
+      if (activeKeys.length > 1) label += ' · +' + (activeKeys.length - 1) + ' more';
       text.textContent = label;
-    } else if (p && p.step === 'done' && Date.now() - syncToastLastDoneAt < 8000) {
+      return;
+    }
+
+    // No active sources — show a "just finished" success toast for ~8s
+    const all = data.all || {};
+    let lastDone = null, lastDoneKey = null;
+    for (const [k, p] of Object.entries(all)) {
+      if (p.step === 'done' && p.updatedAt) {
+        if (!lastDone || (p.updatedAt > lastDone.updatedAt)) { lastDone = p; lastDoneKey = k; }
+      }
+    }
+    const within = (stamp) => stamp && (Date.now() - new Date(stamp).getTime() < 8000);
+    if (lastDone && within(lastDone.updatedAt) && lastDoneKey !== syncToastLastDoneSource) {
+      syncToastLastDoneAt = Date.now();
+      syncToastLastDoneSource = lastDoneKey;
       toast.classList.add('success');
       toast.style.display = 'flex';
-      text.textContent = p.message || 'WhatsApp sync complete';
+      text.textContent = lastDone.message || (labelForSource(lastDoneKey) + ' sync complete');
       fill.style.width = '100%';
-    } else {
-      if (toast.classList.contains('success')) syncToastLastDoneAt = 0;
-      if (p && p.step === 'done' && !syncToastLastDoneAt) {
-        syncToastLastDoneAt = Date.now();
-        toast.classList.add('success');
-        toast.style.display = 'flex';
-        text.textContent = p.message || 'WhatsApp sync complete';
-        fill.style.width = '100%';
-        setTimeout(() => { toast.style.display = 'none'; }, 8000);
-      } else if (!p) {
+      setTimeout(() => {
         toast.style.display = 'none';
-      }
+        toast.classList.remove('success');
+        syncToastLastDoneSource = null;
+      }, 8000);
+      return;
+    }
+    if (toast.classList.contains('success') && Date.now() - syncToastLastDoneAt > 8000) {
+      toast.style.display = 'none';
+      toast.classList.remove('success');
+    } else if (!toast.classList.contains('success')) {
+      toast.style.display = 'none';
     }
   } catch {}
 }

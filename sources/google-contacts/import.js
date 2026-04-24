@@ -163,8 +163,13 @@ function parseCard(lines) {
 }
 
 function run() {
+    const P = require('../_shared/progress');
+    const DATA_DIR = process.env.CRM_DATA_DIR || path.join(__dirname, '../../data');
+    P.startProgress(DATA_DIR, 'googleContacts', { step: 'init', message: 'Reading vCards…' });
     if (!fs.existsSync(CONTACTS_FILE)) {
-        console.error(`Google Contacts VCF not found: ${CONTACTS_FILE}`);
+        const msg = `Google Contacts VCF not found: ${CONTACTS_FILE}`;
+        P.failProgress(DATA_DIR, 'googleContacts', new Error(msg));
+        console.error(msg);
         console.error('');
         console.error('To export:');
         console.error('  1. Go to contacts.google.com');
@@ -181,10 +186,28 @@ function run() {
     const text = fs.readFileSync(CONTACTS_FILE, 'utf8');
     const rawCards = parseVcf(text);
     console.log(`Parsed ${rawCards.length} vCards`);
+    P.updateProgress(DATA_DIR, 'googleContacts', {
+        step: 'contacts', message: `Parsing ${rawCards.length} vCards…`,
+        current: 0, total: rawCards.length,
+    });
 
-    const contacts = rawCards.map(parseCard).filter(Boolean);
+    const contacts = rawCards.map((card, i) => {
+        if (i % 50 === 0) P.updateProgress(DATA_DIR, 'googleContacts', { current: i, total: rawCards.length });
+        return parseCard(card);
+    }).filter(Boolean);
     fs.writeFileSync(path.join(OUT_DIR, 'contacts.json'), JSON.stringify(contacts, null, 2));
     console.log(`Saved ${contacts.length} contacts → data/google-contacts/contacts.json`);
+
+    P.finishProgress(DATA_DIR, 'googleContacts', {
+        message: `Imported ${contacts.length} contacts from ${rawCards.length} vCards.`,
+        current: rawCards.length, total: rawCards.length, itemsProcessed: contacts.length,
+    });
 }
 
-run();
+if (require.main === module) {
+    const P = require('../_shared/progress');
+    const DATA_DIR = process.env.CRM_DATA_DIR || path.join(__dirname, '../../data');
+    try { run(); } catch (e) { P.failProgress(DATA_DIR, 'googleContacts', e); throw e; }
+}
+
+module.exports = { run };
