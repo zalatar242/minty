@@ -2303,6 +2303,8 @@ function loadQueryIndex(paths) {
 
 // POST /api/network/query — instant Layer 2 results
 // POST /api/network/query?enhance=true — runs Claude re-ranking (Layer 3, ~10s)
+const { annotateResults: annotateQueryResults, expandQuery: expandQueryTerms } = require('./query-reasons');
+
 async function handleNetworkQuery(req, res, _params, paths) {
     let reqBody;
     try { reqBody = await body(req); } catch { reqBody = {}; }
@@ -2314,6 +2316,34 @@ async function handleNetworkQuery(req, res, _params, paths) {
     let candidates = filterIndex(index, parsedQ);
     const description = describeQuery(parsedQ);
 
+    // Semantic expansion: if the structured filter returned no results AND the
+    // query has free-text terms with known expansions, fall back to a broader
+    // match over Apollo/LinkedIn/insights text. This is what makes queries like
+    // "anyone who works on notification systems" actually find people, instead
+    // of returning empty because 'notification' isn't a role keyword.
+    const { expandedTerms } = expandQueryTerms(parsedQ);
+    if (candidates.length < 3 && expandedTerms.length) {
+        const contactsById = Object.fromEntries(loadContacts(paths).map(c => [c.id, c]));
+        const matched = [];
+        for (const entry of index) {
+            if (candidates.some(c => c.id === entry.id)) continue;
+            const c = contactsById[entry.id];
+            const text = (
+                (entry.title || '') + ' ' +
+                (entry.company || '') + ' ' +
+                (c?.apollo?.headline || '') + ' ' +
+                (c?.apollo?.industry || '') + ' ' +
+                (c?.sources?.linkedin?.position || '') + ' ' +
+                (c?.sources?.linkedin?.company || '')
+            ).toLowerCase();
+            if (expandedTerms.some(t => t.length > 2 && text.includes(t))) {
+                matched.push(entry);
+            }
+        }
+        // Append the semantic matches after structured matches
+        candidates = candidates.concat(matched.slice(0, 20 - candidates.length));
+    }
+
     // Group-path signal: candidates tied into the user's WhatsApp social graph
     // (many small group co-memberships) get a tie-breaking boost. The base
     // filterIndex ranking is preserved; the boost only shifts candidates within
@@ -2322,6 +2352,13 @@ async function handleNetworkQuery(req, res, _params, paths) {
     const memberships = loadGroupMemberships();
     const fullContacts = loadContacts(paths);
     const groupSignal = computeGroupSignalScores(fullContacts, memberships);
+    const contactsById = Object.fromEntries(fullContacts.map(c => [c.id, c]));
+
+    let insightsByContactId = {};
+    try {
+        const ins = JSON.parse(fs.readFileSync(paths.insights, 'utf8'));
+        insightsByContactId = ins || {};
+    } catch { /* missing insights.json is fine */ }
 
     // Re-rank within the shortlist by adding (groupSignal * 3) to the intent-based
     // sort key. Keeping the multiplier small preserves the dominant role/location
@@ -2347,6 +2384,7 @@ async function handleNetworkQuery(req, res, _params, paths) {
         id:                c.id,
         name:              c.name,
         company:           c.company,
+        title:             c.title,
         city:              c.city,
         roles:             c.roles,
         seniority:         c.seniority,
@@ -2354,17 +2392,23 @@ async function handleNetworkQuery(req, res, _params, paths) {
         daysSinceContact:  c.daysSinceContact,
         meetScore:         c.meetScore,
         groupSignal:       groupSignal[c.id] || 0,
-        reason:            null, // filled by Claude layer
+        reason:            null,
     }));
 
-    if (!reqBody || !reqBody.enhance) {
-        json(res, { query, parsed: parsedQ, description, results: instant, enhanced: false, processingMs: 0 });
-        return;
-    }
+    // Annotate with reasons ("Show thinking") — purely additive, doesn't change ranking.
+    const annotated = annotateQueryResults(parsedQ, instant, {
+        contactsById, insightsByContactId,
+    });
 
-    // Layer 3 enhancement is not available at request time (claude CLI subprocess is unreliable
-    // when invoked from within a running Claude Code session). Return instant results immediately.
-    json(res, { query, parsed: parsedQ, description, results: instant, enhanced: false, processingMs: 0 });
+    json(res, {
+        query,
+        parsed: parsedQ,
+        description,
+        expandedTerms,
+        results: annotated,
+        enhanced: false,
+        processingMs: 0,
+    });
 }
 
 // ── LinkedIn auto-sync (opt-in, experimental) ──────────────────────────────
@@ -3579,6 +3623,21 @@ nav {
 .ask-result-tag.city { border-color: #1e3a5f; color: #93c5fd; background: rgba(30,58,95,0.3); }
 .ask-result-tag.role { border-color: #064e3b; color: #6ee7b7; background: rgba(6,78,59,0.3); }
 .ask-result-reason { font-size: 0.8rem; color: var(--text-secondary); font-style: italic; line-height: 1.5; background: rgba(99,102,241,0.06); border-radius: 6px; padding: 8px 10px; }
+.ask-result-reasons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.ask-reason-chip {
+  font-size: 0.72rem; padding: 3px 8px; border-radius: 10px;
+  border: 1px solid var(--border); background: rgba(99,102,241,0.04);
+  color: var(--text-secondary);
+  display: inline-flex; align-items: center; gap: 4px;
+}
+.ask-reason-chip.role     { border-color: #064e3b; color: #6ee7b7; background: rgba(6,78,59,0.2); }
+.ask-reason-chip.location { border-color: #1e3a5f; color: #93c5fd; background: rgba(30,58,95,0.2); }
+.ask-reason-chip.topic    { border-color: #4c1d95; color: #c4b5fd; background: rgba(76,29,149,0.2); }
+.ask-reason-chip.keyword  { border-color: #78350f; color: #fcd34d; background: rgba(120,53,15,0.2); }
+.ask-reason-chip.warmth   { border-color: #166534; color: #86efac; background: rgba(22,101,52,0.2); }
+.ask-reason-chip.recent   { border-color: #9f1239; color: #fda4af; background: rgba(159,18,57,0.2); }
+.ask-reason-kind { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; opacity: 0.85; }
+.ask-reason-detail { font-size: 0.72rem; color: inherit; opacity: 0.85; }
 .ask-result-score { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
 .ask-result-score-num { font-size: 1.1rem; font-weight: 700; }
 .ask-result-actions { display: flex; gap: 8px; margin-top: 10px; }
@@ -6860,6 +6919,14 @@ function renderAskResults(el, data, enhanced) {
     const reasonHtml = c.reason
       ? \`<div class="ask-result-reason">\${esc(c.reason)}</div>\`
       : '';
+    const reasonChipsHtml = Array.isArray(c.reasons) && c.reasons.length
+      ? '<div class="ask-result-reasons">' + c.reasons.slice(0, 5).map(r =>
+          '<span class="ask-reason-chip ' + esc(r.kind) + '">' +
+            '<span class="ask-reason-kind">' + esc(r.label) + '</span>' +
+            (r.detail ? '<span class="ask-reason-detail">· ' + esc(r.detail) + '</span>' : '') +
+          '</span>'
+        ).join('') + '</div>'
+      : '';
 
     return \`<div class="ask-result-card" onclick="openContact('\${esc(c.id)}')">
       <div class="ask-result-avatar">
@@ -6874,6 +6941,7 @@ function renderAskResults(el, data, enhanced) {
           <span class="ask-result-tag">\${days === 'never' ? 'never contacted' : days + ' ago'}</span>
         </div>
         \${reasonHtml}
+        \${reasonChipsHtml}
         <div class="ask-result-actions">
           <button class="ask-btn-primary" onclick="event.stopPropagation();openContact('\${esc(c.id)}')">View profile</button>
           <button class="ask-btn-secondary" onclick="event.stopPropagation();openContact('\${esc(c.id)}');setTimeout(()=>document.getElementById('draft-panel')?.style.setProperty('display','flex'),300)">Draft message</button>
