@@ -319,19 +319,36 @@ async function scrapeMessages(page) {
             // No ISO — try to parse common relative forms. Be conservative:
             // anything we don't recognize, scrape.
             const text = (t.lastText || '').toLowerCase();
+            // Very recent (seconds / minutes / hours / "now") — always newer than any lastSync.
             if (/^\d+s$/.test(text) || /^\d+m$/.test(text) || /^\d+h$/.test(text) || text === 'now' || text === 'just now') return true;
-            // "Yesterday" thread is ~24h old. It's newer than lastSync iff
-            // lastSync was more than ~24h ago. Original had the comparison
-            // inverted (check for <48h made threads skip when the user had
-            // been absent for 2+ days). Give 24h of leeway either way.
+            // "Yesterday" thread is ~24h old. Newer than lastSync iff lastSync > 24h ago.
             if (/yesterday/.test(text)) return Date.now() - lastSyncMs > 24 * 3600 * 1000;
-            // "3d", "5d" — roughly interpret
-            const dMatch = /^(\d+)d$/.exec(text);
-            if (dMatch) {
-                const daysAgo = Number(dMatch[1]);
-                return (Date.now() - daysAgo * 86400 * 1000) > lastSyncMs;
+            // Relative Nd / Nw / Nmo / Ny. The thread is roughly (N × unit) old;
+            // it's newer than lastSync iff (now - age) > lastSync.
+            const relUnits = [
+                [/^(\d+)d$/, 86400 * 1000],
+                [/^(\d+)w$/, 7 * 86400 * 1000],
+                [/^(\d+)mo$/, 30 * 86400 * 1000],
+                [/^(\d+)y$/, 365 * 86400 * 1000],
+            ];
+            for (const [re, unitMs] of relUnits) {
+                const m = re.exec(text);
+                if (m) return (Date.now() - Number(m[1]) * unitMs) > lastSyncMs;
             }
-            return true; // unknown format → scrape
+            // Absolute "Jan 15" / "jan 15" / "Mar 3" — no year. Try current year;
+            // if the result lies in the future (e.g. Dec in January), it was last year.
+            const absMatch = /^([a-z]{3})\s+(\d{1,2})$/.exec(text);
+            if (absMatch) {
+                const year = new Date().getFullYear();
+                const tryA = Date.parse(`${absMatch[1]} ${absMatch[2]}, ${year}`);
+                if (!Number.isNaN(tryA)) {
+                    const resolved = tryA > Date.now()
+                        ? Date.parse(`${absMatch[1]} ${absMatch[2]}, ${year - 1}`)
+                        : tryA;
+                    if (!Number.isNaN(resolved)) return resolved > lastSyncMs;
+                }
+            }
+            return true; // unknown format → scrape (safe fallback)
         });
         skippedAsUnchanged = before - filtered.length;
     }
@@ -363,11 +380,17 @@ async function scrapeMessages(page) {
             // iterations so pathological threads can't hang.
             let prevCount = -1, stableStreak = 0;
             for (let k = 0; k < 8; k++) {
-                const count = await page.evaluate(() => {
-                    const m = document.querySelector('.msg-s-message-list, ul.msg-s-message-list-content');
-                    if (m) m.scrollTop = 0;
-                    return document.querySelectorAll('.msg-s-event-listitem, li[class*="msg-s-message-list__event"]').length;
-                });
+                const count = await page.evaluate((sels) => {
+                    for (const s of sels.container) {
+                        const m = document.querySelector(s);
+                        if (m) { m.scrollTop = 0; break; }
+                    }
+                    for (const s of sels.bubble) {
+                        const found = document.querySelectorAll(s);
+                        if (found.length) return found.length;
+                    }
+                    return 0;
+                }, { container: SELECTORS.MESSAGE_THREAD.messageListContainer, bubble: SELECTORS.MESSAGE_THREAD.messageBubble });
                 // Two consecutive stable counts = done. Single-tick stability
                 // is too eager on slow networks where LinkedIn lazy-loads —
                 // count might plateau briefly between batches.
