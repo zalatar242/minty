@@ -7610,11 +7610,16 @@ function renderMentionsInline(text) {
 // HTML-decodes the attribute before the JS parser sees it, so we JS-escape
 // first, then HTML-escape. esc() alone is NOT safe in this position.
 function jsAttr(s) {
+  // This function is embedded inside a template literal in server.js's HTML,
+  // so every \\ halves to a \ at render time. We need the *rendered* JS to
+  // contain: .replace(/\\/g, '\\\\'); i.e. source requires 4 backslashes to
+  // output 2. Same for \\r and \\n. Tested by parsing the served HTML's
+  // inline script with new Function() — must succeed without SyntaxError.
   const jsEscaped = String(s||'')
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, "\\'")
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
+    .replace(/\\\\/g, '\\\\\\\\')
+    .replace(/'/g, "\\\\'")
+    .replace(/\\r/g, '\\\\r')
+    .replace(/\\n/g, '\\\\n');
   return jsEscaped
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
