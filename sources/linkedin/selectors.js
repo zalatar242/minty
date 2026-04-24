@@ -127,6 +127,20 @@ const MESSAGING_INBOX = {
         'p.msg-overlay-list-bubble__message-snippet',
     ],
 
+    // Timestamp shown next to each conversation on the inbox. Usually relative
+    // ("2h", "Yesterday", "Jan 15") in visible text, with an ISO datetime in a
+    // `title` or `datetime` attribute on a <time> element. We read the ISO
+    // when available and use it to skip threads unchanged since lastSync. If
+    // no ISO is present, we scrape the thread (safe fallback).
+    threadTimestampIso: [
+        'time[datetime]',
+        'time[title]',
+    ],
+    threadTimestampText: [
+        '.msg-conversation-card__time-stamp',
+        'time',
+    ],
+
     // Tabs — inbox / archived / unread / InMail. We use the tab label to
     // populate the FOLDER column.
     folderTab: [

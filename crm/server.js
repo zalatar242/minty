@@ -3849,50 +3849,101 @@ let staleSources = new Set(); // Set of source names (e.g. 'linkedin', 'whatsapp
 // ============================================================
 let syncToastPoller = null;
 let syncToastLastDoneAt = 0;
-async function pollSyncToast() {
+let syncToastLiLastDone = 0;
+
+// Fetches LinkedIn progress shaped like the WhatsApp endpoint so the toast
+// renderer can treat both uniformly. LinkedIn's phase counts are stored in
+// sync-state.json.linkedin.progress = {phase, current, total} by fetch.js.
+async function fetchLinkedInToastData() {
+  try {
+    const r = await fetch(BASE + '/api/linkedin/status');
+    if (!r.ok) return null; // 404 when feature flag off
+    const s = await r.json();
+    const p = s.progress;
+    const active = s.status === 'syncing';
+    if (active && p) {
+      const phaseLabel = {
+        connecting: 'Syncing LinkedIn · connecting',
+        connections: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} connections\` : 'Syncing LinkedIn · connections',
+        details: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} contact details\` : 'Syncing LinkedIn · contact details',
+        messages: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} threads\` : 'Syncing LinkedIn · threads',
+        invitations: 'Syncing LinkedIn · invitations',
+        parsing: 'Syncing LinkedIn · merging',
+      }[p.phase] || \`Syncing LinkedIn · \${p.phase}\`;
+      const pct = (p.total && p.total > 0) ? Math.round((p.current / p.total) * 100) : null;
+      const label = pct != null ? phaseLabel + \` · \${pct}%\` : phaseLabel;
+      return { active: true, label, pct: pct != null ? pct : 10, source: 'linkedin' };
+    }
+    if (s.status === 'connected' && s.lastSync && Date.now() - Date.parse(s.lastSync) < 8000) {
+      return { active: false, done: true, label: 'LinkedIn sync complete', source: 'linkedin' };
+    }
+    return { active: false, done: false, source: 'linkedin' };
+  } catch { return null; }
+}
+
+async function fetchWhatsappToastData() {
   try {
     const r = await fetch(BASE + '/api/sources/whatsapp/progress');
-    if (!r.ok) return;
+    if (!r.ok) return null;
     const data = await r.json();
-    const toast = document.getElementById('sync-toast');
-    const text = document.getElementById('sync-toast-text');
-    const fill = document.getElementById('sync-toast-fill');
-    if (!toast || !text || !fill) return;
     const p = data.progress;
     if (data.active && p) {
-      toast.style.display = 'flex';
-      toast.classList.remove('success');
       let label = p.message || 'Syncing WhatsApp…';
+      let pct = null;
       if (p.step === 'messages' && p.total) {
-        const pct = Math.round((p.current / p.total) * 100);
+        pct = Math.round((p.current / p.total) * 100);
         const msgCount = p.messageCount ? p.messageCount.toLocaleString() + ' msgs · ' : '';
         label = \`Syncing WhatsApp · \${p.current}/\${p.total} chats · \${msgCount}\${pct}%\`;
-        fill.style.width = pct + '%';
-      } else if (p.step === 'contacts') {
-        fill.style.width = '5%';
-      } else if (p.step === 'chats') {
-        fill.style.width = '10%';
-      }
-      text.textContent = label;
-    } else if (p && p.step === 'done' && Date.now() - syncToastLastDoneAt < 8000) {
-      toast.classList.add('success');
-      toast.style.display = 'flex';
-      text.textContent = p.message || 'WhatsApp sync complete';
-      fill.style.width = '100%';
-    } else {
-      if (toast.classList.contains('success')) syncToastLastDoneAt = 0;
-      if (p && p.step === 'done' && !syncToastLastDoneAt) {
-        syncToastLastDoneAt = Date.now();
-        toast.classList.add('success');
-        toast.style.display = 'flex';
-        text.textContent = p.message || 'WhatsApp sync complete';
-        fill.style.width = '100%';
-        setTimeout(() => { toast.style.display = 'none'; }, 8000);
-      } else if (!p) {
-        toast.style.display = 'none';
-      }
+      } else if (p.step === 'contacts') { pct = 5; }
+      else if (p.step === 'chats') { pct = 10; }
+      return { active: true, label, pct, source: 'whatsapp', rawProgress: p };
     }
-  } catch {}
+    if (p && p.step === 'done') {
+      return { active: false, done: true, label: p.message || 'WhatsApp sync complete', source: 'whatsapp' };
+    }
+    return { active: false, done: false, source: 'whatsapp' };
+  } catch { return null; }
+}
+
+async function pollSyncToast() {
+  const toast = document.getElementById('sync-toast');
+  const text = document.getElementById('sync-toast-text');
+  const fill = document.getElementById('sync-toast-fill');
+  if (!toast || !text || !fill) return;
+  const [li, wa] = await Promise.all([fetchLinkedInToastData(), fetchWhatsappToastData()]);
+  // Active LinkedIn wins (opt-in, rarer), then active WhatsApp, then any "just-done" state.
+  const active = (li && li.active && li) || (wa && wa.active && wa);
+  if (active) {
+    toast.style.display = 'flex';
+    toast.classList.remove('success');
+    text.textContent = active.label;
+    fill.style.width = (active.pct != null ? active.pct : 10) + '%';
+    return;
+  }
+  // Show LinkedIn done for 8s after completion, same for WhatsApp.
+  if (li && li.done && Date.now() - syncToastLiLastDone < 8000) {
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = li.label || 'LinkedIn sync complete'; fill.style.width = '100%'; return;
+  }
+  if (li && li.done && !syncToastLiLastDone) {
+    syncToastLiLastDone = Date.now();
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = li.label || 'LinkedIn sync complete'; fill.style.width = '100%';
+    setTimeout(() => { toast.style.display = 'none'; }, 8000);
+    return;
+  }
+  if (wa && wa.done && Date.now() - syncToastLastDoneAt < 8000) {
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = wa.label || 'WhatsApp sync complete'; fill.style.width = '100%'; return;
+  }
+  if (wa && wa.done && !syncToastLastDoneAt) {
+    syncToastLastDoneAt = Date.now();
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = wa.label || 'WhatsApp sync complete'; fill.style.width = '100%';
+    setTimeout(() => { toast.style.display = 'none'; }, 8000);
+    return;
+  }
+  toast.style.display = 'none';
 }
 
 async function init() {
