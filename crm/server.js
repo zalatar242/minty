@@ -738,59 +738,68 @@ function buildSearchIndex(paths, uuid) {
     return _searchIndex[uuid];
 }
 
+const { searchInteractions: runSearch } = require('./search');
+
 function handleSearchInteractions(req, res, params, paths, uuid) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
-    const q = (url.searchParams.get('q') || '').trim().toLowerCase();
+    const q = (url.searchParams.get('q') || '').trim();
     if (q.length < 2) return json(res, { results: [], query: q });
 
     const { interactions, contactMap, contactById } = buildSearchIndex(paths, uuid);
 
-    const results = [];
-    const MAX = 50;
-
-    for (const i of interactions) {
-        if (results.length >= MAX) break;
-        const body = (i.body || i.subject || '').toLowerCase();
-        if (!body.includes(q)) continue;
-        if (i.chatId?.endsWith('@g.us')) continue; // skip group messages
-
-        // Find contact for this interaction
+    // Decorate interactions with their resolved contact so search.js can filter/emit it.
+    // Done lazily once per search — cheap compared to loading the interactions array.
+    const enriched = interactions.map(i => {
         let contactId = null;
         if (i.chatId) contactId = contactMap[i.chatId];
-        if (!contactId && i.from) contactId = contactMap[i.from];
+        if (!contactId && i.from && typeof i.from === 'string') contactId = contactMap[i.from];
         if (!contactId && i.source === 'linkedin' && i.chatName) {
             for (const name of i.chatName.split(',').map(n => n.trim())) {
                 if (contactMap[name]) { contactId = contactMap[name]; break; }
             }
         }
-
         const contact = contactId ? contactById[contactId] : null;
-        const raw = i.body || i.subject || '';
-        const idx = raw.toLowerCase().indexOf(q);
-        const start = Math.max(0, idx - 40);
-        const end = Math.min(raw.length, idx + q.length + 80);
-        const snippet = (start > 0 ? '…' : '') + raw.slice(start, end) + (end < raw.length ? '…' : '');
-
-        results.push({
-            source: i.source,
-            timestamp: i.timestamp,
-            chatName: i.chatName,
-            snippet,
-            matchStart: idx - start + (start > 0 ? 1 : 0), // offset within snippet for highlight
-            matchLen: q.length,
-            contactId: contact?.id || null,
-            contactName: contact?.name || null,
+        return Object.assign({}, i, {
+            _contactId: contact?.id || null,
+            _contactName: contact?.name || null,
         });
-    }
-
-    // Sort by timestamp descending
-    results.sort((a, b) => {
-        if (!a.timestamp) return 1;
-        if (!b.timestamp) return -1;
-        return new Date(b.timestamp) - new Date(a.timestamp);
     });
 
-    json(res, { results, query: q, total: results.length });
+    const opts = {
+        limit: Math.max(1, Math.min(200, Number(url.searchParams.get('limit')) || 50)),
+        excludeGroups: url.searchParams.get('includeGroups') !== '1',
+    };
+    const source = url.searchParams.getAll('source');
+    if (source.length) opts.source = source;
+    const contactId = url.searchParams.get('contactId');
+    if (contactId) opts.contactId = contactId;
+    const chatId = url.searchParams.get('chatId');
+    if (chatId) opts.chatId = chatId;
+    const since = url.searchParams.get('since');
+    if (since) opts.since = since;
+    const until = url.searchParams.get('until');
+    if (until) opts.until = until;
+
+    const result = runSearch(enriched, q, opts);
+    json(res, {
+        query: result.query,
+        total: result.total,
+        results: result.results.map(r => ({
+            source: r.source,
+            timestamp: r.timestamp,
+            chatId: r.chatId,
+            chatName: r.chatName,
+            from: r.from,
+            to: r.to,
+            snippet: r.snippet,
+            matches: r.matches,
+            // Back-compat fields for existing UI callers
+            matchStart: r.matches[0]?.start ?? 0,
+            matchLen: r.matches[0]?.length ?? 0,
+            contactId: r.contactId,
+            contactName: r.contactName,
+        })),
+    });
 }
 
 // ---------------------------------------------------------------------------
