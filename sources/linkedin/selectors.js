@@ -153,6 +153,13 @@ const MESSAGING_INBOX = {
 const MESSAGE_THREAD = {
     urlTemplate: 'https://www.linkedin.com/messaging/thread/{id}/',
 
+    // The scrollable container that holds all bubbles. Used by the adaptive
+    // scroll loop to scroll-to-top and trigger history loading.
+    messageListContainer: [
+        '.msg-s-message-list',
+        'ul.msg-s-message-list-content',
+    ],
+
     // Each message bubble in a thread. drift sentinel.
     messageBubble: [
         '[data-test-message-bubble]',

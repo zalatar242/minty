@@ -1746,6 +1746,22 @@ function handleWhatsappProgress(req, res, params, paths, uuid) {
     json(res, { active, progress: progress || null });
 }
 
+// Aggregator: returns progress for every source that has one. Halves the
+// toast poll rate (one fetch instead of two). Neutral to feature flags:
+// linkedin is present only when MINTY_LINKEDIN_AUTOSYNC=1; other sources
+// remain individually queryable via their existing endpoints.
+function handleSyncProgress(req, res, params, paths, uuid) {
+    const session = waClients[uuid];
+    const waRaw = session?.progress || readExportProgress(uuid);
+    const whatsapp = { active: !!waRaw && waRaw.step !== 'done', progress: waRaw || null };
+    let linkedin = null;
+    if (LINKEDIN_AUTOSYNC_ENABLED) {
+        const state = readLinkedInState();
+        linkedin = { ...state, playwrightAvailable: linkedInPlaywrightAvailable() };
+    }
+    json(res, { whatsapp, linkedin });
+}
+
 async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
     const chatsPath = path.join(waDir, 'chats.json');
     const progressPath = path.join(waDir, '.export-progress.json');
@@ -2350,6 +2366,7 @@ const ROUTES = [
     ['POST', /^\/api\/sources\/whatsapp\/start$/,         handleWhatsappStart],
     ['GET',  /^\/api\/sources\/whatsapp\/status$/,        handleWhatsappStatus],
     ['GET',  /^\/api\/sources\/whatsapp\/progress$/,      handleWhatsappProgress],
+    ['GET',  /^\/api\/sync\/progress$/,                   handleSyncProgress],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -3854,55 +3871,49 @@ let syncToastLiLastDone = 0;
 // Fetches LinkedIn progress shaped like the WhatsApp endpoint so the toast
 // renderer can treat both uniformly. LinkedIn's phase counts are stored in
 // sync-state.json.linkedin.progress = {phase, current, total} by fetch.js.
-async function fetchLinkedInToastData() {
-  try {
-    const r = await fetch(BASE + '/api/linkedin/status');
-    if (!r.ok) return null; // 404 when feature flag off
-    const s = await r.json();
-    const p = s.progress;
-    const active = s.status === 'syncing';
-    if (active && p) {
-      const phaseLabel = {
-        connecting: 'Syncing LinkedIn · connecting',
-        connections: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} connections\` : 'Syncing LinkedIn · connections',
-        details: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} contact details\` : 'Syncing LinkedIn · contact details',
-        messages: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} threads\` : 'Syncing LinkedIn · threads',
-        invitations: 'Syncing LinkedIn · invitations',
-        parsing: 'Syncing LinkedIn · merging',
-      }[p.phase] || \`Syncing LinkedIn · \${p.phase}\`;
-      const pct = (p.total && p.total > 0) ? Math.round((p.current / p.total) * 100) : null;
-      const label = pct != null ? phaseLabel + \` · \${pct}%\` : phaseLabel;
-      return { active: true, label, pct: pct != null ? pct : 10, source: 'linkedin' };
-    }
-    if (s.status === 'connected' && s.lastSync && Date.now() - Date.parse(s.lastSync) < 8000) {
-      return { active: false, done: true, label: 'LinkedIn sync complete', source: 'linkedin' };
-    }
-    return { active: false, done: false, source: 'linkedin' };
-  } catch { return null; }
+// Translate raw progress payloads from /api/sync/progress into the shape the
+// toast renderer uses (label, pct, active, done).
+
+function linkedInToastFromState(s) {
+  if (!s) return null;
+  const p = s.progress;
+  if (s.status === 'syncing' && p) {
+    const phaseLabel = {
+      connecting: 'Syncing LinkedIn · connecting',
+      connections: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} connections\` : 'Syncing LinkedIn · connections',
+      details: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} contact details\` : 'Syncing LinkedIn · contact details',
+      messages: p.total ? \`Syncing LinkedIn · \${p.current}/\${p.total} threads\` : 'Syncing LinkedIn · threads',
+      invitations: 'Syncing LinkedIn · invitations',
+      parsing: 'Syncing LinkedIn · merging',
+    }[p.phase] || \`Syncing LinkedIn · \${p.phase}\`;
+    const pct = (p.total && p.total > 0) ? Math.round((p.current / p.total) * 100) : null;
+    const label = pct != null ? phaseLabel + \` · \${pct}%\` : phaseLabel;
+    return { active: true, label, pct: pct != null ? pct : 10 };
+  }
+  if (s.status === 'connected' && s.lastSync && Date.now() - Date.parse(s.lastSync) < 8000) {
+    return { active: false, done: true, label: 'LinkedIn sync complete' };
+  }
+  return { active: false, done: false };
 }
 
-async function fetchWhatsappToastData() {
-  try {
-    const r = await fetch(BASE + '/api/sources/whatsapp/progress');
-    if (!r.ok) return null;
-    const data = await r.json();
-    const p = data.progress;
-    if (data.active && p) {
-      let label = p.message || 'Syncing WhatsApp…';
-      let pct = null;
-      if (p.step === 'messages' && p.total) {
-        pct = Math.round((p.current / p.total) * 100);
-        const msgCount = p.messageCount ? p.messageCount.toLocaleString() + ' msgs · ' : '';
-        label = \`Syncing WhatsApp · \${p.current}/\${p.total} chats · \${msgCount}\${pct}%\`;
-      } else if (p.step === 'contacts') { pct = 5; }
-      else if (p.step === 'chats') { pct = 10; }
-      return { active: true, label, pct, source: 'whatsapp', rawProgress: p };
-    }
-    if (p && p.step === 'done') {
-      return { active: false, done: true, label: p.message || 'WhatsApp sync complete', source: 'whatsapp' };
-    }
-    return { active: false, done: false, source: 'whatsapp' };
-  } catch { return null; }
+function whatsappToastFromPayload(data) {
+  if (!data) return null;
+  const p = data.progress;
+  if (data.active && p) {
+    let label = p.message || 'Syncing WhatsApp…';
+    let pct = null;
+    if (p.step === 'messages' && p.total) {
+      pct = Math.round((p.current / p.total) * 100);
+      const msgCount = p.messageCount ? p.messageCount.toLocaleString() + ' msgs · ' : '';
+      label = \`Syncing WhatsApp · \${p.current}/\${p.total} chats · \${msgCount}\${pct}%\`;
+    } else if (p.step === 'contacts') { pct = 5; }
+    else if (p.step === 'chats') { pct = 10; }
+    return { active: true, label, pct };
+  }
+  if (p && p.step === 'done') {
+    return { active: false, done: true, label: p.message || 'WhatsApp sync complete' };
+  }
+  return { active: false, done: false };
 }
 
 async function pollSyncToast() {
@@ -3910,7 +3921,15 @@ async function pollSyncToast() {
   const text = document.getElementById('sync-toast-text');
   const fill = document.getElementById('sync-toast-fill');
   if (!toast || !text || !fill) return;
-  const [li, wa] = await Promise.all([fetchLinkedInToastData(), fetchWhatsappToastData()]);
+  let li = null, wa = null;
+  try {
+    const r = await fetch(BASE + '/api/sync/progress');
+    if (r.ok) {
+      const data = await r.json();
+      li = linkedInToastFromState(data.linkedin);
+      wa = whatsappToastFromPayload(data.whatsapp);
+    }
+  } catch {}
   // Active LinkedIn wins (opt-in, rarer), then active WhatsApp, then any "just-done" state.
   const active = (li && li.active && li) || (wa && wa.active && wa);
   if (active) {
