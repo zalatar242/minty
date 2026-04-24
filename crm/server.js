@@ -290,6 +290,40 @@ function handleGetContact(req, res, [id], paths, uuid) {
 const _mentionsModule = require('./mentions');
 const _exportModule = require('./export');
 const _lifeEvents = require('./life-events');
+const _goalRetro = require('./goal-retro');
+
+/**
+ * GET /api/goals/:id/retro
+ * Synthesise a goal retro — pipeline funnel, stuck/moving/ghosted/replied
+ * contacts, plus a short narrative paragraph.
+ */
+function handleGoalRetro(req, res, [goalId], paths, uuid) {
+    const goals = loadGoals(paths);
+    const goal = goals.find(g => g.id === goalId);
+    if (!goal) return json(res, { error: 'goal not found' }, 404);
+
+    const contacts = loadContacts(paths);
+    const ixns = fs.existsSync(paths.interactions)
+        ? JSON.parse(fs.readFileSync(paths.interactions, 'utf8')) : [];
+    const { contactMap } = buildSearchIndex(paths, uuid);
+    const byContact = {};
+    for (const i of ixns) {
+        let cid = null;
+        if (i.chatId) cid = contactMap[i.chatId];
+        if (!cid && typeof i.from === 'string') cid = contactMap[i.from];
+        if (!cid && i.source === 'linkedin' && i.chatName) {
+            for (const name of i.chatName.split(',').map(n => n.trim())) {
+                if (contactMap[name]) { cid = contactMap[name]; break; }
+            }
+        }
+        if (!cid) continue;
+        if (!byContact[cid]) byContact[cid] = [];
+        byContact[cid].push({ ...i, _contactId: cid });
+    }
+    const selfIds = new Set(['me', ...(paths.selfIds || [])]);
+    const retro = _goalRetro.buildGoalRetro(goal, contacts, byContact, selfIds);
+    json(res, retro);
+}
 
 /**
  * GET /api/life-events
@@ -2832,6 +2866,7 @@ const ROUTES = [
     ['GET',  /^\/api\/life-events$/,                      handleGetLifeEvents],
     ['POST', /^\/api\/goals\/([^/]+)\/assign$/,           handleGoalAssign],
     ['GET',  /^\/api\/goals\/([^/]+)\/pipeline$/,         handleGoalPipeline],
+    ['GET',  /^\/api\/goals\/([^/]+)\/retro$/,            handleGoalRetro],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
