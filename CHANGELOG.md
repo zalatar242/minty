@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Major overnight expansion pushing hard on the three Minty theses: unified
+cross-source data, goal-activation UX, and privacy-first local-first. Adds a
+command palette, semantic Ask, warm-intro path finder, life-event detection,
+goal pipelines + retros, contact @-mentions, engagement metrics, post-meeting
+debriefs, encrypted backup, and CI — all green on 747 tests.
+
+### Added
+- **Cmd/Ctrl+K command palette** — one keystroke to search contacts, messages,
+  goals, companies, and navigate any view. Debounced to 80ms; arrow keys +
+  Enter to select. Backing module at `crm/palette.js`. (Endpoints:
+  `GET /api/palette?q=…`.)
+- **Universal full-text search over interactions** — `crm/search.js`
+  supports phrase queries (`"exact phrase"`), prefix (`invest*`), negation
+  (`-spam`), AND semantics, and filters by source/contactId/chatId/date. Snippet
+  extraction with highlight offsets. Backs the palette's "In conversations"
+  rail plus a more powerful `/api/search/interactions`.
+- **Semantic Ask v2** — `crm/query-reasons.js` adds keyword expansion
+  (payments → stripe/adyen/billing, notification → pubsub/alerts/pagerduty,
+  ~25 domain terms) plus per-result **reason chips** ("role", "location",
+  "keyword", "topic", "warmth", "recent") that explain *why* each person
+  matched. The Happenstance "Show thinking" UX, self-hosted.
+- **Warm-intro path finder** (`/api/intros/find?q=…`) — type a target name /
+  company / position, Minty fuzzy-matches candidates across contacts and for
+  each one computes the warmest path through WhatsApp group graph. Surfaces
+  per-hop relationship score + shared communities.
+- **Life-event detection** (`crm/life-events.js`) — regex-based detection of
+  job changes, fundraises, launches, acquisitions, life moments, and upcoming
+  birthdays (via Google Contacts BDAY). Also diffs LinkedIn company vs Apollo
+  employment history. Surfaced on Today as "Recent in your network."
+- **Per-contact engagement metrics** (`crm/response-metrics.js`) — reply
+  rate, median reply latency, initiation balance, composite engagement score.
+  Rendered as chips on every contact's hero card ("65% reply · 2d avg ·
+  balanced"). Goes beyond the relationship-score heuristic to actual
+  behavioural signal.
+- **Goal pipelines** — every goal now carries a 5-stage default pipeline
+  (To reach out → Contacted → Meeting → Intro made → Closed) with per-contact
+  assignments. Today view shows a summary pill per stage and an inline
+  dropdown to move contacts between stages.
+- **Goal retros** (`/api/goals/:id/retro`) — funnel + stuck / moving /
+  ghosted / replied classification + a 3-sentence narrative paragraph.
+- **Post-meeting debriefs** (`crm/meeting-debrief.js`) — outcome notes +
+  action items + stage moves per calendar event. Stage moves are applied
+  against `goals.json` live.
+- **Contact notes with @-mention backlinks** (`crm/mentions.js`) — write
+  `@alex chen` in notes, Minty resolves it to a contact and cross-links
+  both sides. Mentioned contacts get a "Mentioned in" section on their
+  page.
+- **Unified per-source progress** (`sources/_shared/progress.js`) — every
+  importer (LinkedIn ZIP, Telegram, SMS, Email, Google Contacts, + back-compat
+  for WhatsApp) now writes a canonical `.progress.json` with atomic writes.
+  New endpoints `GET /api/sources/:key/progress` and `GET /api/sync/progress`
+  drive a universal sync toast that works across every source.
+- **Portable encrypted backup** (`crm/export.js`, `npm run export`,
+  `GET /api/export`) — one-shot bundle of contacts, interactions, insights,
+  goals, and memberships. Plain bundles are gzipped JSON; passphrase-enabled
+  bundles add AES-256-GCM with PBKDF2-sha256 (200k iterations).
+- **Seeded synthetic dev dataset** (`scripts/seed-dev-data.js`,
+  `npm run seed:dev`) — deterministic PRNG produces 40 realistic contacts
+  (investors, founders, engineers, creatives, etc.) across 6 sources,
+  1200+ interactions, insights, 3 goals, sync state. Enables offline UI
+  smoke-testing without importing real data.
+- **GitHub Actions CI** — `.github/workflows/test.yml` runs `npm test` on
+  Node 20 + 22, plus seed-data + export smoke, plus a sanity lint job that
+  `node --check`'s every JS file.
+
+### Fixed
+- `npm test` green on fresh checkout — `csv-parse` was declared as an optional
+  dependency but never installed, so `linkedin-csv.test.js` failed out of the
+  box. Moved to installed optionals.
+
+### Tests
+- New suites: `seed-dev-data`, `source-progress`, `search`, `palette`,
+  `query-reasons`, `response-metrics`, `mentions`, `export`, `life-events`,
+  `goal-pipeline`, `goal-retro`, `meeting-debrief` (100+ new unit tests).
+- Total: 747 tests, 734 passing, 13 skipped, 0 failing.
+
+
 ## [0.3.2] - 2026-04-23
 
 Foundation for forthcoming opt-in LinkedIn auto-sync. No user-visible feature ships in this release — everything sits behind an opt-in install that users don't run by default. The scraper itself will land in a follow-up release once Approach-C (headful login → headless session reuse) has been validated on a real LinkedIn account.
