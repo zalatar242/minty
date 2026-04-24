@@ -19,8 +19,12 @@
 
 const fs = require('fs');
 const path = require('path');
+const readline = require('readline');
 
 const tosGate = require('./tos-gate');
+const credentials = require('./credentials');
+const { totp, secondsUntilNext } = require('./totp');
+const SELECTORS = require('./selectors');
 
 const DEFAULT_DATA_DIR = path.resolve(__dirname, '../../data');
 const DEFAULT_SYNC_STATE_REL = 'sync-state.json';
@@ -120,6 +124,172 @@ const INSTRUCTIONS = [
     'Then close the Chromium window (or press Ctrl+C in this terminal).',
 ].join('\n');
 
+const AUTO_INSTRUCTIONS = [
+    'LinkedIn Auto-Connect',
+    '',
+    'Using stored credentials. Chromium is logging in for you.',
+    'If LinkedIn prompts for a challenge we can\'t handle (SMS, device verify,',
+    'CAPTCHA), the window will stay open for you to complete manually.',
+].join('\n');
+
+// --- Interactive creds prompter ---------------------------------------------
+// Reads email, password, optional TOTP secret from stdin. Password input is
+// echoed (readline doesn't do masking cleanly cross-platform — for a local
+// single-user CLI that's OK, and it avoids a native-terminal dep). Users
+// uncomfortable with that should type the creds into data/linkedin/credentials.json
+// by hand (chmod 600 first).
+
+function promptLine(stdin, stdout, question) {
+    return new Promise((resolve) => {
+        const rl = readline.createInterface({ input: stdin, output: stdout });
+        rl.question(question, (answer) => {
+            rl.close();
+            resolve(answer);
+        });
+    });
+}
+
+async function promptForCreds(stdin, stdout) {
+    stdout.write([
+        '',
+        'LinkedIn credential setup',
+        '',
+        'These are stored LOCALLY at data/linkedin/credentials.json with 0o600.',
+        'Minty never sends them anywhere. If your machine is multi-user or',
+        'unencrypted, Ctrl+C now and use the manual flow instead.',
+        '',
+    ].join('\n'));
+    const email = (await promptLine(stdin, stdout, 'LinkedIn email: ')).trim();
+    const password = await promptLine(stdin, stdout, 'LinkedIn password (echoes on screen): ');
+    stdout.write([
+        '',
+        'TOTP secret (optional). If you enable "Authenticator app" 2FA in',
+        'LinkedIn → Settings → Sign in & security → Two-step verification,',
+        'LinkedIn shows a base32 string before the QR code — that\'s the secret.',
+        'Leave blank if you don\'t have one; you\'ll handle 2FA manually.',
+        '',
+    ].join('\n'));
+    const totpRaw = (await promptLine(stdin, stdout, 'TOTP secret (blank to skip): ')).trim();
+    const creds = { email, password };
+    if (totpRaw) creds.totpSecret = totpRaw;
+    return creds;
+}
+
+// --- Auto-login -------------------------------------------------------------
+
+async function firstMatching(page, selectors, { timeout = 5000 } = {}) {
+    // Playwright's page.waitForSelector only takes one selector. We race an
+    // Array.from + querySelector poll instead so multiple candidates work.
+    const started = Date.now();
+    while (Date.now() - started < timeout) {
+        for (const s of selectors) {
+            const el = await page.$(s);
+            if (el) return { el, selector: s };
+        }
+        await page.waitForTimeout(250);
+    }
+    return null;
+}
+
+async function isLoggedIn(page) {
+    const url = page.url();
+    for (const p of SELECTORS.LOGIN.successUrlPatterns) {
+        if (url.includes(p)) return true;
+    }
+    return false;
+}
+
+async function isChallengeActive(page) {
+    const url = page.url();
+    for (const p of SELECTORS.CHALLENGE.urlPatterns) {
+        if (url.includes(p)) return true;
+    }
+    // Also detect a TOTP input on the current page (URL patterns aren't
+    // exhaustive — LinkedIn sometimes keeps you on /login for challenges).
+    return !!(await firstMatching(page, SELECTORS.CHALLENGE.totpInput, { timeout: 1000 }));
+}
+
+/**
+ * Attempt automated login. Returns true on success, false if we hit a
+ * challenge we can't handle (SMS, device verify, CAPTCHA). On false, the
+ * caller should fall through to the manual flow (keep window open).
+ */
+async function tryAutoLogin(page, creds, { stderr } = {}) {
+    const writeStderr = (stderr && stderr.write) ? stderr.write.bind(stderr) : () => {};
+    await page.goto(SELECTORS.LOGIN.url, { waitUntil: 'domcontentloaded' });
+    // If already signed in (cookie from prior session), LinkedIn redirects
+    // straight to /feed — skip the form entirely.
+    await page.waitForTimeout(1000);
+    if (await isLoggedIn(page)) return true;
+
+    const emailHit = await firstMatching(page, SELECTORS.LOGIN.emailInput);
+    const pwHit = await firstMatching(page, SELECTORS.LOGIN.passwordInput);
+    if (!emailHit || !pwHit) {
+        writeStderr('auto-login: login form not found, falling back to manual.\n');
+        return false;
+    }
+    await page.fill(emailHit.selector, creds.email);
+    await page.fill(pwHit.selector, creds.password);
+    const submitHit = await firstMatching(page, SELECTORS.LOGIN.submitButton);
+    if (!submitHit) {
+        writeStderr('auto-login: submit button not found, falling back to manual.\n');
+        return false;
+    }
+    await page.click(submitHit.selector);
+
+    // Wait up to 15s for either success URL or a challenge page.
+    const started = Date.now();
+    while (Date.now() - started < 15000) {
+        await page.waitForTimeout(500);
+        if (await isLoggedIn(page)) return true;
+        if (await isChallengeActive(page)) break;
+    }
+
+    // Challenge path — we can only handle TOTP if the user stored a secret.
+    if (!creds.totpSecret) {
+        writeStderr('auto-login: 2FA required but no TOTP secret stored. Falling back to manual.\n');
+        return false;
+    }
+
+    const totpHit = await firstMatching(page, SELECTORS.CHALLENGE.totpInput, { timeout: 5000 });
+    if (!totpHit) {
+        writeStderr('auto-login: challenge page present but no TOTP input found (may be SMS/device verify). Falling back to manual.\n');
+        return false;
+    }
+
+    // If we're within 3s of the code rotating, wait for the next window so
+    // LinkedIn doesn't reject the code we're about to type.
+    if (secondsUntilNext(Date.now()) < 3) {
+        await page.waitForTimeout(3500);
+    }
+    const code = totp(creds.totpSecret);
+    await page.fill(totpHit.selector, code);
+    const totpSubmit = await firstMatching(page, SELECTORS.CHALLENGE.totpSubmit);
+    if (!totpSubmit) {
+        writeStderr('auto-login: TOTP submit button not found. Falling back to manual.\n');
+        return false;
+    }
+    await page.click(totpSubmit.selector);
+
+    // Wait up to 15s more for success.
+    const started2 = Date.now();
+    while (Date.now() - started2 < 15000) {
+        await page.waitForTimeout(500);
+        if (await isLoggedIn(page)) return true;
+        // If we got kicked back to the challenge page, TOTP was wrong.
+        if (await isChallengeActive(page)) {
+            // Give LinkedIn a moment — sometimes the page briefly re-renders.
+            await page.waitForTimeout(2000);
+            if (!(await isLoggedIn(page))) {
+                writeStderr('auto-login: TOTP rejected or secondary challenge appeared. Falling back to manual.\n');
+                return false;
+            }
+        }
+    }
+    writeStderr('auto-login: timed out waiting for feed redirect. Falling back to manual.\n');
+    return false;
+}
+
 /**
  * Resolve the profile dir from env or a default under dataDir.
  */
@@ -206,6 +376,38 @@ async function run(opts) {
         }
     }
 
+    // 4.5. Credentials: offer to save, or load existing. Three env toggles:
+    //   LINKEDIN_SAVE_CREDS=1  → interactive prompt, write to creds store
+    //   LINKEDIN_FORGET_CREDS=1→ delete stored creds, then fall through
+    //   LINKEDIN_MANUAL=1      → force manual flow even if stored creds exist
+    let storedCreds = null;
+    if (process.env.LINKEDIN_FORGET_CREDS === '1') {
+        try {
+            credentials.remove(dataDir);
+            stdout.write('Stored LinkedIn credentials removed.\n');
+        } catch (err) {
+            stderr.write('failed to remove credentials: ' + (err.message || err) + '\n');
+        }
+    }
+    if (process.env.LINKEDIN_SAVE_CREDS === '1') {
+        try {
+            const entered = await promptForCreds(stdin, stdout);
+            credentials.write(dataDir, entered);
+            storedCreds = entered;
+            stdout.write('✓ Credentials saved to ' + credentials.credPath(dataDir) + ' (mode 0600).\n');
+        } catch (err) {
+            stderr.write('✖ credential setup failed: ' + (err.message || err) + '\n');
+            return 1;
+        }
+    } else if (process.env.LINKEDIN_MANUAL !== '1') {
+        try {
+            storedCreds = credentials.read(dataDir);
+        } catch (err) {
+            stderr.write('warning: ' + (err.message || err) + '\n');
+            storedCreds = null;
+        }
+    }
+
     // 5/6. Launch Chromium + wait for close.
     const { chromium } = playwright;
     let context = null;
@@ -254,24 +456,42 @@ async function run(opts) {
         process.on('SIGINT', sigintHandler);
         process.on('SIGTERM', sigtermHandler);
 
-        try {
-            const page = await context.newPage();
-            await page.goto('https://www.linkedin.com');
-        } catch (err) {
-            // Navigation failures aren't fatal — user may still be able to
-            // navigate manually. Print a soft warning and keep going.
-            const msg = err && err.message ? err.message : String(err);
-            stderr.write(
-                'warning: initial navigation failed (' +
-                    msg +
+        let autoLoggedIn = false;
+        const page = await context.newPage();
+        if (storedCreds) {
+            stdout.write(AUTO_INSTRUCTIONS + '\n');
+            try {
+                autoLoggedIn = await tryAutoLogin(page, storedCreds, { stderr });
+            } catch (err) {
+                stderr.write(
+                    'auto-login threw: ' + (err.message || String(err)) +
+                    '. Falling back to manual.\n'
+                );
+                autoLoggedIn = false;
+            }
+        } else {
+            try {
+                await page.goto('https://www.linkedin.com');
+            } catch (err) {
+                const msg = err && err.message ? err.message : String(err);
+                stderr.write(
+                    'warning: initial navigation failed (' + msg +
                     '); the browser window is still open.\n'
-            );
+                );
+            }
         }
 
-        stdout.write(INSTRUCTIONS + '\n');
-
-        // Wait for the user to close the Chromium window.
-        await context.waitForEvent('close');
+        if (!autoLoggedIn) {
+            // Manual path — user completes login / challenge in the window.
+            // timeout: 0 = wait indefinitely; logging in + 2FA takes minutes.
+            stdout.write(INSTRUCTIONS + '\n');
+            await context.waitForEvent('close', { timeout: 0 });
+        } else {
+            // Auto-login succeeded. Close context immediately and move on.
+            stdout.write('✓ Auto-login succeeded. Saving session...\n');
+            await context.close();
+            context = null;
+        }
 
         // 7. Success — record state.
         try {

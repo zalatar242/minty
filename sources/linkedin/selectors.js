@@ -221,9 +221,68 @@ const MESSAGE_THREAD = {
     ],
 };
 
+// /login and related auth flows. Used by connect.js auto-login mode.
+const LOGIN = {
+    url: 'https://www.linkedin.com/login',
+
+    // Email / username field on the classic login form.
+    emailInput: [
+        '#username',
+        'input[name="session_key"]',
+        'input[autocomplete="username"]',
+    ],
+
+    // Password field.
+    passwordInput: [
+        '#password',
+        'input[name="session_password"]',
+        'input[autocomplete="current-password"]',
+    ],
+
+    // Submit button on the email+password form.
+    submitButton: [
+        'button[type="submit"][aria-label*="Sign in"]',
+        'button[type="submit"].btn__primary--large',
+        'button[type="submit"]',
+    ],
+
+    // URL patterns that indicate a successful login landing page.
+    successUrlPatterns: [
+        '/feed',
+        '/mynetwork',
+        '/in/', // profile page
+    ],
+};
+
+// Two-step verification / challenge interstitials. TOTP (authenticator-app)
+// only — SMS/email challenges require the user to read the code from their
+// phone and still need the manual flow.
+const CHALLENGE = {
+    // Pages/URLs that indicate a challenge is active.
+    urlPatterns: [
+        '/checkpoint/',
+        '/uas/consumer-login-submit',
+    ],
+
+    // TOTP code input. LinkedIn rotates the selector occasionally.
+    totpInput: [
+        'input[name="pin"]',
+        '#input__email_verification_pin',
+        'input[aria-label*="verification code" i]',
+        'input[inputmode="numeric"]',
+    ],
+
+    totpSubmit: [
+        'button[type="submit"][data-litms-control-urn*="verify"]',
+        'button[type="submit"]',
+    ],
+};
+
 module.exports = {
     CONNECTIONS_LIST,
     CONTACT_INFO_MODAL,
     MESSAGING_INBOX,
     MESSAGE_THREAD,
+    LOGIN,
+    CHALLENGE,
 };
