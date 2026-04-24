@@ -291,6 +291,75 @@ const _mentionsModule = require('./mentions');
 const _exportModule = require('./export');
 const _lifeEvents = require('./life-events');
 const _goalRetro = require('./goal-retro');
+const _meetingDebrief = require('./meeting-debrief');
+
+function loadDebriefs(paths) {
+    try {
+        const p = path.join(path.dirname(paths.contacts), 'meeting-debriefs.json');
+        return JSON.parse(fs.readFileSync(p, 'utf8'));
+    } catch { return {}; }
+}
+
+function saveDebriefs(paths, store) {
+    const p = path.join(path.dirname(paths.contacts), 'meeting-debriefs.json');
+    fs.writeFileSync(p, JSON.stringify(store, null, 2));
+}
+
+/**
+ * GET /api/meetings/debriefs/pending
+ * Returns past meetings that haven't yet been debriefed, for the Today card.
+ */
+function handleGetPendingDebriefs(req, res, _params, paths) {
+    const syncStatePath = path.join(path.dirname(paths.contacts), '..', 'sync-state.json');
+    let meetings = [];
+    try {
+        const syncState = JSON.parse(fs.readFileSync(syncStatePath, 'utf8'));
+        meetings = (syncState.calendar && syncState.calendar.upcomingMeetings) || [];
+    } catch { meetings = []; }
+    const store = loadDebriefs(paths);
+    const pending = _meetingDebrief.pendingDebriefs(meetings, store);
+    json(res, { count: pending.length, meetings: pending });
+}
+
+/**
+ * POST /api/meetings/:id/debrief
+ * Persist the user's debrief notes + stage moves for a meeting.
+ */
+async function handleSaveDebrief(req, res, [meetingId], paths) {
+    const payload = await body(req);
+    try {
+        const store = loadDebriefs(paths);
+        const updated = _meetingDebrief.recordDebrief(store, meetingId, payload || {});
+        saveDebriefs(paths, updated);
+        // Apply stage moves against goals.json if supplied
+        if (payload && Array.isArray(payload.stageMoves) && payload.stageMoves.length) {
+            const goals = loadGoals(paths);
+            let touched = false;
+            for (const mv of payload.stageMoves) {
+                if (!mv || !mv.goalId || !mv.contactId || !mv.stage) continue;
+                const g = goals.find(x => x.id === mv.goalId);
+                if (!g) continue;
+                g.assignments = g.assignments || {};
+                g.assignments[mv.contactId] = { stage: mv.stage, updatedAt: new Date().toISOString() };
+                touched = true;
+            }
+            if (touched) fs.writeFileSync(paths.goals, JSON.stringify(goals, null, 2));
+        }
+        json(res, { meetingId, debrief: updated[meetingId] });
+    } catch (e) {
+        json(res, { error: e.message }, 400);
+    }
+}
+
+/**
+ * GET /api/meetings/:id/debrief — read a previously-logged debrief.
+ */
+function handleGetDebrief(req, res, [meetingId], paths) {
+    const store = loadDebriefs(paths);
+    const entry = store[meetingId];
+    if (!entry) return json(res, { error: 'not logged' }, 404);
+    json(res, { meetingId, debrief: entry });
+}
 
 /**
  * GET /api/goals/:id/retro
@@ -2867,6 +2936,9 @@ const ROUTES = [
     ['POST', /^\/api\/goals\/([^/]+)\/assign$/,           handleGoalAssign],
     ['GET',  /^\/api\/goals\/([^/]+)\/pipeline$/,         handleGoalPipeline],
     ['GET',  /^\/api\/goals\/([^/]+)\/retro$/,            handleGoalRetro],
+    ['GET',  /^\/api\/meetings\/debriefs\/pending$/,     handleGetPendingDebriefs],
+    ['GET',  /^\/api\/meetings\/([^/]+)\/debrief$/,      handleGetDebrief],
+    ['POST', /^\/api\/meetings\/([^/]+)\/debrief$/,      handleSaveDebrief],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
