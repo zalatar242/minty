@@ -266,14 +266,41 @@ function getViewerContactId(paths) {
 }
 
 function handleGetContact(req, res, [id], paths, uuid) {
-    const contact = loadContacts(paths).find(c => c.id === id);
+    const allContacts = loadContacts(paths);
+    const contact = allContacts.find(c => c.id === id);
     if (!contact) return json(res, { error: 'not found' }, 404);
     // Enrich with shared-groups metadata for the "you're both in…" section.
     const memberships = loadGroupMemberships();
     const sharedGroups = getSharedGroups(contact, memberships);
     // Engagement metrics (reply rate, latency, initiation balance)
     const metrics = computeContactEngagement(contact, paths, uuid);
-    json(res, { ...contact, sharedGroups, metrics });
+    // Resolved @-mentions in *this contact's* notes and the reverse index
+    // (who mentions this contact in their notes).
+    const mentionsOut = _mentionsModule.resolveMentions(contact.notes || '', allContacts);
+    const backlinks = getMentionIndex(allContacts)[id] || [];
+    json(res, {
+        ...contact,
+        sharedGroups,
+        metrics,
+        mentionsOut,
+        mentionBacklinks: backlinks,
+    });
+}
+
+const _mentionsModule = require('./mentions');
+// Cache the mention index — rebuilds only when contacts.json changes.
+let _mentionIndex = null;
+let _mentionIndexMtime = 0;
+function getMentionIndex(contacts) {
+    try {
+        const st = fs.statSync(path.join(DATA, 'unified/contacts.json'));
+        if (st.mtimeMs === _mentionIndexMtime && _mentionIndex) return _mentionIndex;
+        _mentionIndex = _mentionsModule.buildMentionIndex(contacts);
+        _mentionIndexMtime = st.mtimeMs;
+    } catch {
+        _mentionIndex = _mentionsModule.buildMentionIndex(contacts);
+    }
+    return _mentionIndex;
 }
 
 const { computeContactMetrics: computeEngagementMetrics, labelMetrics } = require('./response-metrics');
@@ -2987,6 +3014,22 @@ nav {
   border: 1px solid var(--border); background: rgba(99,102,241,0.05);
   color: var(--text-secondary); letter-spacing: 0.01em;
 }
+
+/* @-mentions */
+.mention-link {
+  color: var(--accent-hover); cursor: pointer; text-decoration: none;
+  font-weight: 500; border-bottom: 1px dotted var(--accent-hover);
+  padding-bottom: 1px;
+}
+.mention-link:hover { color: var(--accent); border-bottom-style: solid; }
+.backlinks-list { display: flex; flex-direction: column; gap: 8px; }
+.backlink-row {
+  padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px;
+  cursor: pointer; transition: border-color 180ms ease;
+}
+.backlink-row:hover { border-color: var(--accent); }
+.backlink-from { font-size: 13px; color: var(--text-primary); font-weight: 500; }
+.backlink-snippet { font-size: 11px; color: var(--text-secondary); margin-top: 2px; line-height: 1.5; }
 .hero-source-dot { width: 8px; height: 8px; border-radius: 50%; cursor: default; }
 /* Quick actions strip */
 .quick-actions { display: flex; gap: 8px; padding: 8px 20px;
@@ -5603,24 +5646,40 @@ function renderContactDetail(c) {
           <div id="intro-paths-body" style="color:var(--text-muted);font-size:0.82rem">Loading\u2026</div>
         </div>
         <div class="detail-section">
-          <h3>Notes</h3>
-          <textarea class="notes-area" id="notes-area" placeholder="Add notes about this person\u2026">\${esc(c.notes || '')}</textarea>
+          <h3>Notes <span style="color:var(--text-muted);font-weight:400;font-size:0.65rem">\u2014 use @name to link other contacts</span></h3>
+          <textarea class="notes-area" id="notes-area" placeholder="Add notes about this person\u2026 (try @name to link)">\${esc(c.notes || '')}</textarea>
+          <div id="notes-preview" style="display:none;font-size:0.85rem;color:var(--text-secondary);padding:8px 10px;background:rgba(99,102,241,0.04);border-radius:6px;margin-top:6px;line-height:1.5"></div>
           <div class="notes-saved" id="notes-saved"></div>
         </div>
+        \${renderMentionBacklinks(c.mentionBacklinks || [])}
       </div>
     </div>
   \`;
 
-  // Wire up notes save
+  // Wire up notes save + mention preview
   let notesTimer = null;
-  document.getElementById('notes-area').addEventListener('input', e => {
+  const notesArea = document.getElementById('notes-area');
+  const notesPreview = document.getElementById('notes-preview');
+  function renderNotesMentionPreview(text) {
+    if (!notesPreview) return;
+    // Render mentions inline with simple local resolution against allContacts.
+    if (!text || !/@[A-Za-z]/.test(text)) { notesPreview.style.display = 'none'; notesPreview.innerHTML = ''; return; }
+    const html = renderMentionsInline(text);
+    if (!html.includes('mention-link')) { notesPreview.style.display = 'none'; notesPreview.innerHTML = ''; return; }
+    notesPreview.style.display = 'block';
+    notesPreview.innerHTML = '<div style="font-size:0.7rem;color:var(--text-muted);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:4px">Preview</div>' + html;
+  }
+  renderNotesMentionPreview(c.notes || '');
+  notesArea.addEventListener('input', e => {
     clearTimeout(notesTimer);
     document.getElementById('notes-saved').textContent = '';
+    const val = e.target.value;
+    renderNotesMentionPreview(val);
     notesTimer = setTimeout(async () => {
       await fetch(\`\${BASE}/api/contacts/\${encodeURIComponent(c.id)}/notes\`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ notes: e.target.value }),
+        body: JSON.stringify({ notes: val }),
       });
       const saved = document.getElementById('notes-saved');
       if (saved) { saved.textContent = 'Saved'; setTimeout(() => { if(saved) saved.textContent=''; }, 2000); }
@@ -7038,6 +7097,80 @@ function renderEngagementChips(m) {
   if (!m || !Array.isArray(m.chips) || m.chips.length === 0) return '';
   const chipHtml = m.chips.map(c => '<span class="engagement-chip">' + esc(c) + '</span>').join('');
   return '<div class="engagement-chips" title="Reply rate / avg latency / who initiates — computed from cross-source interactions">' + chipHtml + '</div>';
+}
+
+// Render the "Mentioned by" backlinks panel on the contact detail page.
+function renderMentionBacklinks(list) {
+  if (!Array.isArray(list) || list.length === 0) return '';
+  const items = list.slice(0, 8).map(b =>
+    '<div class="backlink-row" onclick="openContact(\\'' + esc(b.fromId) + '\\')">'
+    + '<div class="backlink-from">' + esc(b.fromName || '') + '</div>'
+    + '<div class="backlink-snippet">' + esc(b.snippet || '') + '</div>'
+    + '</div>'
+  ).join('');
+  return '<div class="detail-section">'
+    + '<h3>Mentioned in</h3>'
+    + '<div class="backlinks-list">' + items + '</div>'
+    + '</div>';
+}
+
+// Client-side mention resolver — mirrors crm/mentions.js but operates over
+// the loaded allContacts list so previewing notes doesn't need a roundtrip.
+function renderMentionsInline(text) {
+  if (!text) return '';
+  const MENT = /(^|[\\s(\\[{,;!?])@(?:\"([^\"]+)\"|([A-Za-z][A-Za-z0-9_'-]{0,40}))/g;
+  const candidates = [];
+  let m;
+  MENT.lastIndex = 0;
+  while ((m = MENT.exec(text)) !== null) {
+    const prefix = m[1] || '';
+    const handle = m[2] || m[3];
+    if (!handle) continue;
+    const start = m.index + prefix.length;
+    const length = handle.length + 1 + (m[2] ? 2 : 0);
+    candidates.push({ handle, start, length });
+  }
+  const contacts = allContacts || [];
+  const mentions = [];
+  for (const c of candidates) {
+    let hit = null;
+    let actualHandle = c.handle;
+    const tryResolve = (h) => {
+      const lower = h.toLowerCase();
+      const exact = contacts.filter(x => x.name && x.name.toLowerCase() === lower);
+      if (exact.length === 1) return { contact: exact[0], confidence: 'exact' };
+      const first = contacts.filter(x => x.name && x.name.toLowerCase().split(/\\s+/)[0] === lower);
+      if (first.length === 1) return { contact: first[0], confidence: 'first' };
+      const starts = contacts.filter(x => x.name && x.name.toLowerCase().startsWith(lower));
+      if (starts.length === 1) return { contact: starts[0], confidence: 'starts' };
+      return null;
+    };
+    hit = tryResolve(c.handle);
+    if (!hit || hit.confidence !== 'exact') {
+      const after = text.slice(c.start + c.length);
+      const am = after.match(/^(\\s+[A-Za-z][A-Za-z0-9_'-]{0,40}){1,2}/);
+      if (am) {
+        const extra = am[0].replace(/^\\s+/, '').split(/\\s+/);
+        for (let take = extra.length; take >= 1; take--) {
+          const tryH = (c.handle + ' ' + extra.slice(0, take).join(' ')).trim();
+          const r = tryResolve(tryH);
+          if (r && (r.confidence === 'exact' || !hit)) { hit = r; actualHandle = tryH; if (r.confidence === 'exact') break; }
+        }
+      }
+    }
+    if (hit) mentions.push({ contactId: hit.contact.id, contactName: hit.contact.name, start: c.start, length: actualHandle.length + 1 });
+  }
+  if (mentions.length === 0) return esc(text).replace(/\\n/g, '<br>');
+  mentions.sort((a, b) => a.start - b.start);
+  const parts = [];
+  let i = 0;
+  for (const mn of mentions) {
+    if (mn.start > i) parts.push(esc(text.slice(i, mn.start)).replace(/\\n/g, '<br>'));
+    parts.push('<a class="mention-link" onclick="openContact(\\'' + esc(mn.contactId) + '\\')">@' + esc(mn.contactName || '') + '</a>');
+    i = mn.start + mn.length;
+  }
+  if (i < text.length) parts.push(esc(text.slice(i)).replace(/\\n/g, '<br>'));
+  return parts.join('');
 }
 
 // Safe for interpolation inside a JS single-quoted string inside an HTML
