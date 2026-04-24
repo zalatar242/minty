@@ -25,10 +25,13 @@
 const fs = require('fs');
 const path = require('path');
 
+const { buildWarmIntroBriefs } = require('./people-graph');
+
 const DATA = path.join(__dirname, '../data');
 const CONTACTS_PATH     = path.join(DATA, 'unified/contacts.json');
 const INTERACTIONS_PATH = path.join(DATA, 'unified/interactions.json');
 const INSIGHTS_PATH     = path.join(DATA, 'unified/insights.json');
+const MEMBERSHIPS_PATH  = path.join(DATA, 'unified/group-memberships.json');
 const DIGEST_PATH       = path.join(DATA, 'unified/digest.json');
 
 function load(p) {
@@ -108,6 +111,24 @@ function run() {
         activeThisWeek: activeThisWeek.length,
     };
 
+    // Warm-intro briefs: for each top reconnect, compute the warmest intermediary
+    // via shared WhatsApp groups. This is the "Priya gasp moment" from
+    // docs/PHILOSOPHY.md — surfacing paths the user didn't know they had.
+    const memberships = load(MEMBERSHIPS_PATH) || {};
+    let viewerId = null;
+    let bestGroupCount = 0;
+    for (const c of contacts) {
+        const n = Array.isArray(c.groupMemberships) ? c.groupMemberships.length : 0;
+        if (n > bestGroupCount) { viewerId = c.id; bestGroupCount = n; }
+    }
+    const warmIntroTargets = topReconnects.map(t => ({ id: t.id, name: t.name }));
+    const warmIntroBriefs = buildWarmIntroBriefs(
+        warmIntroTargets,
+        contacts,
+        memberships,
+        { excludeIds: viewerId ? [viewerId] : [], maxGroupSize: 200 }
+    ).slice(0, 5);
+
     const digest = {
         generatedAt: new Date().toISOString(),
         weekSummary: null, // Claude Code fills this in after reading the data above
@@ -116,6 +137,7 @@ function run() {
         topReconnects,
         strongRelationships,
         openLoops: openLoops.slice(0, 15),
+        warmIntroBriefs,
     };
 
     fs.writeFileSync(DIGEST_PATH, JSON.stringify(digest, null, 2));
