@@ -35,6 +35,8 @@
     "linkedin": "node sources/linkedin/_alias-import-zip.js",
     "linkedin:import-zip": "node sources/linkedin/import.js",
     "linkedin:setup": "npm install playwright --save-optional && npx playwright install chromium",
+    "linkedin:connect": "node sources/linkedin/connect.js",
+    "linkedin:sync": "node sources/linkedin/fetch.js",
     "telegram": "node sources/telegram/import.js",
     "email": "node sources/email/import.js",
     "google-contacts": "node sources/google-contacts/import.js",
@@ -47,7 +49,8 @@
     "analyze": "node crm/analyze.js",
     "digest": "node crm/digest.js",
     "index": "node crm/index.js",
-    "test": "node --test --test-concurrency=1 tests/unit/schema.test.js tests/unit/utils.test.js tests/unit/scoring.test.js tests/unit/contact-index.test.js tests/unit/sync.test.js tests/unit/sync-utils.test.js tests/unit/health-ring.test.js tests/unit/goals.test.js tests/unit/reconnect.test.js tests/unit/calendar.test.js tests/unit/network-query.test.js tests/unit/staleness.test.js tests/unit/linkedin-csv.test.js tests/unit/linkedin-lock.test.js tests/unit/linkedin-origin-check.test.js tests/unit/linkedin-session-expiry.test.js tests/unit/linkedin-tos-gate.test.js"
+    "test": "node --test --test-concurrency=1 tests/unit/schema.test.js tests/unit/utils.test.js tests/unit/scoring.test.js tests/unit/contact-index.test.js tests/unit/sync.test.js tests/unit/sync-utils.test.js tests/unit/health-ring.test.js tests/unit/goals.test.js tests/unit/reconnect.test.js tests/unit/calendar.test.js tests/unit/network-query.test.js tests/unit/staleness.test.js tests/unit/linkedin-connect.test.js tests/unit/linkedin-csv.test.js tests/unit/linkedin-lock.test.js tests/unit/linkedin-origin-check.test.js tests/unit/linkedin-scrape.test.js tests/unit/linkedin-session-expiry.test.js tests/unit/linkedin-sync-state.test.js tests/unit/linkedin-tos-gate.test.js",
+    "test:integration": "node --test --test-concurrency=1 tests/integration/linkedin-api.test.js"
   },
   "dependencies": {
     "qrcode": "^1.5.4",
