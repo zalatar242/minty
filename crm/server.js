@@ -2321,8 +2321,19 @@ function handleGetStaleness(req, res, params, paths, uuid) {
 // Goals
 // ---------------------------------------------------------------------------
 
+// Default pipeline every new goal starts with. Users can customise per-goal.
+const DEFAULT_GOAL_STAGES = ['To reach out', 'Contacted', 'Meeting', 'Intro made', 'Closed'];
+
 function loadGoals(paths) {
-    try { return JSON.parse(fs.readFileSync(paths.goals, 'utf8')); }
+    try {
+        const goals = JSON.parse(fs.readFileSync(paths.goals, 'utf8'));
+        // Back-fill pipeline fields so existing goals continue to work.
+        return goals.map(g => ({
+            stages:      Array.isArray(g.stages) && g.stages.length ? g.stages : DEFAULT_GOAL_STAGES.slice(),
+            assignments: (g.assignments && typeof g.assignments === 'object') ? g.assignments : {},
+            ...g,
+        }));
+    }
     catch { return []; }
 }
 
@@ -2346,13 +2357,96 @@ async function handleSaveGoals(req, res, params, paths) {
         } else {
             // New goal — assign id
             const id = 'g_' + Date.now().toString(36);
-            goals = [...existing, { id, createdAt: new Date().toISOString(), active: true, ...data }];
+            goals = [...existing, {
+                id,
+                createdAt: new Date().toISOString(),
+                active: true,
+                stages: DEFAULT_GOAL_STAGES.slice(),
+                assignments: {},
+                ...data,
+            }];
         }
     } else {
         return json(res, { error: 'invalid body' }, 400);
     }
     fs.writeFileSync(paths.goals, JSON.stringify(goals, null, 2));
     json(res, goals);
+}
+
+/**
+ * POST /api/goals/:id/assign  { contactId, stage }
+ * Move a contact to a stage within a goal's pipeline. `stage` is either the
+ * stage label (case-insensitive) or its 0-based index. Pass stage=null to
+ * remove the contact from the pipeline.
+ */
+async function handleGoalAssign(req, res, [goalId], paths) {
+    const body_ = await body(req);
+    const contactId = body_ && body_.contactId;
+    if (!contactId) return json(res, { error: 'contactId required' }, 400);
+
+    const goals = loadGoals(paths);
+    const goal = goals.find(g => g.id === goalId);
+    if (!goal) return json(res, { error: 'goal not found' }, 404);
+
+    const stages = goal.stages || DEFAULT_GOAL_STAGES;
+    const assignments = goal.assignments || {};
+
+    let stage = body_.stage;
+    if (stage === null || stage === undefined || stage === '') {
+        delete assignments[contactId];
+    } else {
+        let stageLabel;
+        if (typeof stage === 'number') {
+            if (stage < 0 || stage >= stages.length) return json(res, { error: 'stage out of range' }, 400);
+            stageLabel = stages[stage];
+        } else {
+            stageLabel = stages.find(s => s.toLowerCase() === String(stage).toLowerCase());
+            if (!stageLabel) return json(res, { error: 'unknown stage ' + stage }, 400);
+        }
+        assignments[contactId] = {
+            stage: stageLabel,
+            updatedAt: new Date().toISOString(),
+        };
+    }
+
+    goal.assignments = assignments;
+    goal.updatedAt = new Date().toISOString();
+    fs.writeFileSync(paths.goals, JSON.stringify(goals, null, 2));
+    json(res, { goal });
+}
+
+/**
+ * GET /api/goals/:id/pipeline
+ * Returns the pipeline of assigned contacts per stage, hydrated with
+ * summary contact data (name, company, score, days-since-contact).
+ */
+function handleGoalPipeline(req, res, [goalId], paths) {
+    const goals = loadGoals(paths);
+    const goal = goals.find(g => g.id === goalId);
+    if (!goal) return json(res, { error: 'goal not found' }, 404);
+
+    const stages = goal.stages || DEFAULT_GOAL_STAGES;
+    const contacts = loadContacts(paths);
+    const byId = Object.fromEntries(contacts.map(c => [c.id, c]));
+
+    const pipeline = stages.map(s => ({ stage: s, contacts: [] }));
+    const assignments = goal.assignments || {};
+    for (const [cid, ass] of Object.entries(assignments)) {
+        const c = byId[cid];
+        if (!c) continue;
+        const stageLabel = (ass && ass.stage) || (typeof ass === 'string' ? ass : null);
+        const stageIdx = stages.findIndex(s => s.toLowerCase() === String(stageLabel || '').toLowerCase());
+        if (stageIdx < 0) continue;
+        pipeline[stageIdx].contacts.push({
+            id: c.id, name: c.name,
+            company: c.sources?.linkedin?.company || c.sources?.googleContacts?.org || null,
+            position: c.sources?.linkedin?.position || c.sources?.googleContacts?.title || null,
+            relationshipScore: c.relationshipScore || 0,
+            daysSinceContact: c.daysSinceContact ?? null,
+            updatedAt: ass && ass.updatedAt,
+        });
+    }
+    json(res, { goalId, text: goal.text, stages, pipeline });
 }
 
 // GET /api/today — goal-relevant contacts, network pulse, upcoming meetings
@@ -2736,6 +2830,8 @@ const ROUTES = [
     ['GET',  /^\/api\/palette$/,                          handlePaletteSearch],
     ['GET',  /^\/api\/export$/,                           handleExport],
     ['GET',  /^\/api\/life-events$/,                      handleGetLifeEvents],
+    ['POST', /^\/api\/goals\/([^/]+)\/assign$/,           handleGoalAssign],
+    ['GET',  /^\/api\/goals\/([^/]+)\/pipeline$/,         handleGoalPipeline],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -3487,6 +3583,36 @@ nav {
 .pulse-item:hover { border-color: rgba(99,102,241,0.4); }
 .pulse-item-name { font-size: 0.88rem; font-weight: 500; color: var(--text-primary); flex: 1; min-width: 0; }
 .pulse-item-meta { font-size: 0.73rem; color: var(--text-muted); }
+
+.goal-pipeline-summary { display: inline-flex; gap: 4px; margin-left: 10px; vertical-align: middle; }
+.goal-stage-pill {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 10px; font-weight: 500;
+  padding: 2px 6px; border-radius: 8px;
+  background: rgba(99,102,241,0.08); border: 1px solid var(--border);
+  color: var(--text-secondary);
+}
+.goal-stage-pill.active { background: rgba(99,102,241,0.16); color: var(--text-primary); }
+.goal-stage-dot { width: 6px; height: 6px; border-radius: 50%; display: inline-block; }
+.goal-stage-dot.s0 { background: #6b7280; }
+.goal-stage-dot.s1 { background: #a78bfa; }
+.goal-stage-dot.s2 { background: #60a5fa; }
+.goal-stage-dot.s3 { background: #34d399; }
+.goal-stage-dot.s4 { background: #22c55e; }
+
+.today-card-stage-row { margin-top: 8px; }
+.today-card-stage-select {
+  background: rgba(255,255,255,0.02);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  border-radius: 6px; padding: 4px 8px;
+  font-size: 11px; font-family: inherit;
+  cursor: pointer;
+}
+.today-card-stage-select:hover, .today-card-stage-select:focus {
+  border-color: var(--accent); outline: 0; color: var(--text-primary);
+}
+
 .life-event-badge {
   position: absolute; right: -4px; bottom: -4px;
   background: var(--bg-card); border: 1px solid var(--border); border-radius: 50%;
@@ -4967,8 +5093,18 @@ function renderToday(el) {
     </div>\`;
   } else {
     visibleSections.forEach(section => {
+      const goal = todayGoals.find(g => g.id === section.goalId);
+      const stages = (goal && goal.stages) || ['To reach out', 'Contacted', 'Meeting', 'Intro made', 'Closed'];
+      const assignments = (goal && goal.assignments) || {};
+      // Quick per-goal pipeline summary: counts per stage
+      const counts = stages.map(s => Object.values(assignments).filter(a => (a && a.stage) === s).length);
+      const totalInPipeline = counts.reduce((n, x) => n + x, 0);
+
       html += \`<div class="today-section">
-        <div class="today-section-header">\${esc(section.goalText)}</div>\`;
+        <div class="today-section-header">
+          <span>\${esc(section.goalText)}</span>
+          \${totalInPipeline > 0 ? '<span class="goal-pipeline-summary">' + counts.map((n, i) => '<span class="goal-stage-pill" title="' + esc(stages[i]) + '"><span class="goal-stage-dot s' + i + '"></span>' + n + '</span>').join('') + '</span>' : ''}
+        </div>\`;
 
       if (!section.contacts || section.contacts.length === 0) {
         html += \`<div class="today-empty">
@@ -4990,22 +5126,35 @@ function renderToday(el) {
             ? \`<div class="today-card-why">\${esc(c.meetingBrief.slice(0, 120))}</div>\`
             : '';
 
-          html += \`<div class="today-card" onclick="openContact('\${c.id}')">
-            <div class="today-card-avatar">
+          const assigned = assignments[c.id] && assignments[c.id].stage ? assignments[c.id].stage : null;
+          const stageOptions = ['<option value="">— set stage —</option>']
+            .concat(stages.map(s => '<option value="' + esc(s) + '"' + (s === assigned ? ' selected' : '') + '>' + esc(s) + '</option>'))
+            .join('');
+          const stageIdx = stages.indexOf(assigned);
+          const stageChip = assigned
+            ? '<span class="goal-stage-pill active"><span class="goal-stage-dot s' + stageIdx + '"></span>' + esc(assigned) + '</span>'
+            : '';
+
+          html += \`<div class="today-card">
+            <div class="today-card-avatar" onclick="openContact('\${c.id}')">
               \${ring}
               <div class="today-card-avatar-inner" style="background:\${col.bg};color:\${col.fg}">
                 \${esc(getInitials(c.name))}
               </div>
             </div>
-            <div class="today-card-body">
+            <div class="today-card-body" onclick="openContact('\${c.id}')" style="cursor:pointer">
               <div class="today-card-name">\${esc(c.name)}</div>
               \${roleStr ? \`<div class="today-card-role">\${esc(roleStr)}</div>\` : ''}
               \${whyHtml}
               <div class="today-card-meta">
                 <span class="today-card-score">Score <span>\${c.relationshipScore}</span></span>
                 <span class="today-card-days">Last contact: \${daysStr}</span>
+                \${stageChip}
               </div>
               \${topicsHtml ? \`<div class="today-card-topics">\${topicsHtml}</div>\` : ''}
+              <div class="today-card-stage-row">
+                <select class="today-card-stage-select" data-goal-id="\${esc(section.goalId)}" data-contact-id="\${esc(c.id)}" onchange="onStageChange(event)">\${stageOptions}</select>
+              </div>
             </div>
           </div>\`;
         });
@@ -5124,6 +5273,27 @@ function setActiveGoal(id) {
   activeGoalId = (activeGoalId === id) ? null : id; // toggle
   const el = document.getElementById('today-scroll');
   if (el && todayLoaded) renderToday(el);
+}
+
+async function onStageChange(e) {
+  const sel = e.target;
+  const goalId = sel.dataset.goalId;
+  const contactId = sel.dataset.contactId;
+  const stage = sel.value || null;
+  try {
+    await fetch(BASE + '/api/goals/' + encodeURIComponent(goalId) + '/assign', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contactId, stage }),
+    });
+    // Refresh goals + re-render today to update pipeline summary
+    const goals = await fetch(BASE + '/api/goals').then(r => r.json());
+    todayGoals = goals;
+    const el = document.getElementById('today-scroll');
+    if (el && todayLoaded) renderToday(el);
+  } catch (err) {
+    console.error('stage update failed:', err);
+  }
 }
 
 function showGoalInput() {
