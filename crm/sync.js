@@ -66,10 +66,15 @@ function computeDirHash(dirPath) {
     if (!fs.existsSync(dirPath)) return null;
     let files;
     try { files = fs.readdirSync(dirPath).sort(); } catch { return null; }
-    const parts = files.map(f => {
-        try { return hashContent(fs.readFileSync(path.join(dirPath, f))); }
-        catch { return ''; }
-    });
+    // Skip dotfiles and auto-sync staging/profile dirs so LinkedIn auto-sync
+    // doesn't retrigger the watcher (Eng H1/H2: prevent double-merge).
+    const ignored = new Set(['.scraped-staging', 'browser-profile', 'export']);
+    const parts = files
+        .filter(f => !f.startsWith('.') && !ignored.has(f))
+        .map(f => {
+            try { return hashContent(fs.readFileSync(path.join(dirPath, f))); }
+            catch { return ''; }
+        });
     return hashContent(parts.join('|'));
 }
 
@@ -649,7 +654,11 @@ function startSyncDaemon(uuid, userDataDir) {
     // ── File-based source watchers ────────────────────────────────────────
 
     const fileSources = [
-        { source: 'linkedin',  dir: path.join(userDataDir, 'linkedin'),       script: 'sources/linkedin/import.js',  envKey: 'LINKEDIN_OUT_DIR' },
+        // LinkedIn: skipped when auto-sync owns the state. Auto-sync's fetch.js invokes
+        // import.js directly; letting the watcher also poll would race (Eng H1/H2).
+        ...(process.env.MINTY_LINKEDIN_AUTOSYNC === '1' ? [] : [
+            { source: 'linkedin', dir: path.join(userDataDir, 'linkedin'), script: 'sources/linkedin/import.js', envKey: 'LINKEDIN_OUT_DIR' },
+        ]),
         { source: 'telegram',  dir: path.join(userDataDir, 'telegram'),       script: 'sources/telegram/import.js',  envKey: 'TELEGRAM_OUT_DIR' },
         { source: 'sms',       dir: path.join(userDataDir, 'sms'),            script: 'sources/sms/import.js',       envKey: 'SMS_OUT_DIR' },
     ];

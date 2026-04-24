@@ -67,6 +67,8 @@ Or use the in-app WhatsApp connector from the **Sources** view (live QR, auto-me
 LINKEDIN_EXPORT_DIR=/path/to/extracted npm run linkedin
 ```
 
+> Also: an experimental, ToS-adjacent auto-sync option is available for power users. See the [Advanced — LinkedIn auto-sync](#advanced--linkedin-auto-sync-experimental) section below. **The ZIP flow is the recommended path for most users.**
+
 ### Telegram
 1. Telegram Desktop → Settings → Advanced → Export Telegram Data
 2. Select **Personal chats**, **Contacts** — format **JSON**
@@ -101,6 +103,66 @@ SMS_EXPORT_FILE=/path/to/sms-*.xml npm run sms
 npm run merge
 ```
 Writes `data/unified/contacts.json` and `data/unified/interactions.json`.
+
+## Advanced — LinkedIn auto-sync (experimental, in development)
+
+> **Status:** This PR lands the foundation modules and Playwright setup for LinkedIn auto-sync. The actual scraper (`connect.js` / `fetch.js`) lands in a follow-up PR once Approach-C (headful login + headless session reuse) has been validated on a real account via `scratch/linkedin-session-probe.js`. Until then, only `npm run linkedin:setup` is functional. The full flow and the tuning knobs below describe the target end-state.
+
+> **LinkedIn auto-sync will be prohibited by LinkedIn's User Agreement §8.2.** You are responsible for your own account. LinkedIn may restrict, challenge, or suspend it. Minty cannot protect you from this. If you want the maximum-safety option, use the ZIP flow above and stop here.
+
+The ZIP flow has a real downside: LinkedIn takes up to 24 hours to produce the export, so the "unified network" moment is a day late. Auto-sync will close that gap by driving a real headful browser session on your own machine. It is opt-in at every layer — Playwright isn't installed by default, the endpoints are gated behind a feature flag, and the first run requires a typed ToS acknowledgement.
+
+### Setup (available now)
+
+```bash
+# Install Playwright (adds ~300MB). Opt-in; the core Minty install skips this.
+npm run linkedin:setup
+```
+
+### Planned flow (follow-up PR)
+
+```bash
+# Open the real LinkedIn login in a headful Chromium window. Log in, solve 2FA, close the window.
+npm run linkedin:connect
+
+# Scrape your connections + messages into Minty's unified store.
+npm run linkedin:sync
+```
+
+Once `linkedin:connect` has been run, the Sources view in `npm run crm` will gain a "Sync now" button that does the same thing as `npm run linkedin:sync`.
+
+### Known limitations
+
+- **Session survival:** best-effort ≥7 days; LinkedIn will occasionally challenge and require re-running `linkedin:connect`.
+- **Some ZIP-only fields don't survive:** `ImportedContacts.csv` (phone-book data) and `Invitations.csv` (sent/received requests) are only available via the ZIP flow.
+- **Headless servers (NAS, Pi):** the initial `linkedin:connect` needs a GUI. Workaround: do initial login on your laptop and ensure disk-level encryption protects `data/linkedin/browser-profile/`.
+
+### Tuning (env vars)
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `LINKEDIN_EXPORT_DIR` | `./data/linkedin/export` | Where ZIP import looks for CSVs |
+| `LINKEDIN_PROFILE_DIR` | `./data/linkedin/browser-profile` | Playwright persistent context path. Useful for multi-account dev testing |
+| `LINKEDIN_THROTTLE_MS` | `2000` | Delay between page navigations |
+| `LINKEDIN_SYNC_MESSAGE_CAP` | unlimited | Max threads scraped per sync. Default is unlimited — every thread in your inbox. Set a positive integer (e.g. `50`) to cap for speed. Expect roughly 15 seconds per thread at the default throttle, so 500 threads ≈ 2 hours. The scrape prints a time estimate before starting; Ctrl+C aborts cleanly (prior data preserved). |
+| `LINKEDIN_SCRAPE_INVITATIONS` | unset | If `1`, also scrapes pending invitations (sent + received) into `data/linkedin/pending-invitations.json`. **Pending only** — LinkedIn's DOM has no history page, so accepted/declined invites are ZIP-only. Writes a SEPARATE file from the ZIP's Invitations.csv so historical data isn't clobbered. |
+| `LINKEDIN_SKIP_DETAILS` | `0` | If `1`, skip per-card detail backfill (faster TTHW, degraded matching) |
+| `LINKEDIN_MESSAGE_WINDOW_HOURS` | `24` | On incremental syncs, scrape threads with activity within this many hours of `lastSync` |
+| `LINKEDIN_ACCEPT_TOS` | unset | If `1`, bypass typed "I accept" prompt (first run still persists sentinel) |
+| `LINKEDIN_LIVE_TEST` | unset | If `1`, run live-test suite against real account |
+| `MINTY_LINKEDIN_AUTOSYNC` | unset | Feature flag — if unset, all auto-sync endpoints 404 and SPA falls back to ZIP-only |
+
+### Feature flag
+
+The entire auto-sync surface is gated behind `MINTY_LINKEDIN_AUTOSYNC=1`. When unset, the feature's endpoints return 404 and the Sources-view UI falls back to ZIP-only. This is the feature's kill-switch — if you decide not to use it, simply leave this env var unset.
+
+### Security
+
+The persistent browser session lives at `data/linkedin/browser-profile/`. Minty creates this directory with `0700` permissions and refuses to launch if they loosen. Malware running as your user can still impersonate your LinkedIn session indefinitely — disk encryption (FileVault / LUKS / similar) is your first line of defense.
+
+### Deprecation note
+
+`npm run linkedin` has been renamed to `npm run linkedin:import-zip`. The old name still works but prints a deprecation warning and will be removed in v0.4. Update any cron jobs or scripts.
 
 ## Privacy
 

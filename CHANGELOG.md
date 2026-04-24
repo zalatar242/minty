@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-23
+
+Foundation for forthcoming opt-in LinkedIn auto-sync. No user-visible feature ships in this release — everything sits behind an opt-in install that users don't run by default. The scraper itself will land in a follow-up release once Approach-C (headful login → headless session reuse) has been validated on a real LinkedIn account.
+
+### Added
+- `npm run linkedin:setup` — opt-in Playwright install for the forthcoming LinkedIn auto-sync feature. See the README "Advanced — LinkedIn auto-sync" section. Experimental; ToS-adjacent.
+- Foundation utility modules for LinkedIn auto-sync (`sources/linkedin/csv.js`, `lock.js`, `origin-check.js`, `session-detect.js`, `tos-gate.js`) with 133 new unit tests. These compose into the forthcoming `connect.js`/`fetch.js` scraper.
+- `scratch/linkedin-session-probe.js` — 20-minute validation script to confirm Approach-C holds on a real account before any scraper code ships.
+
+### Changed
+- `npm run linkedin` renamed to `npm run linkedin:import-zip`. The old `linkedin` name still works but prints a deprecation warning to stderr. Alias will be removed in v0.4. Update your cron jobs and scripts accordingly.
+
 ## [0.3.1] - 2026-04-23
 
 ### Fixed

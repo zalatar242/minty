@@ -15,3 +15,7 @@ data/
 *.png
 *.jpg
 .DS_Store
+
+# LinkedIn auto-sync scratch probe
+/scratch/scratch-profile/
+/scratch/session-probe.png
