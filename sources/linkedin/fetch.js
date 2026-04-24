@@ -54,7 +54,13 @@ const SCRAPE_INVITATIONS = process.env.LINKEDIN_SCRAPE_INVITATIONS === '1';
 // Parallelism for the per-contact detail backfill. Default 3 tabs — same
 // authenticated session, LinkedIn sees multi-tab browsing (common in humans).
 // Higher = faster but more concurrent requests; higher detection risk.
-const DETAIL_CONCURRENCY = Math.max(1, Number(process.env.LINKEDIN_DETAIL_CONCURRENCY) || 3);
+// 0 / invalid / empty = use default of 3. Explicit 1 = serial.
+const DETAIL_CONCURRENCY = (() => {
+    const raw = process.env.LINKEDIN_DETAIL_CONCURRENCY;
+    if (!raw) return 3;
+    const n = Number(raw);
+    return (!Number.isFinite(n) || n < 1) ? 1 : Math.floor(n);
+})();
 
 // --- sync-state.json -------------------------------------------------------
 // Delegated to sources/linkedin/sync-state.js which handles atomic writes
@@ -314,7 +320,11 @@ async function scrapeMessages(page) {
             // anything we don't recognize, scrape.
             const text = (t.lastText || '').toLowerCase();
             if (/^\d+s$/.test(text) || /^\d+m$/.test(text) || /^\d+h$/.test(text) || text === 'now' || text === 'just now') return true;
-            if (/yesterday/.test(text)) return Date.now() - lastSyncMs < 48 * 3600 * 1000;
+            // "Yesterday" thread is ~24h old. It's newer than lastSync iff
+            // lastSync was more than ~24h ago. Original had the comparison
+            // inverted (check for <48h made threads skip when the user had
+            // been absent for 2+ days). Give 24h of leeway either way.
+            if (/yesterday/.test(text)) return Date.now() - lastSyncMs > 24 * 3600 * 1000;
             // "3d", "5d" — roughly interpret
             const dMatch = /^(\d+)d$/.exec(text);
             if (dMatch) {
@@ -358,7 +368,10 @@ async function scrapeMessages(page) {
                     if (m) m.scrollTop = 0;
                     return document.querySelectorAll('.msg-s-event-listitem, li[class*="msg-s-message-list__event"]').length;
                 });
-                if (count === prevCount) { stableStreak++; if (stableStreak >= 1) break; }
+                // Two consecutive stable counts = done. Single-tick stability
+                // is too eager on slow networks where LinkedIn lazy-loads —
+                // count might plateau briefly between batches.
+                if (count === prevCount) { stableStreak++; if (stableStreak >= 2) break; }
                 else { stableStreak = 0; prevCount = count; }
                 await page.waitForTimeout(THROTTLE_MS);
             }
