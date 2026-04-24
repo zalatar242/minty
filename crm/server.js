@@ -795,6 +795,72 @@ function buildSearchIndex(paths, uuid) {
 }
 
 const { searchInteractions: runSearch } = require('./search');
+const { paletteSearch } = require('./palette');
+
+/**
+ * GET /api/palette?q=<query>&limit=<n>
+ * Unified cross-category search for the Cmd+K palette.
+ */
+function handlePaletteSearch(req, res, params, paths, uuid) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const q = (url.searchParams.get('q') || '').trim();
+    const limit = Number(url.searchParams.get('limit')) || 8;
+
+    const contacts = fs.existsSync(paths.contacts) ? loadContacts(paths) : [];
+    const goals = fs.existsSync(paths.goals)
+        ? (safeLoadJson(paths.goals) || [])
+        : [];
+
+    let interactions = [];
+    let contactMap = {};
+    let contactById = {};
+    if (fs.existsSync(paths.interactions)) {
+        const idx = buildSearchIndex(paths, uuid);
+        interactions = idx.interactions;
+        contactMap = idx.contactMap;
+        contactById = idx.contactById;
+    }
+    // Enrich interactions with _contactId/_contactName so the palette can surface them.
+    // Only do this once per process; cache on the search index.
+    if (interactions.length && !interactions[0]._decorated) {
+        for (const i of interactions) {
+            let cid = null;
+            if (i.chatId) cid = contactMap[i.chatId];
+            if (!cid && typeof i.from === 'string') cid = contactMap[i.from];
+            if (!cid && i.source === 'linkedin' && i.chatName) {
+                for (const name of i.chatName.split(',').map(n => n.trim())) {
+                    if (contactMap[name]) { cid = contactMap[name]; break; }
+                }
+            }
+            i._contactId = cid || null;
+            i._contactName = cid ? (contactById[cid]?.name || null) : null;
+            i._decorated = true;
+        }
+    }
+
+    const companies = computeCompanyCounts(contacts);
+
+    const result = paletteSearch(q, {
+        contacts, interactions, goals, companies, contactMap, contactById,
+    }, { limit });
+    json(res, result);
+}
+
+function safeLoadJson(p) {
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+function computeCompanyCounts(contacts) {
+    const map = {};
+    for (const c of contacts) {
+        if (c.isGroup) continue;
+        const co = c.sources?.linkedin?.company || c.sources?.googleContacts?.org;
+        if (!co) continue;
+        if (!map[co]) map[co] = { name: co, count: 0 };
+        map[co].count++;
+    }
+    return Object.values(map);
+}
 
 function handleSearchInteractions(req, res, params, paths, uuid) {
     const url = new URL(req.url, `http://localhost:${PORT}`);
@@ -2458,6 +2524,7 @@ const ROUTES = [
     ['GET',  /^\/api\/sources\/whatsapp\/progress$/,      handleWhatsappProgress],
     ['GET',  /^\/api\/sources\/([a-zA-Z]+)\/progress$/,  handleSourceProgress],
     ['GET',  /^\/api\/sync\/progress$/,                   handleSyncProgress],
+    ['GET',  /^\/api\/palette$/,                          handlePaletteSearch],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -3084,6 +3151,100 @@ nav {
   .sync-toast { top: auto; bottom: 76px; right: 10px; left: 10px; max-width: none; }
 }
 
+/* ----- Command palette ----- */
+.palette-overlay {
+  position: fixed; inset: 0;
+  background: rgba(6, 10, 20, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: none;
+  align-items: flex-start; justify-content: center;
+  padding-top: 15vh;
+  z-index: 9998;
+  animation: palette-fade 180ms ease;
+}
+.palette-overlay.open { display: flex; }
+@keyframes palette-fade { from { opacity: 0; } to { opacity: 1; } }
+.palette {
+  width: min(640px, 92vw);
+  background: #0e1526;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 30px 60px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.02);
+  overflow: hidden;
+  display: flex; flex-direction: column;
+  max-height: 60vh;
+}
+.palette-input-wrap {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px; border-bottom: 1px solid var(--border);
+}
+.palette-icon { color: var(--text-secondary); flex-shrink: 0; }
+#palette-input {
+  flex: 1; background: transparent; border: 0; outline: 0;
+  color: var(--text-primary); font-size: 15px; letter-spacing: -0.01em;
+  font-family: inherit;
+}
+#palette-input::placeholder { color: var(--text-muted); }
+.palette-hint { color: var(--text-muted); font-size: 11px; display: inline-flex; gap: 6px; align-items: center; white-space: nowrap; }
+.palette-hint kbd {
+  background: #1a2235; border: 1px solid var(--border);
+  border-radius: 4px; padding: 1px 5px; font-size: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text-secondary);
+}
+.palette-results { overflow-y: auto; }
+.palette-group { padding: 6px 0; }
+.palette-group-label {
+  padding: 8px 16px 4px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--text-muted); font-weight: 600;
+}
+.palette-item {
+  padding: 8px 16px;
+  display: flex; align-items: center; gap: 12px;
+  cursor: pointer; transition: background 120ms ease;
+}
+.palette-item:hover,
+.palette-item.active { background: #1a2235; }
+.palette-item-avatar {
+  width: 28px; height: 28px; border-radius: 50%;
+  background: linear-gradient(135deg, #4f46e5, #818cf8);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 600; color: white; flex-shrink: 0;
+}
+.palette-item-body { flex: 1; min-width: 0; }
+.palette-item-title {
+  color: var(--text-primary); font-size: 14px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.palette-item-sub {
+  color: var(--text-secondary); font-size: 12px; margin-top: 1px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.palette-item-type {
+  font-size: 10px; padding: 2px 6px; border-radius: 4px;
+  background: rgba(99,102,241,0.12); color: var(--accent-hover);
+  text-transform: uppercase; letter-spacing: 0.06em;
+  flex-shrink: 0;
+}
+.palette-empty {
+  padding: 24px 16px; text-align: center; color: var(--text-muted); font-size: 13px;
+}
+.palette-score-ring {
+  width: 10px; height: 10px; border-radius: 50%;
+  background: var(--health-none); flex-shrink: 0;
+}
+.palette-score-ring.strong { background: var(--health-strong); }
+.palette-score-ring.good   { background: var(--health-good); }
+.palette-score-ring.warm   { background: var(--health-warm); }
+.palette-score-ring.fading { background: var(--health-fading); }
+.palette-score-ring.cold   { background: var(--health-cold); }
+@media (max-width: 720px) {
+  .palette-overlay { padding-top: 10vh; }
+  .palette-hint { display: none; }
+}
+
 /* Pulse section */
 .pulse-item {
   display: flex; align-items: center; gap: 12px; padding: 10px 14px;
@@ -3617,6 +3778,19 @@ body { background: var(--bg); }
   <div class="sync-toast-bar"><div class="sync-toast-bar-fill" id="sync-toast-fill"></div></div>
 </div>
 
+<div id="palette-overlay" class="palette-overlay" role="dialog" aria-modal="true" aria-label="Command palette">
+  <div class="palette">
+    <div class="palette-input-wrap">
+      <svg class="palette-icon" width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="8" cy="8" r="5.5"/><path d="M13 13l3 3"/>
+      </svg>
+      <input id="palette-input" type="text" placeholder="Search people, messages, goals, companies… (⌘K)" autocomplete="off" spellcheck="false" />
+      <span class="palette-hint"><kbd>↑↓</kbd> move · <kbd>↵</kbd> open · <kbd>esc</kbd> close</span>
+    </div>
+    <div id="palette-results" class="palette-results"></div>
+  </div>
+</div>
+
 <nav>
   <div class="nav-logo">
     <span class="nav-logo-icon" aria-hidden="true">M</span>
@@ -4138,9 +4312,173 @@ async function pollSyncToast() {
   toast.style.display = 'none';
 }
 
+// ============================================================
+// Command palette (Cmd/Ctrl+K)
+// ============================================================
+let paletteResults = [];
+let paletteActiveIdx = 0;
+let paletteDebounce = null;
+
+function openPalette() {
+  const o = document.getElementById('palette-overlay');
+  if (!o) return;
+  o.classList.add('open');
+  const input = document.getElementById('palette-input');
+  input.value = '';
+  paletteActiveIdx = 0;
+  paletteQuery('');
+  setTimeout(() => { input.focus(); input.select(); }, 10);
+}
+
+function closePalette() {
+  document.getElementById('palette-overlay')?.classList.remove('open');
+}
+
+async function paletteQuery(q) {
+  try {
+    const r = await fetch(BASE + '/api/palette?q=' + encodeURIComponent(q));
+    if (!r.ok) return;
+    const data = await r.json();
+    paletteResults = data.results || [];
+    paletteActiveIdx = 0;
+    renderPalette();
+  } catch {}
+}
+
+function renderPalette() {
+  const el = document.getElementById('palette-results');
+  if (!el) return;
+  if (paletteResults.length === 0) {
+    el.innerHTML = '<div class="palette-empty">No matches yet — try a name, company, or message snippet.</div>';
+    return;
+  }
+  // Group by type for display
+  const order = ['contact', 'conversation', 'goal', 'company', 'nav'];
+  const labels = { contact: 'People', conversation: 'In conversations', goal: 'Goals', company: 'Companies', nav: 'Go to' };
+  const groups = {};
+  paletteResults.forEach((r, i) => {
+    if (!groups[r.type]) groups[r.type] = [];
+    groups[r.type].push({ ...r, _idx: i });
+  });
+  const parts = [];
+  for (const key of order) {
+    if (!groups[key]) continue;
+    parts.push('<div class="palette-group"><div class="palette-group-label">' + labels[key] + '</div>');
+    for (const r of groups[key]) {
+      parts.push(paletteItemHtml(r));
+    }
+    parts.push('</div>');
+  }
+  el.innerHTML = parts.join('');
+  paletteUpdateActive();
+}
+
+function paletteItemHtml(r) {
+  const active = r._idx === paletteActiveIdx ? ' active' : '';
+  const badge = r.type.charAt(0).toUpperCase() + r.type.slice(1);
+  const initials = (r.label || '?').split(/\\s+/).slice(0,2).map(s => s.charAt(0).toUpperCase()).join('');
+  const ring = r.type === 'contact' ? '<span class="palette-score-ring ' + tierFor(r.relationshipScore) + '"></span>' : '';
+  const avatar = r.type === 'contact' ? '<div class="palette-item-avatar">' + escapeHtml(initials) + '</div>' : '<div class="palette-item-avatar" style="background:linear-gradient(135deg,#1e2d45,#4b5563)">·</div>';
+  return '<div class="palette-item' + active + '" data-idx="' + r._idx + '" onclick="paletteSelect(' + r._idx + ')">'
+    + avatar
+    + ring
+    + '<div class="palette-item-body">'
+    + '<div class="palette-item-title">' + escapeHtml(r.label || '') + '</div>'
+    + (r.sublabel ? '<div class="palette-item-sub">' + escapeHtml(r.sublabel) + '</div>' : '')
+    + '</div>'
+    + '<span class="palette-item-type">' + badge + '</span>'
+    + '</div>';
+}
+
+function tierFor(score) {
+  if (score == null) return 'none';
+  if (score >= 70) return 'strong';
+  if (score >= 40) return 'good';
+  if (score >= 20) return 'warm';
+  if (score > 0)   return 'fading';
+  return 'none';
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function paletteUpdateActive() {
+  document.querySelectorAll('.palette-item').forEach(el => {
+    el.classList.toggle('active', Number(el.getAttribute('data-idx')) === paletteActiveIdx);
+  });
+  const active = document.querySelector('.palette-item.active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
+}
+
+function paletteSelect(idx) {
+  const r = paletteResults[idx];
+  if (!r) return;
+  closePalette();
+  if (r.type === 'nav') { showView(r.action); return; }
+  if (r.type === 'contact') { showContact(r.id); return; }
+  if (r.type === 'conversation') {
+    if (r.contactId) showContact(r.contactId);
+    return;
+  }
+  if (r.type === 'goal') {
+    showView('today');
+    return;
+  }
+  if (r.type === 'company') {
+    // Jump to Ask prefilled with "at <company>"
+    showView('ask');
+    const input = document.getElementById('ask-input');
+    if (input) { input.value = 'at ' + r.name; input.focus(); }
+    return;
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  const isOpen = document.getElementById('palette-overlay')?.classList.contains('open');
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault(); isOpen ? closePalette() : openPalette(); return;
+  }
+  if (!isOpen) return;
+  if (e.key === 'Escape') { e.preventDefault(); closePalette(); return; }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (paletteResults.length === 0) return;
+    paletteActiveIdx = (paletteActiveIdx + 1) % paletteResults.length;
+    paletteUpdateActive(); return;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (paletteResults.length === 0) return;
+    paletteActiveIdx = (paletteActiveIdx - 1 + paletteResults.length) % paletteResults.length;
+    paletteUpdateActive(); return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    paletteSelect(paletteActiveIdx); return;
+  }
+});
+
+document.addEventListener('click', (e) => {
+  const overlay = document.getElementById('palette-overlay');
+  if (!overlay?.classList.contains('open')) return;
+  if (e.target === overlay) closePalette();
+});
+
+function wirePaletteInput() {
+  const input = document.getElementById('palette-input');
+  if (!input) return;
+  input.addEventListener('input', () => {
+    clearTimeout(paletteDebounce);
+    const q = input.value;
+    paletteDebounce = setTimeout(() => paletteQuery(q), 80);
+  });
+}
+
 async function init() {
   // Show Today immediately — contacts load in background
   showView('today');
+  wirePaletteInput();
   // Start global sync toast poller (runs regardless of view)
   if (!syncToastPoller) {
     pollSyncToast();
