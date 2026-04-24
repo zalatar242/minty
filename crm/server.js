@@ -14,6 +14,11 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
+const {
+    getSharedGroups,
+    findIntroPaths,
+    computeGroupSignalScores,
+} = require('./people-graph');
 
 const PORT = Number(process.env.PORT) || 3456;
 const HOST = process.env.HOST || '127.0.0.1'; // set HOST=0.0.0.0 to expose on LAN
@@ -235,10 +240,60 @@ function handleListContacts(req, res, params, paths , ) {
     json(res, people.map(contactSummary));
 }
 
+/**
+ * Identify the viewer's own contact record. In Minty's single-user mode, the
+ * viewer is in every WhatsApp group by definition, so the contact with the
+ * most group memberships is a reliable heuristic. Cached by contacts mtime.
+ */
+const _viewerIdCache = {};
+function getViewerContactId(paths) {
+    const key = paths.contacts;
+    try {
+        const mtime = fs.statSync(key).mtimeMs;
+        if (_viewerIdCache[key] && _viewerIdCache[key].mtime === mtime) {
+            return _viewerIdCache[key].id;
+        }
+        const contacts = loadContacts(paths);
+        let best = null, bestCount = 0;
+        for (const c of contacts) {
+            const n = Array.isArray(c.groupMemberships) ? c.groupMemberships.length : 0;
+            if (n > bestCount) { best = c.id; bestCount = n; }
+        }
+        _viewerIdCache[key] = { mtime, id: best };
+        return best;
+    } catch { return null; }
+}
+
 function handleGetContact(req, res, [id], paths , ) {
     const contact = loadContacts(paths).find(c => c.id === id);
     if (!contact) return json(res, { error: 'not found' }, 404);
-    json(res, contact);
+    // Enrich with shared-groups metadata for the "you're both in…" section.
+    const memberships = loadGroupMemberships();
+    const sharedGroups = getSharedGroups(contact, memberships);
+    json(res, { ...contact, sharedGroups });
+}
+
+function handleGetIntroPaths(req, res, [id], paths , ) {
+    const contacts = loadContacts(paths);
+    const target = contacts.find(c => c.id === id);
+    if (!target) return json(res, { error: 'not found' }, 404);
+    const memberships = loadGroupMemberships();
+    const viewerId = getViewerContactId(paths);
+    const excludeIds = [];
+    if (viewerId) excludeIds.push(viewerId);
+    if (paths.selfIds?.size) excludeIds.push(...paths.selfIds);
+
+    const paths_ = findIntroPaths(id, contacts, memberships, {
+        maxPaths: 5,
+        maxGroupSize: 200,
+        excludeIds,
+    });
+    json(res, {
+        targetId: id,
+        targetName: target.name || null,
+        count: paths_.length,
+        paths: paths_,
+    });
 }
 
 function handleGetInteractions(req, res, [id], paths, uuid) {
@@ -778,25 +833,62 @@ function extractGroupSignals(messages) {
     return { urls, hiring, events, intros };
 }
 
+function loadGroupMemberships() {
+    const p = path.join(DATA, 'unified/group-memberships.json');
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return {}; }
+}
+
 function handleGetGroups(req, res, params, paths, uuid) {
     const idx = getInteractionIndex(paths, uuid);
+    const memberships = loadGroupMemberships();
     const groupMap = {};
+
+    // Seed from roster data first — captures groups with rosters but zero messages.
+    for (const [chatId, g] of Object.entries(memberships)) {
+        if (!chatId.endsWith('@g.us')) continue;
+        groupMap[chatId] = {
+            chatId,
+            name: g.name || chatId,
+            messageCount: 0,
+            lastMessageAt: null,
+            lastSnippet: '',
+            rosterCount: g.size || 0,
+            posterCount: 0,
+            category: inferGroupCategory(g.name || chatId),
+            owner: g.owner || null,
+            createdAt: g.createdAt || null,
+            labels: g.labels || [],
+        };
+    }
+
+    // Layer message data on top.
     for (const [chatId, msgs] of Object.entries(idx.byChatId)) {
         if (!chatId.endsWith('@g.us')) continue;
         const sorted = [...msgs].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
         const name = sorted[0]?.chatName || chatId;
-        const participants = new Set(msgs.map(m => m.from).filter(Boolean));
+        const posters = new Set(msgs.map(m => m.from).filter(Boolean));
+        const existing = groupMap[chatId] || {
+            chatId, name, rosterCount: 0, posterCount: 0,
+            category: inferGroupCategory(name), owner: null, createdAt: null, labels: [],
+        };
         groupMap[chatId] = {
-            chatId,
-            name,
+            ...existing,
+            name: existing.name || name,
             messageCount: msgs.length,
             lastMessageAt: sorted[0]?.timestamp || null,
             lastSnippet: (sorted[0]?.body || '').slice(0, 100),
-            participantCount: participants.size,
-            category: inferGroupCategory(name),
+            posterCount: posters.size,
         };
     }
-    const groups = Object.values(groupMap).sort((a, b) => {
+
+    // Back-compat: keep participantCount as the higher of roster/poster counts.
+    const groups = Object.values(groupMap).map(g => ({
+        ...g,
+        participantCount: Math.max(g.rosterCount || 0, g.posterCount || 0),
+    })).sort((a, b) => {
+        if (!a.lastMessageAt && !b.lastMessageAt) {
+            return (b.rosterCount || 0) - (a.rosterCount || 0);
+        }
         if (!a.lastMessageAt) return 1;
         if (!b.lastMessageAt) return -1;
         return new Date(b.lastMessageAt) - new Date(a.lastMessageAt);
@@ -1653,26 +1745,62 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
             message: `Syncing ${i + 1}/${total}: ${name}`,
         });
 
-        let fetched;
-        try {
-            fetched = await chat.fetchMessages({ limit });
-        } catch (e) {
-            console.error(`[whatsapp] fetchMessages failed for ${name}:`, e.message);
-            continue;
+        // Capture metadata FIRST — independent of fetchMessages success.
+        // `chat.participants`, `chat.groupMetadata`, etc. are hydrated by
+        // `client.getChats()` itself (Utils.js:645-654), not by fetchMessages.
+        // Keeping these even when the message fetch throws is valuable signal.
+        const meta = {
+            id: chat.id._serialized,
+            name: chat.name || null,
+            isGroup: chat.isGroup,
+            isReadOnly: chat.isReadOnly || false,
+            unreadCount: chat.unreadCount || 0,
+            lastMessageTime: chat.lastMessage?.timestamp
+                ? new Date(chat.lastMessage.timestamp * 1000).toISOString()
+                : null,
+        };
+        if (chat.isGroup) {
+            meta.participants = (chat.participants || [])
+                .map(p => ({
+                    id: p.id?._serialized,
+                    isAdmin: !!p.isAdmin,
+                    isSuperAdmin: !!p.isSuperAdmin,
+                }))
+                .filter(p => p.id);
+            meta.participantCountAtSync = meta.participants.length;
+            meta.owner = chat.owner?._serialized || null;
+            meta.createdAt = chat.createdAt?.toISOString?.() || null;
+            meta.description = chat.description || null;
         }
 
-        const seen = existingIds[name] || new Set();
-        const newMessages = fetched
-            .filter(m => !seen.has(m.id._serialized))
-            .map(m => ({
-                id: m.id._serialized,
-                timestamp: new Date(m.timestamp * 1000).toISOString(),
-                from: m.from, body: m.body, type: m.type,
-            }));
+        // WhatsApp Business labels per chat — no-op / throws on personal accounts.
+        try {
+            const labels = await chat.getLabels();
+            if (labels && labels.length > 0) {
+                meta.labels = labels.map(l => ({ id: l.id, name: l.name, hexColor: l.hexColor }));
+            }
+        } catch { /* personal account — ignore */ }
+
+        // Attempt message fetch; tolerate failure (known wweb.js waitForChatLoading issue).
+        let newMessages = [];
+        try {
+            const fetched = await chat.fetchMessages({ limit });
+            const seen = existingIds[name] || new Set();
+            newMessages = fetched
+                .filter(m => !seen.has(m.id._serialized))
+                .map(m => ({
+                    id: m.id._serialized,
+                    timestamp: new Date(m.timestamp * 1000).toISOString(),
+                    from: m.from, body: m.body, type: m.type,
+                }));
+        } catch (e) {
+            console.error(`[whatsapp] fetchMessages failed for ${name}:`, e.message);
+            // fall through — meta is still written
+        }
 
         const existing = result[name];
         result[name] = {
-            meta: { id: chat.id._serialized, isGroup: chat.isGroup },
+            meta,
             messages: existing ? [...(existing.messages || []), ...newMessages] : newMessages,
         };
         msgCount += newMessages.length;
@@ -1919,8 +2047,36 @@ async function handleNetworkQuery(req, res, _params, paths) {
 
     const index   = loadQueryIndex(paths);
     const parsedQ = parseNetworkQuery(query);
-    const candidates = filterIndex(index, parsedQ);
+    let candidates = filterIndex(index, parsedQ);
     const description = describeQuery(parsedQ);
+
+    // Group-path signal: candidates tied into the user's WhatsApp social graph
+    // (many small group co-memberships) get a tie-breaking boost. The base
+    // filterIndex ranking is preserved; the boost only shifts candidates within
+    // a similar-score band. Helps when LinkedIn/email data is thin but someone
+    // is clearly in your inner circle via WhatsApp communities.
+    const memberships = loadGroupMemberships();
+    const fullContacts = loadContacts(paths);
+    const groupSignal = computeGroupSignalScores(fullContacts, memberships);
+
+    // Re-rank within the shortlist by adding (groupSignal * 3) to the intent-based
+    // sort key. Keeping the multiplier small preserves the dominant role/location
+    // signals but lets group-path break ties and bubble up tightly-connected people.
+    const baseIntentScore = (c) => {
+        switch (parsedQ.intent) {
+            case 'meet':      return c.meetScore || 0;
+            case 'reconnect': return c.daysSinceContact || 0;
+            case 'intro':     return (c.seniority_rank || 1) * 20;
+            default:          return c.relationshipScore || 0;
+        }
+    };
+    candidates = [...candidates].sort((a, b) => {
+        const locBoostA = (parsedQ.locations?.length && parsedQ.locations.some(l => a.city === l)) ? 1000 : 0;
+        const locBoostB = (parsedQ.locations?.length && parsedQ.locations.some(l => b.city === l)) ? 1000 : 0;
+        const gA = (groupSignal[a.id] || 0) * 3;
+        const gB = (groupSignal[b.id] || 0) * 3;
+        return (locBoostB + baseIntentScore(b) + gB) - (locBoostA + baseIntentScore(a) + gA);
+    });
 
     // Instant result shape (Layer 2 only)
     const instant = candidates.slice(0, 20).map(c => ({
@@ -1933,6 +2089,7 @@ async function handleNetworkQuery(req, res, _params, paths) {
         relationshipScore: c.relationshipScore,
         daysSinceContact:  c.daysSinceContact,
         meetScore:         c.meetScore,
+        groupSignal:       groupSignal[c.id] || 0,
         reason:            null, // filled by Claude layer
     }));
 
@@ -2048,6 +2205,7 @@ const ROUTES = [
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
     ['GET',  /^\/api\/contacts\/([^/]+)\/insights$/,     handleGetInsights],
+    ['GET',  /^\/api\/contacts\/([^/]+)\/intro-paths$/,  handleGetIntroPaths],
     ['POST', /^\/api\/contacts\/([^/]+)\/regenerate-draft$/, handleRegenerateDraft],
     ['POST', /^\/api\/contacts\/([^/]+)\/notes$/,        handleSaveNotes],
     ['GET',  /^\/api\/contacts\/([^/]+)$/,               handleGetContact],
@@ -4646,6 +4804,11 @@ function renderContactDetail(c) {
         </div>
       </div>
       <div>
+        \${renderSharedGroupsCard(c)}
+        <div class="detail-section" id="intro-paths-card">
+          <h3>Warmest paths to this person <span style="color:var(--text-muted);font-weight:400;font-size:0.65rem" id="intro-paths-status">\u2014 loading\u2026</span></h3>
+          <div id="intro-paths-body" style="color:var(--text-muted);font-size:0.82rem">Loading\u2026</div>
+        </div>
         <div class="detail-section">
           <h3>Notes</h3>
           <textarea class="notes-area" id="notes-area" placeholder="Add notes about this person\u2026">\${esc(c.notes || '')}</textarea>
@@ -4675,6 +4838,62 @@ function renderContactDetail(c) {
   loadInteractions(c.id);
   loadInsightsCard(c.id);
   loadTimeline(c.id);
+  loadIntroPaths(c.id);
+}
+
+function renderSharedGroupsCard(c) {
+  const groups = c.sharedGroups || [];
+  if (!groups.length) return '';
+  const items = groups.slice(0, 8).map(g => {
+    const sizeLabel = g.size ? g.size + ' member' + (g.size === 1 ? '' : 's') : '—';
+    const adminBadge = g.isSuperAdmin ? ' <span style="color:#fbbf24;font-size:0.65rem">★ creator</span>'
+                     : g.isAdmin ? ' <span style="color:#60a5fa;font-size:0.65rem">admin</span>' : '';
+    return \`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--border);font-size:0.82rem">
+      <span style="color:var(--text-primary)">\${esc(g.name)}\${adminBadge}</span>
+      <span style="color:var(--text-muted);font-size:0.72rem">\${sizeLabel}</span>
+    </div>\`;
+  }).join('');
+  const more = groups.length > 8 ? \`<div style="color:var(--text-muted);font-size:0.72rem;margin-top:6px">+ \${groups.length - 8} more</div>\` : '';
+  return \`<div class="detail-section">
+    <h3>You're both in <span style="color:var(--text-muted);font-weight:400;font-size:0.65rem">\${groups.length} group\${groups.length===1?'':'s'}</span></h3>
+    \${items}\${more}
+  </div>\`;
+}
+
+async function loadIntroPaths(contactId) {
+  const body = document.getElementById('intro-paths-body');
+  const status = document.getElementById('intro-paths-status');
+  if (!body) return;
+  let data;
+  try {
+    data = await fetch(\`\${BASE}/api/contacts/\${encodeURIComponent(contactId)}/intro-paths\`).then(r => r.json());
+  } catch (e) {
+    body.innerHTML = '<div class="loading">Could not load intro paths</div>';
+    if (status) status.textContent = '';
+    return;
+  }
+  if (status) status.textContent = '';
+  if (!data || !data.paths || data.paths.length === 0) {
+    body.innerHTML = '<div style="color:var(--text-muted);font-size:0.82rem">No warm paths found — this contact is only in groups that are too large for reliable intros.</div>';
+    return;
+  }
+  body.innerHTML = data.paths.map((p, i) => {
+    const roleStr = [p.intermediaryTitle, p.intermediaryCompany].filter(Boolean).join(' at ');
+    const scoreColor = p.intermediaryScore >= 70 ? 'var(--health-strong)' :
+                       p.intermediaryScore >= 40 ? 'var(--health-warm)' :
+                       p.intermediaryScore >= 20 ? 'var(--health-fading)' : 'var(--health-cold)';
+    const groupChips = p.sharedGroupsWithTarget.map(g =>
+      \`<span style="display:inline-block;background:var(--surface-alt);padding:2px 6px;border-radius:4px;font-size:0.68rem;margin-right:4px">\${esc(g.name)} · \${g.size}</span>\`
+    ).join('');
+    return \`<div style="padding:8px 0;\${i===data.paths.length-1?'':'border-bottom:1px solid var(--border)'}">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
+        <button style="background:none;border:none;color:var(--text-primary);font-weight:600;font-size:0.88rem;cursor:pointer;padding:0;text-align:left" onclick="openContact('\${jsAttr(p.intermediaryId)}')">\${esc(p.intermediaryName)}</button>
+        <span style="color:\${scoreColor};font-size:0.72rem;font-weight:600">\${p.intermediaryScore}</span>
+      </div>
+      \${roleStr ? \`<div style="color:var(--text-muted);font-size:0.72rem;margin-bottom:6px">\${esc(roleStr)}</div>\` : ''}
+      <div>\${groupChips}</div>
+    </div>\`;
+  }).join('');
 }
 
 async function loadInsightsCard(contactId) {
@@ -5140,10 +5359,27 @@ async function loadDigest() {
       </div>\`).join('')}
     </div>\` : '';
 
+  const warmIntroHtml = d.warmIntroBriefs?.length
+    ? \`<div class="digest-section"><h3>Warm paths you didn't know you had</h3>
+      \${d.warmIntroBriefs.map(b => {
+        const roleStr = [b.intermediary.title, b.intermediary.company].filter(Boolean).join(' at ');
+        const via = b.sharedGroup ? \`via \${esc(b.sharedGroup.name)} (\${b.sharedGroup.size})\` : '';
+        return \`<div class="digest-loop-item">
+          <div>
+            <span class="digest-loop-contact" onclick="openContact('\${esc(b.target.id)}')" style="cursor:pointer">\${esc(b.target.name)}</span>
+            <span style="color:var(--text-muted);font-size:0.72rem"> ← intro via </span>
+            <span class="digest-loop-contact" onclick="openContact('\${esc(b.intermediary.id)}')" style="cursor:pointer">\${esc(b.intermediary.name)}</span>
+          </div>
+          <div class="digest-loop-text" style="font-size:0.72rem">\${esc(roleStr)}\${roleStr && via ? ' · ' : ''}\${via}</div>
+        </div>\`;
+      }).join('')}
+    </div>\` : '';
+
   const generatedAt = new Date(d.generatedAt).toLocaleDateString('en-GB', { weekday:'long', day:'numeric', month:'long' });
   el.innerHTML = [
     stats,
     summaryHtml,
+    warmIntroHtml,
     activeHtml,
     reconnectHtml,
     loopsHtml,
