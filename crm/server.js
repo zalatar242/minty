@@ -265,13 +265,36 @@ function getViewerContactId(paths) {
     } catch { return null; }
 }
 
-function handleGetContact(req, res, [id], paths , ) {
+function handleGetContact(req, res, [id], paths, uuid) {
     const contact = loadContacts(paths).find(c => c.id === id);
     if (!contact) return json(res, { error: 'not found' }, 404);
     // Enrich with shared-groups metadata for the "you're both in…" section.
     const memberships = loadGroupMemberships();
     const sharedGroups = getSharedGroups(contact, memberships);
-    json(res, { ...contact, sharedGroups });
+    // Engagement metrics (reply rate, latency, initiation balance)
+    const metrics = computeContactEngagement(contact, paths, uuid);
+    json(res, { ...contact, sharedGroups, metrics });
+}
+
+const { computeContactMetrics: computeEngagementMetrics, labelMetrics } = require('./response-metrics');
+
+/**
+ * Build per-contact engagement metrics from that contact's interactions.
+ * Cheap — only runs on detail-view open.
+ */
+function computeContactEngagement(contact, paths, uuid) {
+    try {
+        const list = getContactInteractions(contact, paths, uuid);
+        if (!list || !list.length) return null;
+        const selfIds = new Set(['me', ...(paths.selfIds || [])]);
+        // Add the user's own phone if we can infer one (seed data uses 'me', so this is mostly a no-op).
+        const decorated = list.map(i => Object.assign({}, i, { _contactId: contact.id }));
+        const m = computeEngagementMetrics(decorated, selfIds);
+        m.chips = labelMetrics(m);
+        return m;
+    } catch {
+        return null;
+    }
 }
 
 function handleGetIntroPaths(req, res, [id], paths , ) {
@@ -2958,6 +2981,12 @@ nav {
                     color: var(--text-muted); font-weight: 600; }
 .hero-last-contact { font-size: 11px; color: var(--text-secondary); text-align: right; margin-top: 4px; }
 .hero-source-dots { display: flex; gap: 5px; margin-top: 4px; justify-content: flex-end; }
+.engagement-chips { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; margin-top: 4px; }
+.engagement-chip {
+  font-size: 10px; padding: 2px 6px; border-radius: 10px;
+  border: 1px solid var(--border); background: rgba(99,102,241,0.05);
+  color: var(--text-secondary); letter-spacing: 0.01em;
+}
 .hero-source-dot { width: 8px; height: 8px; border-radius: 50%; cursor: default; }
 /* Quick actions strip */
 .quick-actions { display: flex; gap: 8px; padding: 8px 20px;
@@ -5522,6 +5551,7 @@ function renderContactDetail(c) {
         </div>
         <div class="hero-score-bar"><div class="hero-score-fill" style="width:\${barPct}%;background:\${scoreColor}"></div></div>
         <div class="hero-last-contact">\${esc(lastContactStr)}</div>
+        \${renderEngagementChips(c.metrics)}
         <div class="hero-source-dots">\${dotsHtml}</div>
       </div>
     </div>
@@ -6999,6 +7029,15 @@ function sourceLabel(s) {
 
 function esc(s) {
   return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// Render engagement chips (reply rate, latency, initiation) for the hero card.
+// Tolerant of missing metrics — returns empty string so the layout never
+// breaks on sparse data.
+function renderEngagementChips(m) {
+  if (!m || !Array.isArray(m.chips) || m.chips.length === 0) return '';
+  const chipHtml = m.chips.map(c => '<span class="engagement-chip">' + esc(c) + '</span>').join('');
+  return '<div class="engagement-chips" title="Reply rate / avg latency / who initiates — computed from cross-source interactions">' + chipHtml + '</div>';
 }
 
 // Safe for interpolation inside a JS single-quoted string inside an HTML
