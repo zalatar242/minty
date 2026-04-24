@@ -271,7 +271,10 @@ async function run(opts) {
         stdout.write(INSTRUCTIONS + '\n');
 
         // Wait for the user to close the Chromium window.
-        await context.waitForEvent('close');
+        // Wait indefinitely — logging in + 2FA + browsing takes minutes, well
+        // past Playwright's default 30s. Earlier shipped version timed out
+        // and claimed 'connect failed' while the user was still typing.
+        await context.waitForEvent('close', { timeout: 0 });
 
         // 7. Success — record state.
         try {
