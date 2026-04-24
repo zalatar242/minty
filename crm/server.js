@@ -958,6 +958,8 @@ function handleGetSources(req, res, params, paths, uuid) {
     // Also indicate whether Google OAuth is configured
     result._googleOAuthEnabled = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
     result._microsoftOAuthEnabled = !!(process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_CLIENT_SECRET);
+    result._linkedinAutoSyncEnabled = LINKEDIN_AUTOSYNC_ENABLED;
+    result._linkedin = LINKEDIN_AUTOSYNC_ENABLED ? readLinkedInState() : { status: 'disconnected' };
     json(res, result);
 }
 
@@ -1944,8 +1946,95 @@ async function handleNetworkQuery(req, res, _params, paths) {
     json(res, { query, parsed: parsedQ, description, results: instant, enhanced: false, processingMs: 0 });
 }
 
+// ── LinkedIn auto-sync (opt-in, experimental) ──────────────────────────────
+// Gated behind MINTY_LINKEDIN_AUTOSYNC=1 env flag. All three endpoints return
+// 404 when the flag is unset — this is the feature's kill-switch. POST endpoints
+// also enforce Origin/Sec-Fetch-Site (via sources/linkedin/origin-check.js) to
+// prevent a drive-by webpage from spawning a Chromium process on the user's machine.
+
+const LINKEDIN_AUTOSYNC_ENABLED = process.env.MINTY_LINKEDIN_AUTOSYNC === '1';
+
+function readLinkedInState() {
+    try {
+        const state = JSON.parse(fs.readFileSync(path.join(DATA, 'sync-state.json'), 'utf8'));
+        return state.linkedin || { status: 'disconnected' };
+    } catch { return { status: 'disconnected' }; }
+}
+
+function linkedInPlaywrightAvailable() {
+    try { require.resolve('playwright'); return true; } catch { return false; }
+}
+
+function linkedInGate(req, res) {
+    if (!LINKEDIN_AUTOSYNC_ENABLED) { res.writeHead(404); res.end('not found'); return false; }
+    if (req.method === 'POST') {
+        let originCheck;
+        try {
+            const { requireSameOrigin } = require('../sources/linkedin/origin-check.js');
+            originCheck = requireSameOrigin(req);
+        } catch { res.writeHead(500); res.end('origin check unavailable'); return false; }
+        if (!originCheck.ok) {
+            res.writeHead(403, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: 'csrf', reason: originCheck.reason })); return false;
+        }
+    }
+    return true;
+}
+
+const _linkedinChildren = new Map();
+
+function handleLinkedInStatus(req, res) {
+    if (!linkedInGate(req, res)) return;
+    const state = readLinkedInState();
+    json(res, { ...state, playwrightAvailable: linkedInPlaywrightAvailable() });
+}
+
+function handleLinkedInConnect(req, res) {
+    if (!linkedInGate(req, res)) return;
+    if (!linkedInPlaywrightAvailable()) {
+        json(res, { error: 'playwright-missing', message: 'Run: npm run linkedin:setup' }, 503); return;
+    }
+    const state = readLinkedInState();
+    if (state.status === 'syncing') { json(res, { error: 'sync in progress' }, 409); return; }
+    const { spawn } = require('child_process');
+    const scriptPath = path.resolve(__dirname, '../sources/linkedin/connect.js');
+    const child = spawn(process.execPath, [scriptPath], {
+        detached: false, stdio: 'ignore', env: { ...process.env },
+    });
+    child.unref();
+    _linkedinChildren.set(child.pid, child);
+    child.on('exit', () => _linkedinChildren.delete(child.pid));
+    res.writeHead(202, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, pid: child.pid, message: 'Check your terminal / desktop for the Chromium window.' }));
+}
+
+function handleLinkedInSync(req, res) {
+    if (!linkedInGate(req, res)) return;
+    if (!linkedInPlaywrightAvailable()) {
+        json(res, { error: 'playwright-missing', message: 'Run: npm run linkedin:setup' }, 503); return;
+    }
+    const state = readLinkedInState();
+    if (state.status === 'syncing') { json(res, { error: 'sync in progress' }, 409); return; }
+    if (state.status === 'disconnected') {
+        json(res, { error: 'not connected', message: 'Run: npm run linkedin:connect (or click Enable auto-sync)' }, 400); return;
+    }
+    const { spawn } = require('child_process');
+    const scriptPath = path.resolve(__dirname, '../sources/linkedin/fetch.js');
+    const child = spawn(process.execPath, [scriptPath], {
+        detached: false, stdio: 'ignore', env: { ...process.env },
+    });
+    child.unref();
+    _linkedinChildren.set(child.pid, child);
+    child.on('exit', () => _linkedinChildren.delete(child.pid));
+    res.writeHead(202, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, pid: child.pid }));
+}
+
 const ROUTES = [
     ['GET',  /^\/api\/sources$/,                          handleGetSources],
+    ['GET',  /^\/api\/linkedin\/status$/,                 handleLinkedInStatus],
+    ['POST', /^\/api\/linkedin\/connect$/,                handleLinkedInConnect],
+    ['POST', /^\/api\/linkedin\/sync$/,                   handleLinkedInSync],
     ['POST', /^\/api\/sources\/upload\/([^/]+)$/,         handleUploadSource],
     ['POST', /^\/api\/sources\/email$/,                   handleConnectEmail],
     ['POST', /^\/api\/sources\/email\/device-start$/,     handleEmailDeviceStart],
@@ -6240,10 +6329,42 @@ function renderSourceForm(key, status, connected) {
     return;
   }
 
-  // File upload sources (LinkedIn, Telegram, SMS)
+  if (key === 'linkedin') {
+    const li = sourceStatuses._linkedin || { status: 'disconnected' };
+    const autoEnabled = !!sourceStatuses._linkedinAutoSyncEnabled;
+    const pwMissing = autoEnabled && !sourceStatuses._linkedin?.playwrightAvailable && li.status !== 'disconnected';
+    const showAutoCard = autoEnabled && (li.status === 'connected' || li.status === 'syncing' || li.status === 'challenge' || li.status === 'error');
+    if (showAutoCard) {
+      const copy = {
+        connected: li.lastSync ? 'Synced · ' + new Date(li.lastSync).toLocaleDateString() : 'Connected — no data yet',
+        syncing: li.progress ? 'Syncing · ' + li.progress.phase + ' ' + li.progress.current + '/' + li.progress.total : 'Syncing…',
+        challenge: 'Action needed — reconnect',
+        error: 'Sync failed' + (li.lastError?.message ? ' — ' + li.lastError.message : ''),
+      }[li.status] || 'Connected';
+      const color = (li.status === 'error' || li.status === 'challenge') ? '#f87171' : (li.status === 'syncing' ? '#fbbf24' : '#34d399');
+      const cta = li.status === 'challenge' ? '<button class="source-btn secondary" style="font-size:0.7rem;padding:4px 10px" onclick="connectLinkedIn()">Reconnect</button>'
+                : '<button class="source-btn secondary sync-now-btn" style="font-size:0.7rem;padding:4px 10px" onclick="syncLinkedIn()" ' + (li.status === 'syncing' ? 'disabled' : '') + '>Sync now</button>';
+      el.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
+        + '<span style="font-size:0.76rem;color:' + color + '">● ' + copy + '</span>' + cta + '</div>'
+        + '<div style="margin-top:8px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();switchLinkedInMode(\\'zip\\')" style="color:#6366f1">Prefer the safer ZIP import? Switch to file upload</a></div>';
+      if (li.status === 'syncing') startLinkedInPoll();
+      return;
+    }
+    // ZIP mode (default)
+    const zipBtn = '<input type="file" id="file-linkedin" accept="*" multiple style="display:none" onchange="uploadSource(\\'linkedin\\', this.files)">'
+      + '<button class="source-btn secondary" style="width:100%" onclick="document.getElementById(\\'file-linkedin\\').click()">Choose file — Connections.csv, messages.csv, Invitations.csv</button>'
+      + '<label class="drop-zone" id="dz-linkedin" ondragover="dzOver(event,\\'linkedin\\')" ondragleave="dzLeave(\\'linkedin\\')" ondrop="dzDrop(event,\\'linkedin\\')" style="margin-top:6px;padding:10px;font-size:0.72rem">or drop here</label>'
+      + '<div class="source-log" id="log-linkedin"></div>';
+    const footer = !autoEnabled ? '' : pwMissing
+      ? '<div style="margin-top:10px;font-size:0.7rem;color:#8892a4">Auto-sync needs Playwright. Run <code>npm run linkedin:setup</code> in your terminal.</div>'
+      : '<div style="margin-top:10px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();connectLinkedIn()" style="color:#6366f1">Enable auto-sync (experimental — ToS-adjacent, see README)</a></div>';
+    el.innerHTML = zipBtn + footer;
+    return;
+  }
+
+  // File upload sources (Telegram, SMS)
   const accept = key === 'telegram' ? '.json' : key === 'sms' ? '.xml' : '*';
-  const fileLabel = key === 'linkedin' ? 'Connections.csv, messages.csv, Invitations.csv' :
-                    key === 'telegram' ? 'result.json' : 'XML backup file';
+  const fileLabel = key === 'telegram' ? 'result.json' : 'XML backup file';
   el.innerHTML = \`
     <input type="file" id="file-\${key}" accept="\${accept}" multiple style="display:none" onchange="uploadSource('\${key}', this.files)">
     <button class="source-btn secondary" style="width:100%" onclick="document.getElementById('file-\${key}').click()">Choose file — \${fileLabel}</button>
@@ -6251,6 +6372,36 @@ function renderSourceForm(key, status, connected) {
       or drop here
     </label>
     <div class="source-log" id="log-\${key}"></div>\`;
+}
+
+let _liPoll = null;
+function startLinkedInPoll() {
+  if (_liPoll) return;
+  _liPoll = setInterval(async () => {
+    await loadSources();
+    const s = sourceStatuses._linkedin?.status;
+    if (s !== 'syncing') { clearInterval(_liPoll); _liPoll = null; }
+  }, 5000);
+}
+async function syncLinkedIn() {
+  const r = await fetch(BASE + '/api/linkedin/sync', { method: 'POST', credentials: 'same-origin' });
+  if (r.status === 403) return alert('CSRF check failed. Reload the page and try again.');
+  if (r.status === 503) return alert('Playwright not installed. Run: npm run linkedin:setup');
+  if (r.status === 409) return alert('A sync is already in progress.');
+  if (r.status === 400) return alert('Connect LinkedIn first (Enable auto-sync).');
+  await loadSources();
+  startLinkedInPoll();
+}
+async function connectLinkedIn() {
+  if (!confirm('This opens a Chromium window on this machine for you to log into LinkedIn. Continue?')) return;
+  const r = await fetch(BASE + '/api/linkedin/connect', { method: 'POST', credentials: 'same-origin' });
+  if (r.status === 403) return alert('CSRF check failed. Reload and try again.');
+  if (r.status === 503) return alert('Playwright not installed. Run: npm run linkedin:setup');
+  if (r.status === 409) return alert('A sync is already running. Wait for it to finish.');
+  alert('Chromium window should be opening on this machine. Log into LinkedIn there, then close the window.');
+}
+function switchLinkedInMode(/* mode */) {
+  alert('Mode switching is not persisted in Phase 1. For the ZIP flow, use: npm run linkedin:import-zip');
 }
 
 function reconnectSource(key) { renderSourceForm(key, {}, false); }
