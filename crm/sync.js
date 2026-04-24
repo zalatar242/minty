@@ -490,15 +490,33 @@ function attachWhatsAppSync(uuid, client, userDataDir, statePath) {
     client.on('message', async msg => {
         try {
             const chatsPath = path.join(waDir, 'chats.json');
-            let chats = [];
-            try { chats = JSON.parse(fs.readFileSync(chatsPath, 'utf8')); } catch { chats = []; }
+            // chats.json is an object keyed by chat name (written by runWhatsAppExport
+            // in server.js). Earlier versions wrote an array; support both shapes so a
+            // mid-upgrade user's file doesn't crash the live listener.
+            let chats = {};
+            try {
+                const raw = JSON.parse(fs.readFileSync(chatsPath, 'utf8'));
+                if (Array.isArray(raw)) {
+                    for (const c of raw) {
+                        const key = c?.meta?.id || c?.id;
+                        if (!key) continue;
+                        chats[key] = { meta: c.meta || { id: key }, messages: c.messages || [] };
+                    }
+                } else if (raw && typeof raw === 'object') {
+                    chats = raw;
+                }
+            } catch { chats = {}; }
 
             const chatId = msg.from;
-            let chat = chats.find(c => c.id === chatId);
-            if (!chat) {
-                chat = { id: chatId, messages: [] };
-                chats.push(chat);
+            let entryKey = Object.keys(chats).find(k => chats[k]?.meta?.id === chatId);
+            if (!entryKey) {
+                entryKey = chatId;
+                chats[entryKey] = {
+                    meta: { id: chatId, isGroup: chatId.endsWith('@g.us') },
+                    messages: [],
+                };
             }
+            const chat = chats[entryKey];
             if (!chat.messages) chat.messages = [];
             chat.messages.push({
                 id: msg.id?.id || crypto.randomBytes(8).toString('hex'),

@@ -90,6 +90,94 @@ function loadWhatsApp(index) {
     console.log(`Merged ${Object.keys(contacts).length} WhatsApp contacts (${groups} group chats tagged)`);
 }
 
+/**
+ * Extract group rosters from whatsapp/chats.json meta.participants and:
+ *   1. Upsert a unified contact for every participant (including silent lurkers).
+ *   2. Attach contact.groupMemberships[] so the UI can answer "you're both in X".
+ *   3. Write data/unified/group-memberships.json keyed by chatId for fast lookup.
+ *
+ * Must run AFTER loadWhatsApp (so phone-based dedup index is populated) and BEFORE
+ * other source loaders (so rostered phones can bridge to LinkedIn/Google Contacts).
+ */
+function loadWhatsAppRosters(index, outDir) {
+    const chats = load(path.join(DATA, 'whatsapp/chats.json'));
+    if (!chats) { console.log('whatsapp/chats.json not found, skipping rosters'); return; }
+    const lidMap = load(path.join(DATA, 'whatsapp/lid-map.json')) || {};
+
+    const groupMemberships = {}; // chatId -> { name, participants, size, owner, ... }
+    let rosterUpserts = 0;
+    let silentLurkerAdds = 0;
+
+    for (const [chatName, chat] of Object.entries(chats)) {
+        const meta = chat && chat.meta;
+        if (!meta || !meta.isGroup || !Array.isArray(meta.participants)) continue;
+        const chatId = meta.id;
+        const memberContactIds = [];
+
+        for (const p of meta.participants) {
+            const pid = p && p.id;
+            if (!pid) continue;
+            // Resolve @lid -> @c.us if we have the mapping
+            const resolvedId = pid.endsWith('@lid') && lidMap[pid] ? lidMap[pid] : pid;
+            const isLid = resolvedId.endsWith('@lid');
+            const phone = resolvedId.endsWith('@c.us')
+                ? `+${resolvedId.split('@')[0]}`
+                : null;
+            const stableId = !isLid ? waStableId(resolvedId.split('@')[0]) : `wa_lid_${pid}`;
+            const wasInContacts = !!(index.byId && index.byId[stableId]);
+
+            const contact = index.upsert(phone ? [phone] : [], [], null, stableId);
+            if (!wasInContacts && !contact.sources.whatsapp) silentLurkerAdds++;
+
+            if (!contact.sources.whatsapp) {
+                contact.sources.whatsapp = {
+                    id: resolvedId,
+                    number: phone ? phone.replace('+', '') : null,
+                    fromRoster: true,
+                };
+            }
+            if (!contact.groupMemberships) contact.groupMemberships = [];
+            if (!contact.groupMemberships.some(g => g.chatId === chatId)) {
+                contact.groupMemberships.push({
+                    chatId,
+                    chatName: meta.name || chatName,
+                    isAdmin: !!p.isAdmin,
+                    isSuperAdmin: !!p.isSuperAdmin,
+                });
+            }
+            memberContactIds.push(contact.id);
+            rosterUpserts++;
+        }
+
+        groupMemberships[chatId] = {
+            chatId,
+            name: meta.name || chatName,
+            createdAt: meta.createdAt || null,
+            owner: meta.owner || null,
+            description: meta.description || null,
+            labels: meta.labels || [],
+            members: memberContactIds,
+            size: memberContactIds.length,
+        };
+    }
+
+    // Write the group-memberships artifact for server.js consumers.
+    try {
+        fs.mkdirSync(outDir, { recursive: true });
+        fs.writeFileSync(
+            path.join(outDir, 'group-memberships.json'),
+            JSON.stringify(groupMemberships, null, 2)
+        );
+    } catch (e) {
+        console.error('[rosters] failed to write group-memberships.json:', e.message);
+    }
+
+    console.log(
+        `Rosters: ${rosterUpserts} upserts across ${Object.keys(groupMemberships).length} groups ` +
+        `(+${silentLurkerAdds} silent-lurker contacts)`
+    );
+}
+
 function loadLinkedIn(index) {
     const contacts = load(path.join(DATA, 'linkedin/contacts.json'));
     if (!contacts) { console.log('linkedin/contacts.json not found, skipping'); return; }
@@ -445,6 +533,7 @@ function run() {
 
     const index = new ContactIndex();
     loadWhatsApp(index);
+    loadWhatsAppRosters(index, outDir);
     loadLinkedIn(index);
     loadTelegram(index);
     loadEmail(index);
@@ -472,4 +561,10 @@ function run() {
     console.log(`Unified interactions: ${interactions.length} → data/unified/interactions.json`);
 }
 
-run();
+if (require.main === module) {
+    run();
+}
+
+module.exports = {
+    loadWhatsAppRosters,
+};

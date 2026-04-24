@@ -7,7 +7,7 @@ const http = require('http');
 const path = require('path');
 
 const DATA_DIR = path.join(__dirname, '../../data/whatsapp');
-const AUTH_DIR = path.join(__dirname, '../../.wwebjs_auth');
+const AUTH_DIR = process.env.WHATSAPP_AUTH_DIR || path.join(__dirname, '../../.wwebjs_auth');
 
 const client = new Client({ authStrategy: new LocalAuth({ dataPath: AUTH_DIR }) });
 

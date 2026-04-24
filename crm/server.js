@@ -778,25 +778,62 @@ function extractGroupSignals(messages) {
     return { urls, hiring, events, intros };
 }
 
+function loadGroupMemberships() {
+    const p = path.join(DATA, 'unified/group-memberships.json');
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return {}; }
+}
+
 function handleGetGroups(req, res, params, paths, uuid) {
     const idx = getInteractionIndex(paths, uuid);
+    const memberships = loadGroupMemberships();
     const groupMap = {};
+
+    // Seed from roster data first — captures groups with rosters but zero messages.
+    for (const [chatId, g] of Object.entries(memberships)) {
+        if (!chatId.endsWith('@g.us')) continue;
+        groupMap[chatId] = {
+            chatId,
+            name: g.name || chatId,
+            messageCount: 0,
+            lastMessageAt: null,
+            lastSnippet: '',
+            rosterCount: g.size || 0,
+            posterCount: 0,
+            category: inferGroupCategory(g.name || chatId),
+            owner: g.owner || null,
+            createdAt: g.createdAt || null,
+            labels: g.labels || [],
+        };
+    }
+
+    // Layer message data on top.
     for (const [chatId, msgs] of Object.entries(idx.byChatId)) {
         if (!chatId.endsWith('@g.us')) continue;
         const sorted = [...msgs].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
         const name = sorted[0]?.chatName || chatId;
-        const participants = new Set(msgs.map(m => m.from).filter(Boolean));
+        const posters = new Set(msgs.map(m => m.from).filter(Boolean));
+        const existing = groupMap[chatId] || {
+            chatId, name, rosterCount: 0, posterCount: 0,
+            category: inferGroupCategory(name), owner: null, createdAt: null, labels: [],
+        };
         groupMap[chatId] = {
-            chatId,
-            name,
+            ...existing,
+            name: existing.name || name,
             messageCount: msgs.length,
             lastMessageAt: sorted[0]?.timestamp || null,
             lastSnippet: (sorted[0]?.body || '').slice(0, 100),
-            participantCount: participants.size,
-            category: inferGroupCategory(name),
+            posterCount: posters.size,
         };
     }
-    const groups = Object.values(groupMap).sort((a, b) => {
+
+    // Back-compat: keep participantCount as the higher of roster/poster counts.
+    const groups = Object.values(groupMap).map(g => ({
+        ...g,
+        participantCount: Math.max(g.rosterCount || 0, g.posterCount || 0),
+    })).sort((a, b) => {
+        if (!a.lastMessageAt && !b.lastMessageAt) {
+            return (b.rosterCount || 0) - (a.rosterCount || 0);
+        }
         if (!a.lastMessageAt) return 1;
         if (!b.lastMessageAt) return -1;
         return new Date(b.lastMessageAt) - new Date(a.lastMessageAt);
@@ -1651,26 +1688,62 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
             message: `Syncing ${i + 1}/${total}: ${name}`,
         });
 
-        let fetched;
-        try {
-            fetched = await chat.fetchMessages({ limit });
-        } catch (e) {
-            console.error(`[whatsapp] fetchMessages failed for ${name}:`, e.message);
-            continue;
+        // Capture metadata FIRST — independent of fetchMessages success.
+        // `chat.participants`, `chat.groupMetadata`, etc. are hydrated by
+        // `client.getChats()` itself (Utils.js:645-654), not by fetchMessages.
+        // Keeping these even when the message fetch throws is valuable signal.
+        const meta = {
+            id: chat.id._serialized,
+            name: chat.name || null,
+            isGroup: chat.isGroup,
+            isReadOnly: chat.isReadOnly || false,
+            unreadCount: chat.unreadCount || 0,
+            lastMessageTime: chat.lastMessage?.timestamp
+                ? new Date(chat.lastMessage.timestamp * 1000).toISOString()
+                : null,
+        };
+        if (chat.isGroup) {
+            meta.participants = (chat.participants || [])
+                .map(p => ({
+                    id: p.id?._serialized,
+                    isAdmin: !!p.isAdmin,
+                    isSuperAdmin: !!p.isSuperAdmin,
+                }))
+                .filter(p => p.id);
+            meta.participantCountAtSync = meta.participants.length;
+            meta.owner = chat.owner?._serialized || null;
+            meta.createdAt = chat.createdAt?.toISOString?.() || null;
+            meta.description = chat.description || null;
         }
 
-        const seen = existingIds[name] || new Set();
-        const newMessages = fetched
-            .filter(m => !seen.has(m.id._serialized))
-            .map(m => ({
-                id: m.id._serialized,
-                timestamp: new Date(m.timestamp * 1000).toISOString(),
-                from: m.from, body: m.body, type: m.type,
-            }));
+        // WhatsApp Business labels per chat — no-op / throws on personal accounts.
+        try {
+            const labels = await chat.getLabels();
+            if (labels && labels.length > 0) {
+                meta.labels = labels.map(l => ({ id: l.id, name: l.name, hexColor: l.hexColor }));
+            }
+        } catch { /* personal account — ignore */ }
+
+        // Attempt message fetch; tolerate failure (known wweb.js waitForChatLoading issue).
+        let newMessages = [];
+        try {
+            const fetched = await chat.fetchMessages({ limit });
+            const seen = existingIds[name] || new Set();
+            newMessages = fetched
+                .filter(m => !seen.has(m.id._serialized))
+                .map(m => ({
+                    id: m.id._serialized,
+                    timestamp: new Date(m.timestamp * 1000).toISOString(),
+                    from: m.from, body: m.body, type: m.type,
+                }));
+        } catch (e) {
+            console.error(`[whatsapp] fetchMessages failed for ${name}:`, e.message);
+            // fall through — meta is still written
+        }
 
         const existing = result[name];
         result[name] = {
-            meta: { id: chat.id._serialized, isGroup: chat.isGroup },
+            meta,
             messages: existing ? [...(existing.messages || []), ...newMessages] : newMessages,
         };
         msgCount += newMessages.length;
