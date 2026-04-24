@@ -265,11 +265,19 @@ const CHALLENGE = {
     ],
 
     // TOTP code input. LinkedIn rotates the selector occasionally.
+    // First try the W3C standard attribute (autocomplete="one-time-code" is
+    // the spec'd hint for TOTP / SMS OTP inputs — browsers autofill from
+    // clipboard / SMS based on this). Falls through to LinkedIn-specific
+    // selectors, then narrow fallbacks that require 6-digit constraint.
     totpInput: [
+        'input[autocomplete="one-time-code"]',
         'input[name="pin"]',
         '#input__email_verification_pin',
         'input[aria-label*="verification code" i]',
-        'input[inputmode="numeric"]',
+        // Narrowed fallback: inputmode="numeric" is common on phone-number
+        // and CAPTCHA fields too. Requiring maxlength=6 picks up TOTP-shaped
+        // inputs only.
+        'input[inputmode="numeric"][maxlength="6"]',
     ],
 
     totpSubmit: [

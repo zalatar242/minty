@@ -136,8 +136,14 @@ Once you've connected, the Sources view in `npm run crm` gains a "Sync now" butt
 If you'd rather not type your password every time the session expires, Minty can log in for you using stored credentials. **This is a higher-trust trade-off:** email + password + (optionally) your authenticator-app TOTP secret live plaintext at `data/linkedin/credentials.json` with `0o600` permissions. Disk encryption at the OS level (FileVault / LUKS / BitLocker) is load-bearing — without it, same-user malware can read the file. If that's not your setup, use the manual flow above instead.
 
 ```bash
-# One-time interactive setup — prompts for email, password, optional TOTP secret.
-MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:save-creds
+# One-time interactive setup — prompts for email, password, optional TOTP
+# secret. Saves to disk then exits (does NOT launch a browser).
+npm run linkedin:save-creds
+
+# Same as save-creds, but also runs an auto-login immediately after saving.
+# Useful for end-to-end verification that your password + TOTP secret work.
+# Fails fast if LinkedIn rejects the credentials.
+MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:save-and-verify
 
 # Subsequent connects auto-login using the stored creds (no prompt).
 MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:connect
@@ -170,7 +176,8 @@ To force the manual flow even with stored creds: `LINKEDIN_MANUAL=1 npm run link
 | `LINKEDIN_SKIP_DETAILS` | `0` | If `1`, skip per-card detail backfill (faster TTHW, degraded matching) |
 | `LINKEDIN_MESSAGE_WINDOW_HOURS` | `24` | On incremental syncs, scrape threads with activity within this many hours of `lastSync` |
 | `LINKEDIN_ACCEPT_TOS` | unset | If `1`, bypass typed "I accept" prompt (first run still persists sentinel) |
-| `LINKEDIN_SAVE_CREDS` | unset | If `1`, prompt for email/password/TOTP and save to `data/linkedin/credentials.json`. Equivalent to `npm run linkedin:save-creds`. |
+| `LINKEDIN_SAVE_CREDS` | unset | If `1`, prompt for email/password/TOTP, save to `data/linkedin/credentials.json`, then launch the browser and run auto-login to verify the credentials end-to-end. Equivalent to `npm run linkedin:save-and-verify`. |
+| `LINKEDIN_SAVE_CREDS_ONLY` | unset | If `1`, prompt for credentials, save them, and exit without launching the browser. Equivalent to `npm run linkedin:save-creds`. |
 | `LINKEDIN_FORGET_CREDS` | unset | If `1`, delete stored credentials and continue. Equivalent to `npm run linkedin:forget-creds`. |
 | `LINKEDIN_MANUAL` | unset | If `1`, ignore stored credentials and use the manual-login flow. |
 | `LINKEDIN_LIVE_TEST` | unset | If `1`, run live-test suite against real account |
