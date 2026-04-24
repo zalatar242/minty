@@ -288,6 +288,36 @@ function handleGetContact(req, res, [id], paths, uuid) {
 }
 
 const _mentionsModule = require('./mentions');
+const _exportModule = require('./export');
+
+/**
+ * GET /api/export[?passphrase=<p>]
+ * Download the full unified dataset as a portable bundle. Without a passphrase
+ * the bundle is gzipped JSON. With a passphrase the gzipped payload is
+ * AES-256-GCM encrypted (PBKDF2 200k sha256 key derivation).
+ */
+function handleExport(req, res, _params, _paths, uuid) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const passphrase = url.searchParams.get('passphrase') || null;
+    try {
+        const { buffer, filename, encrypted, stats } = _exportModule.exportAll(
+            getUserDataDir(uuid),
+            { passphrase },
+        );
+        res.writeHead(200, {
+            'Content-Type': encrypted ? 'application/octet-stream' : 'application/gzip',
+            'Content-Length': buffer.length,
+            'Content-Disposition': 'attachment; filename="' + filename + '"',
+            'X-Minty-Bundle-Stats': JSON.stringify(stats),
+            'X-Minty-Encrypted': encrypted ? '1' : '0',
+        });
+        res.end(buffer);
+    } catch (e) {
+        console.error('[export]', e);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+    }
+}
 // Cache the mention index — rebuilds only when contacts.json changes.
 let _mentionIndex = null;
 let _mentionIndexMtime = 0;
@@ -2619,6 +2649,7 @@ const ROUTES = [
     ['GET',  /^\/api\/sources\/([a-zA-Z]+)\/progress$/,  handleSourceProgress],
     ['GET',  /^\/api\/sync\/progress$/,                   handleSyncProgress],
     ['GET',  /^\/api\/palette$/,                          handlePaletteSearch],
+    ['GET',  /^\/api\/export$/,                           handleExport],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
