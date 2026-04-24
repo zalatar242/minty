@@ -289,6 +289,53 @@ function handleGetContact(req, res, [id], paths, uuid) {
 
 const _mentionsModule = require('./mentions');
 const _exportModule = require('./export');
+const _lifeEvents = require('./life-events');
+
+/**
+ * GET /api/life-events
+ * Returns a ranked list of recently-detected network life events — announcements
+ * picked out of message bodies, upcoming birthdays, detected job changes.
+ */
+function handleGetLifeEvents(req, res, _params, paths) {
+    const url = new URL(req.url, `http://localhost:${PORT}`);
+    const limit = Math.max(1, Math.min(50, Number(url.searchParams.get('limit')) || 12));
+    try {
+        const contacts = loadContacts(paths);
+        const interactions = fs.existsSync(paths.interactions)
+            ? JSON.parse(fs.readFileSync(paths.interactions, 'utf8'))
+            : [];
+
+        // Build interactionsByContactId using the existing searchIndex
+        const { contactMap, contactById } = buildSearchIndex(paths, /*uuid*/ SINGLE_USER_UUID);
+        const byContact = {};
+        for (const i of interactions) {
+            let cid = null;
+            if (i.chatId) cid = contactMap[i.chatId];
+            if (!cid && typeof i.from === 'string') cid = contactMap[i.from];
+            if (!cid && i.source === 'linkedin' && i.chatName) {
+                for (const name of i.chatName.split(',').map(n => n.trim())) {
+                    if (contactMap[name]) { cid = contactMap[name]; break; }
+                }
+            }
+            if (!cid) continue;
+            if (!byContact[cid]) byContact[cid] = [];
+            byContact[cid].push(i);
+        }
+
+        const events = _lifeEvents.detectAllEvents({ contacts, interactionsByContactId: byContact });
+        // Attach company/position for the UI
+        for (const e of events) {
+            const c = contactById[e.contactId];
+            if (c) {
+                e.company = c.sources?.linkedin?.company || c.sources?.googleContacts?.org || null;
+                e.position = c.sources?.linkedin?.position || c.sources?.googleContacts?.title || null;
+            }
+        }
+        json(res, { count: events.length, events: events.slice(0, limit) });
+    } catch (e) {
+        json(res, { error: e.message }, 500);
+    }
+}
 
 /**
  * GET /api/export[?passphrase=<p>]
@@ -2309,7 +2356,7 @@ async function handleSaveGoals(req, res, params, paths) {
 }
 
 // GET /api/today — goal-relevant contacts, network pulse, upcoming meetings
-function handleGetToday(req, res, params, paths) {
+function handleGetToday(req, res, params, paths, uuid) {
     const goals = loadGoals(paths);
     const contacts = loadContacts(paths);
     const insights = loadInsights(paths);
@@ -2387,12 +2434,50 @@ function handleGetToday(req, res, params, paths) {
         syncWarnings = health.warnings;
     } catch { /* graceful degradation */ }
 
+    // Life events (top 6) — surfaced on the Today view's "Recent in your
+    // network" section. Cheap to compute; done inline here to keep the
+    // Today view a single-request render.
+    let lifeEvents = [];
+    try {
+        const ixns = fs.existsSync(paths.interactions)
+            ? JSON.parse(fs.readFileSync(paths.interactions, 'utf8')) : [];
+        const { contactMap } = buildSearchIndex(paths, uuid);
+        const byContact = {};
+        for (const i of ixns) {
+            let cid = null;
+            if (i.chatId) cid = contactMap[i.chatId];
+            if (!cid && typeof i.from === 'string') cid = contactMap[i.from];
+            if (!cid && i.source === 'linkedin' && i.chatName) {
+                for (const name of i.chatName.split(',').map(n => n.trim())) {
+                    if (contactMap[name]) { cid = contactMap[name]; break; }
+                }
+            }
+            if (!cid) continue;
+            if (!byContact[cid]) byContact[cid] = [];
+            byContact[cid].push(i);
+        }
+        const contacts = loadContacts(paths);
+        const contactById = Object.fromEntries(contacts.map(c => [c.id, c]));
+        const all = _lifeEvents.detectAllEvents({ contacts, interactionsByContactId: byContact });
+        for (const e of all) {
+            const c = contactById[e.contactId];
+            if (c) {
+                e.company = c.sources?.linkedin?.company || c.sources?.googleContacts?.org || null;
+                e.position = c.sources?.linkedin?.position || c.sources?.googleContacts?.title || null;
+            }
+        }
+        lifeEvents = all.slice(0, 6);
+    } catch (e) {
+        console.error('[today/life-events]', e.message);
+    }
+
     json(res, {
         goals:            activeGoals,
         goalSections,
         pulse,
         upcomingMeetings,
         syncWarnings,
+        lifeEvents,
         generatedAt:      new Date().toISOString(),
     });
 }
@@ -2650,6 +2735,7 @@ const ROUTES = [
     ['GET',  /^\/api\/sync\/progress$/,                   handleSyncProgress],
     ['GET',  /^\/api\/palette$/,                          handlePaletteSearch],
     ['GET',  /^\/api\/export$/,                           handleExport],
+    ['GET',  /^\/api\/life-events$/,                      handleGetLifeEvents],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -3401,6 +3487,12 @@ nav {
 .pulse-item:hover { border-color: rgba(99,102,241,0.4); }
 .pulse-item-name { font-size: 0.88rem; font-weight: 500; color: var(--text-primary); flex: 1; min-width: 0; }
 .pulse-item-meta { font-size: 0.73rem; color: var(--text-muted); }
+.life-event-badge {
+  position: absolute; right: -4px; bottom: -4px;
+  background: var(--bg-card); border: 1px solid var(--border); border-radius: 50%;
+  width: 18px; height: 18px; display: flex; align-items: center; justify-content: center;
+  font-size: 10px;
+}
 
 /* (health-strip tiles removed — replaced by health-bar-wrap in HTML and CSS above) */
 
@@ -4985,6 +5077,30 @@ function renderToday(el) {
     }
   }
 
+  // ---- Recent changes in your network (life events) ----
+  if (Array.isArray(todayData?.lifeEvents) && todayData.lifeEvents.length > 0 && !activeGoalId) {
+    html += '<div class="today-section"><div class="today-section-header">Recent in your network</div>';
+    todayData.lifeEvents.slice(0, 6).forEach(e => {
+      const icon = eventIcon(e.kind);
+      const col = avatarColor(e.contactId);
+      const initials = esc(getInitials(e.contactName || '?'));
+      html += \`<div class="pulse-item" onclick="openContact('\${esc(e.contactId)}')">
+        <div style="position:relative;width:36px;height:36px;flex-shrink:0">
+          <div style="width:36px;height:36px;border-radius:50%;display:flex;align-items:center;
+                      justify-content:center;font-size:0.72rem;font-weight:600;background:\${col.bg};color:\${col.fg}">
+            \${initials}
+          </div>
+          <span class="life-event-badge" title="\${esc(e.label || e.kind)}">\${icon}</span>
+        </div>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column;gap:2px">
+          <span class="pulse-item-name">\${esc(e.contactName || '?')}</span>
+          <span class="pulse-item-meta" style="font-size:0.74rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">\${esc(e.label || '')}\${e.snippet ? ' · ' + esc(e.snippet) : ''}</span>
+        </div>
+      </div>\`;
+    });
+    html += '</div>';
+  }
+
   // ---- Network pulse (strong contacts) ----
   if (pulse.length > 0 && !activeGoalId) {
     html += '<div class="today-section"><div class="today-section-header">Strong connections</div>';
@@ -5012,6 +5128,14 @@ function renderToday(el) {
   }
 
   el.innerHTML = html;
+}
+
+function eventIcon(kind) {
+  const map = {
+    job_change: '💼', funding: '💰', milestone: '🚀',
+    life_moment: '✨', birthday: '🎂', reconnection: '👋',
+  };
+  return map[kind] || '•';
 }
 
 // Small SVG health ring — radius adapts to size

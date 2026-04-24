@@ -417,9 +417,30 @@ const FILLER = [
     'let me think on it', 'ping me if anything changes',
 ];
 
+// Occasional announcement-style messages so life-event detection has something
+// meaningful to pick up during offline smoke-tests.
+const ANNOUNCEMENTS = {
+    investor:   ['I just closed my Series A at Index', 'Excited to announce I\'m joining a16z as a Partner'],
+    founder:    ['We raised a $4M seed round led by Accel!', 'I\'m excited to announce I\'m joining Linear as co-founder', 'We just launched on Product Hunt today'],
+    engineer:   ['Excited to announce I\'m joining Stripe next month', 'Just started at Anthropic as a research engineer'],
+    operator:   ['Got promoted to VP of Product', 'Excited to announce I\'m moving to Airbnb'],
+    creative:   ['Just launched — live on Product Hunt', 'Starting at Figma as Design Lead'],
+    finance:    ['Starting a new role at Goldman Sachs', 'Got promoted to Vice President'],
+    consultant: ['Just made Principal at BCG', 'Excited to announce I\'m joining McKinsey'],
+    sales:      ['Closed our biggest deal yet — $2M ARR', 'Got promoted to Head of Sales'],
+    academic:   ['Paper got accepted to NeurIPS', 'Starting a postdoc at MIT'],
+    legal:      ['Made partner at the firm', 'Excited to announce I\'m joining a new firm'],
+    hr:         ['Got promoted to Head of People', 'Starting at Stripe as Head of Talent'],
+};
+
 function pickMessage(cat) {
     const topic = pick(TOPICS[cat] || TOPICS.operator);
     const filler = pick(FILLER);
+    // ~5% of messages are announcements so life-event detection has seed signal
+    if (rand() < 0.05) {
+        const bag = ANNOUNCEMENTS[cat] || ANNOUNCEMENTS.operator;
+        return pick(bag);
+    }
     if (rand() < 0.25) return filler + '.';
     if (rand() < 0.5) return `${filler} about ${topic}.`;
     if (rand() < 0.75) return `Quick note on ${topic} — ${filler}.`;
