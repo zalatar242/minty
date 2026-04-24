@@ -6324,11 +6324,16 @@ function esc(s) {
 // HTML-decodes the attribute before the JS parser sees it, so we JS-escape
 // first, then HTML-escape. esc() alone is NOT safe in this position.
 function jsAttr(s) {
+  // NOTE: this whole <script> is inside the server-side \`const HTML = \\\`...\\\`\`
+  // template literal. Every \\ in THIS source is halved by Node before the
+  // browser sees it. So to produce a browser-visible regex \\\\ (matching one
+  // backslash) we need \\\\\\\\ in source; to produce a browser-visible string
+  // \\\\\\\\ (two backslashes) we need \\\\\\\\\\\\\\\\ in source. Same for \\r / \\n.
   const jsEscaped = String(s||'')
-    .replace(/\\/g, '\\\\')
-    .replace(/'/g, "\\'")
-    .replace(/\r/g, '\\r')
-    .replace(/\n/g, '\\n');
+    .replace(/\\\\/g, '\\\\\\\\')
+    .replace(/'/g, "\\\\'")
+    .replace(/\\r/g, '\\\\r')
+    .replace(/\\n/g, '\\\\n');
   return jsEscaped
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
