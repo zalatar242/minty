@@ -32,14 +32,15 @@ const LOCK_PATH = path.join(LINKEDIN_DIR, '.scrape.lock');
 const STATE_PATH = path.join(ROOT, 'data', 'sync-state.json');
 
 const THROTTLE_MS = Number(process.env.LINKEDIN_THROTTLE_MS) || 2000;
-// Message-thread cap. Default 200 (raised from the TTHW-optimized 50). Set to 0
-// for "unlimited — scrape until the inbox runs out". Big accounts with hundreds
-// of threads should run once with LINKEDIN_SYNC_MESSAGE_CAP=0 for the historical
-// backfill, then go back to the default for incremental syncs.
+// Message-thread cap. Default: unlimited (scrape every thread). Set a positive
+// integer via LINKEDIN_SYNC_MESSAGE_CAP to limit for speed. Unlimited on an
+// account with N threads takes roughly N × (THROTTLE_MS × 6 + 1s) seconds —
+// a 870-thread inbox at default throttle is ~3 hours. The scrape prints an
+// estimate before starting.
 const _msgCapRaw = process.env.LINKEDIN_SYNC_MESSAGE_CAP;
-const MESSAGE_CAP = (_msgCapRaw === '0' || _msgCapRaw === 'all')
+const MESSAGE_CAP = (!_msgCapRaw || _msgCapRaw === '0' || _msgCapRaw === 'all')
     ? Infinity
-    : (Number(_msgCapRaw) || 200);
+    : Number(_msgCapRaw);
 const MAX_CONNECTIONS = Number(process.env.LINKEDIN_MAX_CONNECTIONS) || 30000;
 const SKIP_DETAILS = process.env.LINKEDIN_SKIP_DETAILS === '1';
 // Scrape pending invitations (sent + received). Off by default because pending
@@ -242,6 +243,11 @@ async function scrapeMessages(page) {
     }, SELECTORS.MESSAGING_INBOX);
 
     const capped = threads.filter((t) => t.id).slice(0, MESSAGE_CAP);
+    // Time estimate — each thread costs ~1 goto + 5 scrolls + extract ≈ 6 × THROTTLE_MS + ~1s overhead.
+    const estSecondsPerThread = (THROTTLE_MS * 6 / 1000) + 1;
+    const estMinutes = Math.ceil((capped.length * estSecondsPerThread) / 60);
+    const unboundedNote = (MESSAGE_CAP === Infinity) ? '' : ` (capped at ${MESSAGE_CAP})`;
+    console.log(`Scraping ${capped.length} message thread${capped.length === 1 ? '' : 's'}${unboundedNote} — estimated ${estMinutes} min. Ctrl+C to abort.`);
     const allRows = []; // [{ record, context }]
 
     for (let i = 0; i < capped.length; i++) {

@@ -144,7 +144,7 @@ Once `linkedin:connect` has been run, the Sources view in `npm run crm` will gai
 | `LINKEDIN_EXPORT_DIR` | `./data/linkedin/export` | Where ZIP import looks for CSVs |
 | `LINKEDIN_PROFILE_DIR` | `./data/linkedin/browser-profile` | Playwright persistent context path. Useful for multi-account dev testing |
 | `LINKEDIN_THROTTLE_MS` | `2000` | Delay between page navigations |
-| `LINKEDIN_SYNC_MESSAGE_CAP` | `200` | Max threads scraped per sync. Set to `0` or `all` for unlimited (scrape every thread). For a big historical backfill, run once with `=0`, then leave it at the default for incremental syncs. |
+| `LINKEDIN_SYNC_MESSAGE_CAP` | unlimited | Max threads scraped per sync. Default is unlimited — every thread in your inbox. Set a positive integer (e.g. `50`) to cap for speed. Expect roughly 15 seconds per thread at the default throttle, so 500 threads ≈ 2 hours. The scrape prints a time estimate before starting; Ctrl+C aborts cleanly (prior data preserved). |
 | `LINKEDIN_SCRAPE_INVITATIONS` | unset | If `1`, also scrapes pending invitations (sent + received) into `data/linkedin/pending-invitations.json`. **Pending only** — LinkedIn's DOM has no history page, so accepted/declined invites are ZIP-only. Writes a SEPARATE file from the ZIP's Invitations.csv so historical data isn't clobbered. |
 | `LINKEDIN_SKIP_DETAILS` | `0` | If `1`, skip per-card detail backfill (faster TTHW, degraded matching) |
 | `LINKEDIN_MESSAGE_WINDOW_HOURS` | `24` | On incremental syncs, scrape threads with activity within this many hours of `lastSync` |
