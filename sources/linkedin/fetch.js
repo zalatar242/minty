@@ -32,9 +32,21 @@ const LOCK_PATH = path.join(LINKEDIN_DIR, '.scrape.lock');
 const STATE_PATH = path.join(ROOT, 'data', 'sync-state.json');
 
 const THROTTLE_MS = Number(process.env.LINKEDIN_THROTTLE_MS) || 2000;
-const MESSAGE_CAP = Number(process.env.LINKEDIN_SYNC_MESSAGE_CAP) || 50;
+// Message-thread cap. Default 200 (raised from the TTHW-optimized 50). Set to 0
+// for "unlimited — scrape until the inbox runs out". Big accounts with hundreds
+// of threads should run once with LINKEDIN_SYNC_MESSAGE_CAP=0 for the historical
+// backfill, then go back to the default for incremental syncs.
+const _msgCapRaw = process.env.LINKEDIN_SYNC_MESSAGE_CAP;
+const MESSAGE_CAP = (_msgCapRaw === '0' || _msgCapRaw === 'all')
+    ? Infinity
+    : (Number(_msgCapRaw) || 200);
 const MAX_CONNECTIONS = Number(process.env.LINKEDIN_MAX_CONNECTIONS) || 30000;
 const SKIP_DETAILS = process.env.LINKEDIN_SKIP_DETAILS === '1';
+// Scrape pending invitations (sent + received). Off by default because pending
+// invitations change often and rewriting Invitations.csv on every sync would
+// clobber ZIP-imported historical invitations. Turn on explicitly to track
+// pending. See README for the historical-vs-pending tradeoff.
+const SCRAPE_INVITATIONS = process.env.LINKEDIN_SCRAPE_INVITATIONS === '1';
 
 // --- sync-state.json -------------------------------------------------------
 
@@ -319,6 +331,53 @@ async function scrapeMessages(page) {
     return allRows;
 }
 
+// --- Scrape: pending invitations (opt-in) ----------------------------------
+// LinkedIn's DOM only exposes PENDING invitations — there's no history page.
+// Historical invitations (who you invited in 2019 who accepted) exist ONLY in
+// the ZIP export. We write pending invites to a DIFFERENT file than the ZIP's
+// Invitations.csv so we don't clobber historical data.
+
+async function scrapeInvitationsPage(page, url, direction) {
+    await page.goto(url, { waitUntil: 'domcontentloaded' });
+    assertOk(page);
+    await page.waitForTimeout(THROTTLE_MS);
+    // Scroll to load all pending invitations.
+    for (let i = 0; i < 5; i++) {
+        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await page.waitForTimeout(THROTTLE_MS);
+    }
+    return page.evaluate(({ cardSelectors, direction }) => {
+        let cards = [];
+        for (const s of cardSelectors) {
+            const found = Array.from(document.querySelectorAll(s));
+            if (found.length) { cards = found; break; }
+        }
+        return cards.map((card) => {
+            const nameEl = card.querySelector('a[href*="/in/"] span[aria-hidden="true"], a[href*="/in/"] span, .artdeco-entity-lockup__title');
+            const name = (nameEl?.textContent || '').trim();
+            const anchor = card.querySelector('a[href*="/in/"]');
+            const href = anchor?.getAttribute('href') || '';
+            const profileUrl = href.startsWith('/') ? 'https://www.linkedin.com' + href.split('?')[0] : (href.split('?')[0] || '');
+            const headlineEl = card.querySelector('.artdeco-entity-lockup__subtitle, [class*="subtitle"]');
+            const headline = (headlineEl?.textContent || '').trim();
+            const messageEl = card.querySelector('.invitation-card__custom-message, [class*="custom-message"], blockquote');
+            const message = (messageEl?.textContent || '').trim();
+            const relTimeEl = card.querySelector('time, .time-badge, [class*="time"]');
+            const relativeTime = (relTimeEl?.textContent || '').trim();
+            return { name, profileUrl, headline, message, relativeTime, direction };
+        }).filter((r) => r.profileUrl);
+    }, { cardSelectors: ['li.invitation-card', 'li[data-test-invitation-card]', 'div[data-view-name="invitation-card"]', 'li[componentkey*="Invitation"]'], direction });
+}
+
+async function scrapeInvitations(page) {
+    setProgress('invitations', 0, 2);
+    const received = await scrapeInvitationsPage(page, 'https://www.linkedin.com/mynetwork/invitation-manager/', 'INCOMING').catch(() => []);
+    setProgress('invitations', 1, 2);
+    const sent = await scrapeInvitationsPage(page, 'https://www.linkedin.com/mynetwork/invitation-manager/sent/', 'OUTGOING').catch(() => []);
+    setProgress('invitations', 2, 2);
+    return [...received, ...sent];
+}
+
 // --- Main ------------------------------------------------------------------
 
 async function run() {
@@ -389,6 +448,25 @@ async function run() {
         writeCsvAtomic(STAGING_DIR, 'messages.csv',
             toCsvFile(MESSAGES_HEADER, messageRowsToCsvMatrix(records, (r) => contexts.get(r) || {})));
 
+        // 5b. Pending invitations (opt-in). Writes a SEPARATE file — never
+        // touches Invitations.csv from the ZIP. Pending-only by nature of the DOM.
+        let pendingInvites = [];
+        if (SCRAPE_INVITATIONS) {
+            pendingInvites = await scrapeInvitations(page);
+            const pendingPath = path.join(LINKEDIN_DIR, 'pending-invitations.json');
+            const tmp = pendingPath + '.tmp';
+            const fd = fs.openSync(tmp, 'w');
+            try {
+                fs.writeSync(fd, JSON.stringify({
+                    scrapedAt: new Date().toISOString(),
+                    note: 'Pending invitations only. Historical invitations (accepted/declined) are ZIP-only.',
+                    invitations: pendingInvites,
+                }, null, 2));
+                fs.fsyncSync(fd);
+            } finally { fs.closeSync(fd); }
+            fs.renameSync(tmp, pendingPath);
+        }
+
         await context.close();
         context = null;
 
@@ -407,7 +485,8 @@ async function run() {
             lastError: null,
         });
         const uniqThreads = new Set(msgRows.map((m) => m.context.conversationId)).size;
-        console.log(`Done. ${detailed.length} contacts, ${uniqThreads} threads synced.`);
+        const pendingMsg = SCRAPE_INVITATIONS ? `, ${pendingInvites.length} pending invites` : '';
+        console.log(`Done. ${detailed.length} contacts, ${uniqThreads} threads synced${pendingMsg}.`);
     } catch (err) {
         if (context) { try { await context.close(); } catch (_) {} }
         if (err && err.code === 'SESSION') {
