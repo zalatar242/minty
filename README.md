@@ -112,24 +112,45 @@ Writes `data/unified/contacts.json` and `data/unified/interactions.json`.
 
 The ZIP flow has a real downside: LinkedIn takes up to 24 hours to produce the export, so the "unified network" moment is a day late. Auto-sync will close that gap by driving a real headful browser session on your own machine. It is opt-in at every layer — Playwright isn't installed by default, the endpoints are gated behind a feature flag, and the first run requires a typed ToS acknowledgement.
 
-### Setup (available now)
+### Setup
 
 ```bash
 # Install Playwright (adds ~300MB). Opt-in; the core Minty install skips this.
 npm run linkedin:setup
 ```
 
-### Planned flow (follow-up PR)
+### Manual-login flow (default)
 
 ```bash
 # Open the real LinkedIn login in a headful Chromium window. Log in, solve 2FA, close the window.
-npm run linkedin:connect
+MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:connect
 
 # Scrape your connections + messages into Minty's unified store.
-npm run linkedin:sync
+MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:sync
 ```
 
-Once `linkedin:connect` has been run, the Sources view in `npm run crm` will gain a "Sync now" button that does the same thing as `npm run linkedin:sync`.
+Once you've connected, the Sources view in `npm run crm` gains a "Sync now" button that does the same thing as `npm run linkedin:sync`.
+
+### Auto-login flow (store credentials locally)
+
+If you'd rather not type your password every time the session expires, Minty can log in for you using stored credentials. **This is a higher-trust trade-off:** email + password + (optionally) your authenticator-app TOTP secret live plaintext at `data/linkedin/credentials.json` with `0o600` permissions. Disk encryption at the OS level (FileVault / LUKS / BitLocker) is load-bearing — without it, same-user malware can read the file. If that's not your setup, use the manual flow above instead.
+
+```bash
+# One-time interactive setup — prompts for email, password, optional TOTP secret.
+MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:save-creds
+
+# Subsequent connects auto-login using the stored creds (no prompt).
+MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:connect
+
+# Wipe stored creds if you change your mind:
+npm run linkedin:forget-creds
+```
+
+**TOTP secret** (optional but recommended if your LinkedIn account has 2FA): LinkedIn supports "Authenticator app" 2FA under **Settings → Sign in & security → Two-step verification → Authenticator app**. When you enable it, LinkedIn shows a base32 string alongside the QR code — save that string before scanning. That's what goes in the TOTP prompt. Without it, auto-login will still handle the email+password step but will fall back to manual when LinkedIn challenges (the browser window stays open for you to complete 2FA by hand).
+
+If auto-login fails for any reason (wrong password, unexpected challenge, CAPTCHA, rate limit), the Chromium window stays open and the flow falls back to manual. You'll see a reason in stderr.
+
+To force the manual flow even with stored creds: `LINKEDIN_MANUAL=1 npm run linkedin:connect`.
 
 ### Known limitations
 
@@ -149,6 +170,9 @@ Once `linkedin:connect` has been run, the Sources view in `npm run crm` will gai
 | `LINKEDIN_SKIP_DETAILS` | `0` | If `1`, skip per-card detail backfill (faster TTHW, degraded matching) |
 | `LINKEDIN_MESSAGE_WINDOW_HOURS` | `24` | On incremental syncs, scrape threads with activity within this many hours of `lastSync` |
 | `LINKEDIN_ACCEPT_TOS` | unset | If `1`, bypass typed "I accept" prompt (first run still persists sentinel) |
+| `LINKEDIN_SAVE_CREDS` | unset | If `1`, prompt for email/password/TOTP and save to `data/linkedin/credentials.json`. Equivalent to `npm run linkedin:save-creds`. |
+| `LINKEDIN_FORGET_CREDS` | unset | If `1`, delete stored credentials and continue. Equivalent to `npm run linkedin:forget-creds`. |
+| `LINKEDIN_MANUAL` | unset | If `1`, ignore stored credentials and use the manual-login flow. |
 | `LINKEDIN_LIVE_TEST` | unset | If `1`, run live-test suite against real account |
 | `MINTY_LINKEDIN_AUTOSYNC` | unset | Feature flag — if unset, all auto-sync endpoints 404 and SPA falls back to ZIP-only |
 
