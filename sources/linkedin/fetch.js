@@ -29,7 +29,6 @@ const LINKEDIN_DIR = path.join(ROOT, 'data', 'linkedin');
 const PROFILE_DIR = process.env.LINKEDIN_PROFILE_DIR || path.join(LINKEDIN_DIR, 'browser-profile');
 const STAGING_DIR = path.join(LINKEDIN_DIR, '.scraped-staging');
 const LOCK_PATH = path.join(LINKEDIN_DIR, '.scrape.lock');
-const STATE_PATH = path.join(ROOT, 'data', 'sync-state.json');
 
 const THROTTLE_MS = Number(process.env.LINKEDIN_THROTTLE_MS) || 2000;
 // Message-thread cap. Default: unlimited (scrape every thread). Set a positive
@@ -50,21 +49,19 @@ const SKIP_DETAILS = process.env.LINKEDIN_SKIP_DETAILS === '1';
 const SCRAPE_INVITATIONS = process.env.LINKEDIN_SCRAPE_INVITATIONS === '1';
 
 // --- sync-state.json -------------------------------------------------------
+// Delegated to sources/linkedin/sync-state.js which handles atomic writes
+// (openSync + fsyncSync + rename). We hold the lock during the entire scrape,
+// so racing writers aren't the concern — atomic write protects against
+// power-loss / process-kill leaving a truncated sync-state.json on disk.
 
-function readState() {
-    try { return JSON.parse(fs.readFileSync(STATE_PATH, 'utf8')); } catch (_) { return {}; }
-}
+const syncState = require('./sync-state');
+const DATA_DIR = path.join(ROOT, 'data');
+
 function writeStatePatch(patch) {
-    const cur = readState();
-    const next = Object.assign({}, cur);
-    next.linkedin = Object.assign({}, cur.linkedin || {}, patch);
-    try {
-        fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-        fs.writeFileSync(STATE_PATH, JSON.stringify(next, null, 2));
-    } catch (_) { /* best-effort */ }
+    try { syncState.writeLinkedIn(DATA_DIR, patch); } catch (_) { /* best-effort */ }
 }
 function setProgress(phase, current, total) {
-    writeStatePatch({ progress: { phase, current, total } });
+    try { syncState.setProgress(DATA_DIR, phase, current, total); } catch (_) { /* best-effort */ }
 }
 
 // --- Atomic CSV write (Eng H7 — ENOSPC-safe) -------------------------------
@@ -478,7 +475,9 @@ async function run() {
 
         // 6. Invoke import.js with staging dir.
         setProgress('parsing', 0, 1);
-        const res = spawnSync('node', [path.join(__dirname, 'import.js')], {
+        // Use process.execPath so nvm / multi-node-version setups invoke the
+        // same node binary as the parent, not whatever `node` happens to be in PATH.
+        const res = spawnSync(process.execPath, [path.join(__dirname, 'import.js')], {
             env: Object.assign({}, process.env, { LINKEDIN_EXPORT_DIR: STAGING_DIR }),
             stdio: 'inherit',
         });

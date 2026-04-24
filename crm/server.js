@@ -1077,7 +1077,13 @@ function handleGetSources(req, res, params, paths, uuid) {
     result._googleOAuthEnabled = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
     result._microsoftOAuthEnabled = !!(process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_CLIENT_SECRET);
     result._linkedinAutoSyncEnabled = LINKEDIN_AUTOSYNC_ENABLED;
-    result._linkedin = LINKEDIN_AUTOSYNC_ENABLED ? readLinkedInState() : { status: 'disconnected' };
+    // Include playwrightAvailable so the SPA can show "install needed" hints
+    // without polling /api/linkedin/status separately. Fixes the pwMissing
+    // logic in renderSourceForm that was always falsy because this field was
+    // only populated by /api/linkedin/status, not by /api/sources.
+    result._linkedin = LINKEDIN_AUTOSYNC_ENABLED
+        ? { ...readLinkedInState(), playwrightAvailable: linkedInPlaywrightAvailable() }
+        : { status: 'disconnected', playwrightAvailable: false };
     json(res, result);
 }
 
