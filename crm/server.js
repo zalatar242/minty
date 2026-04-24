@@ -896,15 +896,36 @@ function handleGetGroups(req, res, params, paths, uuid) {
     json(res, { count: groups.length, groups });
 }
 
+function loadWhatsAppChatsRaw() {
+    try {
+        return JSON.parse(fs.readFileSync(path.join(DATA, 'whatsapp/chats.json'), 'utf8')) || {};
+    } catch { return {}; }
+}
+
 function handleGetGroupDetail(req, res, [chatId], paths, uuid) {
     const idx = getInteractionIndex(paths, uuid);
-    const msgs = idx.byChatId[chatId];
-    if (!msgs) return json(res, { error: 'not found' }, 404);
+    const msgs = idx.byChatId[chatId] || [];
+    const rawChats = loadWhatsAppChatsRaw();
+
+    // Find the raw chat entry (keyed by name in chats.json) whose meta.id matches.
+    let rawChatEntry = null;
+    for (const entry of Object.values(rawChats)) {
+        if (entry?.meta?.id === chatId) { rawChatEntry = entry; break; }
+    }
+
+    const memberships = loadGroupMemberships();
+    const membership = memberships[chatId] || null;
+
+    // If there are no messages AND no roster record, treat as not found.
+    if (msgs.length === 0 && !membership && !rawChatEntry) {
+        return json(res, { error: 'not found' }, 404);
+    }
 
     const sorted = [...msgs].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    const name = sorted[0]?.chatName || chatId;
+    const name = sorted[0]?.chatName || rawChatEntry?.meta?.name || membership?.name || chatId;
     const category = inferGroupCategory(name);
     const signals = extractGroupSignals(sorted);
+    const pinnedMessages = rawChatEntry?.meta?.pinnedMessages || [];
 
     json(res, {
         chatId,
@@ -917,6 +938,11 @@ function handleGetGroupDetail(req, res, [chatId], paths, uuid) {
             from: m.from,
             body: m.body || '',
         })),
+        pinnedMessages,
+        rosterCount: membership?.size || 0,
+        owner: membership?.owner || rawChatEntry?.meta?.owner || null,
+        createdAt: membership?.createdAt || rawChatEntry?.meta?.createdAt || null,
+        description: membership?.description || rawChatEntry?.meta?.description || null,
         signals,
     });
 }
@@ -1657,6 +1683,31 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     json(res, { status: 'starting' });
 }
 
+function handleWhatsappProfilePic(req, res, [encodedId], paths, uuid) {
+    // Serve cached profile pic from data/whatsapp/profile_pics/. Pre-sanitized filenames
+    // match the runWhatsAppExport writer: `${id.replace(/[^a-z0-9@._-]/gi, '_')}.jpg`.
+    try {
+        const safe = decodeURIComponent(encodedId).replace(/[^a-z0-9@._-]/gi, '_');
+        const dataDir = getUserDataDir(uuid);
+        const picPath = path.join(dataDir, 'whatsapp', 'profile_pics', `${safe}.jpg`);
+        // Guard path traversal — ensure resolved path stays inside picsDir.
+        const picsDir = path.join(dataDir, 'whatsapp', 'profile_pics');
+        if (!picPath.startsWith(picsDir + path.sep)) {
+            return json(res, { error: 'forbidden' }, 403);
+        }
+        if (!fs.existsSync(picPath)) {
+            return json(res, { error: 'not found' }, 404);
+        }
+        res.writeHead(200, {
+            'Content-Type': 'image/jpeg',
+            'Cache-Control': 'private, max-age=86400',
+        });
+        fs.createReadStream(picPath).pipe(res);
+    } catch (e) {
+        json(res, { error: e.message }, 500);
+    }
+}
+
 function readExportProgress(uuid) {
     try {
         const dataDir = getUserDataDir(uuid);
@@ -1706,6 +1757,83 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
             isBusiness: c.isBusiness,
             about: c.about || null,
         };
+    }
+    fs.writeFileSync(path.join(waDir, 'contacts.json'), JSON.stringify(contactMap, null, 2));
+
+    // -------------------------------------------------------------------
+    // Enrichment pass: about text + profile pics for saved contacts.
+    // Runs in parallel batches; tolerates individual failures.
+    // -------------------------------------------------------------------
+    const savedContacts = contacts.filter(c => c.isMyContact);
+    const picDir = path.join(waDir, 'profile_pics');
+    try { fs.mkdirSync(picDir, { recursive: true }); } catch {}
+
+    writeProgress({
+        step: 'enrich',
+        current: 0,
+        total: savedContacts.length,
+        message: `Fetching about + profile pics for ${savedContacts.length} saved contacts...`,
+    });
+
+    const BATCH = 20;
+    for (let i = 0; i < savedContacts.length; i += BATCH) {
+        const slice = savedContacts.slice(i, i + BATCH);
+        const ids = slice.map(c => c.id._serialized);
+
+        // About text — one call per contact (library wraps Store.StatusUtils.getStatus).
+        const aboutResults = await Promise.all(
+            slice.map(c => c.getAbout().catch(() => null))
+        );
+
+        // Profile pic URLs — one page-evaluate batched call.
+        let picUrlMap = {};
+        try {
+            picUrlMap = await client.pupPage.evaluate(async (batchIds) => {
+                const out = {};
+                await Promise.all(batchIds.map(async (wid) => {
+                    try {
+                        const chatWid = window.Store.WidFactory.createWid(wid);
+                        const result = await window.Store.ProfilePicThumb.findImpl(chatWid, true);
+                        out[wid] = (result && result.attributes && result.attributes.eurl) || null;
+                    } catch { out[wid] = null; }
+                }));
+                return out;
+            }, ids);
+        } catch (e) {
+            console.error('[whatsapp] profile-pic batch failed:', e.message);
+        }
+
+        // Download pics that exist; store local path on contactMap
+        await Promise.all(slice.map(async (c, j) => {
+            const id = ids[j];
+            const about = aboutResults[j];
+            if (about) contactMap[id].about = about;
+
+            const picUrl = picUrlMap[id];
+            if (picUrl) {
+                const safe = id.replace(/[^a-z0-9@._-]/gi, '_');
+                const picFile = path.join(picDir, `${safe}.jpg`);
+                try {
+                    await new Promise((resolve) => {
+                        const proto = picUrl.startsWith('https') ? require('https') : require('http');
+                        const file = fs.createWriteStream(picFile);
+                        proto.get(picUrl, res => {
+                            res.pipe(file);
+                            file.on('finish', () => { file.close(); resolve(); });
+                            file.on('error', () => resolve());
+                        }).on('error', () => resolve());
+                    });
+                    contactMap[id].profilePic = path.relative(waDir, picFile);
+                } catch { /* pic fetch failed, skip silently */ }
+            }
+        }));
+
+        writeProgress({
+            step: 'enrich',
+            current: Math.min(i + BATCH, savedContacts.length),
+            total: savedContacts.length,
+            message: `Enriched ${Math.min(i + BATCH, savedContacts.length)}/${savedContacts.length}`,
+        });
     }
     fs.writeFileSync(path.join(waDir, 'contacts.json'), JSON.stringify(contactMap, null, 2));
 
@@ -1778,6 +1906,20 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
                 meta.labels = labels.map(l => ({ id: l.id, name: l.name, hexColor: l.hexColor }));
             }
         } catch { /* personal account — ignore */ }
+
+        // Pinned messages — user-curated "important" signal. Works on any chat.
+        try {
+            const pinned = await client.getPinnedMessages(chat.id._serialized);
+            if (pinned && pinned.length > 0) {
+                meta.pinnedMessages = pinned.map(m => ({
+                    id: m.id?._serialized || null,
+                    timestamp: m.timestamp ? new Date(m.timestamp * 1000).toISOString() : null,
+                    from: m.from || null,
+                    body: m.body || '',
+                    type: m.type || 'chat',
+                }));
+            }
+        } catch { /* not all chats support pinned / upstream may fail */ }
 
         // Attempt message fetch; tolerate failure (known wweb.js waitForChatLoading issue).
         let newMessages = [];
@@ -2113,6 +2255,7 @@ const ROUTES = [
     ['POST', /^\/api\/sources\/whatsapp\/start$/,         handleWhatsappStart],
     ['GET',  /^\/api\/sources\/whatsapp\/status$/,        handleWhatsappStatus],
     ['GET',  /^\/api\/sources\/whatsapp\/progress$/,      handleWhatsappProgress],
+    ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
     ['GET',  /^\/api\/contacts\/([^/]+)\/insights$/,     handleGetInsights],
@@ -4577,6 +4720,14 @@ function renderContactDetail(c) {
   const initials = getInitials(c.name);
   const color = avatarColor(c.id);
 
+  // WhatsApp-sourced enrichment: about text + cached profile pic.
+  const waSrc = c.sources?.whatsapp || {};
+  const waAbout = waSrc.about || null;
+  const waPicId = waSrc.id || null;
+  const waPicUrl = waPicId && waSrc.profilePic
+    ? \`\${BASE}/api/wa-pic/\${encodeURIComponent(waPicId)}\`
+    : null;
+
   // Parse score override from notes
   const overrideMatch = (c.notes || '').match(/score_override:(\d+)/);
   const overrideScore = overrideMatch ? parseInt(overrideMatch[1]) : null;
@@ -4655,12 +4806,16 @@ function renderContactDetail(c) {
     <div class="contact-hero">
       <button class="back-btn" onclick="showView('contacts')">\u2190</button>
       <div class="hero-avatar-wrap">
-        <div class="hero-avatar" style="background:\${color.bg};color:\${color.fg}">\${esc(initials)}</div>
+        \${waPicUrl
+          ? \`<img class="hero-avatar" src="\${esc(waPicUrl)}" alt="\${esc(c.name || '')}" onerror="this.style.display='none';this.nextElementSibling.style.display='flex'" />
+             <div class="hero-avatar" style="display:none;background:\${color.bg};color:\${color.fg}">\${esc(initials)}</div>\`
+          : \`<div class="hero-avatar" style="background:\${color.bg};color:\${color.fg}">\${esc(initials)}</div>\`}
         \${ringHtml}
       </div>
       <div class="hero-info">
         <div class="hero-name">\${esc(c.name || '(no name)')}</div>
         \${roleStr ? \`<div class="hero-role">\${esc(roleStr)}</div>\` : ''}
+        \${waAbout ? \`<div class="hero-role" style="font-style:italic;opacity:0.8">"\${esc(waAbout)}"</div>\` : ''}
         <div class="hero-known" id="hero-known"></div>
       </div>
       <div class="hero-score-col">
@@ -5205,13 +5360,40 @@ async function loadGroupDetail(chatId) {
 
   const noSignals = !sig.urls.length && !sig.hiring.length && !sig.events.length && !sig.intros.length;
 
+  // Pinned messages — user-curated "important" content. Surface at the top of the feed.
+  const pinned = g.pinnedMessages || [];
+  const pinnedHtml = pinned.length ? \`<div class="signal-section" style="background:var(--surface-alt,#1a1f2b);padding:12px;border-radius:6px;margin-bottom:12px">
+    <div class="signal-title">📌 Pinned <span style="color:#374151">\${pinned.length}</span></div>
+    \${pinned.map(m => {
+      const who = m.from && m.from !== 'me' ? m.from.replace(/@.*/, '') : 'You';
+      return \`<div class="signal-item" style="margin-bottom:8px">
+        <div style="font-weight:600;font-size:0.72rem;color:var(--text-muted)">\${esc(who)} · \${fmtDate(m.timestamp)}</div>
+        <div style="color:var(--text-primary);font-size:0.82rem;margin-top:2px">\${esc((m.body || '').slice(0, 280))}</div>
+      </div>\`;
+    }).join('')}
+  </div>\` : '';
+
+  // Group metadata header: creator, age, description
+  const metaHeaderParts = [];
+  if (g.rosterCount) metaHeaderParts.push(\`\${g.rosterCount} members\`);
+  if (g.messageCount) metaHeaderParts.push(\`\${g.messageCount} messages\`);
+  if (lastAt !== '—') metaHeaderParts.push(\`Last active \${lastAt}\`);
+  const metaHeader = metaHeaderParts.join(' · ');
+  const descHtml = g.description
+    ? \`<p style="color:var(--text-muted);font-size:0.82rem;margin-top:4px;font-style:italic">"\${esc(g.description.slice(0, 200))}"</p>\`
+    : '';
+  const createdStr = g.createdAt
+    ? \` · Created \${new Date(g.createdAt).toLocaleDateString('en-GB', { month:'short', year:'numeric' })}\`
+    : '';
+
   detail.innerHTML = \`
     <div class="group-detail-header">
       <h3>\${esc(g.name)} <span class="group-cat \${catCls}" style="vertical-align:middle">\${esc(g.category)}</span></h3>
-      <p>\${g.messageCount} messages · Last active \${lastAt}</p>
+      <p>\${metaHeader}\${createdStr}</p>
+      \${descHtml}
     </div>
     <div class="group-detail-body">
-      <div class="group-feed">\${feedHtml || '<div class="loading">No messages found</div>'}</div>
+      <div class="group-feed">\${pinnedHtml}\${feedHtml || (pinned.length ? '' : '<div class="loading">No messages found</div>')}</div>
       <div class="group-signals">
         <div class="signal-title" style="margin-bottom:12px">Signals</div>
         \${urlSection}\${hiringSection}\${eventSection}\${introSection}
