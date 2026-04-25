@@ -4,6 +4,7 @@ A rolling log of open-source-quality improvements made by an autonomous loop whi
 
 ## Shipped
 
+- **2026-04-25** — Added `RELEASING.md` documenting versioning policy, cadence, step-by-step cut, and hotfix flow. Borrowed structure from Keep a Changelog ecosystem (Vue.js / Tailwind release docs) — exact CLI commands, no hand-waving.
 - **2026-04-25** — Added `.github/CODEOWNERS` (solo maintainer for now) so review routing surfaces in the GitHub UI. Pattern is GitHub's stock CODEOWNERS recommendation.
 - **2026-04-25** — Added a "Supported versions" table to `SECURITY.md` (pre-1.0 latest-only policy). Pattern from Keep a Changelog ecosystem + GitHub's security-policy template.
 - **2026-04-25** — Deepened `CONTRIBUTING.md`: "Where to start" pointer to ARCHITECTURE.md, `good first issue` guidance, dev-setup with `core.hooksPath`, full Testing section listing every script. Pattern borrowed from Node.js core's CONTRIBUTING (concrete commands over prose) + Excalidraw (explicit "where to start" block).

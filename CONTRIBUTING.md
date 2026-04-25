@@ -77,6 +77,10 @@ AI-assisted PRs are welcome, but:
 - **You're responsible for the code** — you read it, tested it, stand behind it
 - Low-effort AI slop (no testing, no context) will be closed without review
 
+## Releases
+
+Releases follow [SemVer](https://semver.org/) and are cut from `main` by the maintainer. The full recipe — versioning policy, cadence, exact commands — lives in [RELEASING.md](./RELEASING.md). Your PR will ship in the next release; check `## [Unreleased]` in [CHANGELOG.md](./CHANGELOG.md) to see what else is queued.
+
 ## Code of Conduct
 
 By participating you agree to our [Code of Conduct](./CODE_OF_CONDUCT.md).
