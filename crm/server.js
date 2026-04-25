@@ -2376,6 +2376,11 @@ async function handleRemoveEmailAccount(req, res, params, paths, uuid) {
 // WhatsApp session management (per user)
 const waClients = {}; // uuid -> { client, qr, status }
 const waSilentResume = new Set(); // uuids whose current init was auto-triggered (no UI watching)
+// Transient export-failure retry counter, kept across re-inits so a failing
+// chat can't trigger an infinite reconnect loop. Reset on a successful export.
+const waRetryCounts = {};
+const WA_MAX_RETRIES = 2;
+const WA_RETRY_DELAY_MS = 10 * 1000;
 
 async function handleWhatsappStart(req, res, params, paths, uuid) {
     const existing = waClients[uuid];
@@ -2473,10 +2478,44 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
             runIncrementalMerge();
             updateUserSource(uuid, 'whatsapp', { status: 'connected', connectedAt: new Date().toISOString() });
             waClients[uuid].status = 'done';
+            waRetryCounts[uuid] = 0;
+            notifications.dismiss(dataDir, 'whatsapp');
             ensureSyncDaemon(uuid).attachWhatsApp(client);
         } catch (e) {
             console.error('WhatsApp export error:', e);
             waClients[uuid].status = 'error';
+            // Detached Frame / Target closed / Session closed are Puppeteer
+            // transient errors that fire mid-export when the WhatsApp Web tab
+            // recycles. The export saves chats.json per chat, so a fresh
+            // client.initialize() on the same LocalAuth session resumes from
+            // where it stopped. Retry up to WA_MAX_RETRIES then bail to a
+            // banner.
+            const isTransient = /detached Frame|Target closed|Session closed|Protocol error|Execution context|Page crashed/i.test(e.message || '');
+            const retryCount = (waRetryCounts[uuid] || 0);
+            if (isTransient && retryCount < WA_MAX_RETRIES) {
+                waRetryCounts[uuid] = retryCount + 1;
+                console.log(`[whatsapp] transient export error — retry ${retryCount + 1}/${WA_MAX_RETRIES} in ${WA_RETRY_DELAY_MS / 1000}s`);
+                notifications.set(dataDir, 'whatsapp', {
+                    message: `WhatsApp export hit a transient error (Chromium frame detached). Retrying ${retryCount + 1}/${WA_MAX_RETRIES} in ${WA_RETRY_DELAY_MS / 1000}s…`,
+                    pauseSync: false,
+                });
+                try { await client.destroy(); } catch { /* swallow */ }
+                delete waClients[uuid];
+                waSilentResume.delete(uuid);
+                setTimeout(() => {
+                    try { autoResumeWhatsapp(uuid); }
+                    catch (err) { console.error('[whatsapp] retry init failed:', err.message); }
+                }, WA_RETRY_DELAY_MS);
+                return;
+            }
+            // Non-transient (or out of retries) — surface to the UI.
+            const msg = (e.message || 'unknown').slice(0, 240);
+            notifications.set(dataDir, 'whatsapp', {
+                message: `WhatsApp export failed: ${msg}. Open Sources → WhatsApp → Reconnect to retry.`,
+                pauseSync: false,
+            });
+            waRetryCounts[uuid] = 0;
+            waSilentResume.delete(uuid);
         }
     });
 
