@@ -2,6 +2,8 @@
 
 A rolling log of open-source-quality improvements made by an autonomous loop while the maintainer is away. Newest at top.
 
+**Loop status (2026-04-25):** Concrete backlog drained after 12 atomic commits. Loop ended pending maintainer review. Items left under "Needs user" require product judgment or GitHub UI access — not loop-eligible. To resume on a wider mandate (e.g. code review of `crm/server.js` size, performance pass, importer hardening), kick the loop off again with the new scope.
+
 ## Shipped
 
 - **2026-04-25** — Added `tests/README.md` orienting contributors who land in the tests folder: layer overview, when-to-add-what table, fixture/PII rules, CI summary. Pattern from Node.js core / Vitest contributor docs.
