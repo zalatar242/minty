@@ -458,6 +458,17 @@ function watchSourceDir(source, sourceDir, importScript, importEnv, userDataDir,
     saveSyncState(statePath, state);
 
     function check() {
+        // Auto-sync (when enabled) owns the LinkedIn lifecycle — its fetch.js
+        // spawns import.js with LINKEDIN_EXPORT_DIR pointing at the staging
+        // dir. The watcher's default importer call doesn't set that env, so a
+        // race between scrape-write and watcher-fire produced "LinkedIn export
+        // directory not found" in the CRM log. Runtime check (instead of the
+        // boot-time inclusion gate) means a UI toggle takes effect immediately
+        // without a CRM restart.
+        if (source === 'linkedin' && userConfig.isLinkedInAutosyncEnabled(userDataDir)) {
+            currentHash = computeDirHash(sourceDir); // keep hash fresh so we don't fire later
+            return;
+        }
         const newHash = computeDirHash(sourceDir);
         if (newHash && newHash !== currentHash) {
             currentHash = newHash;

@@ -2802,9 +2802,12 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
     }
 
     const firstRun = !resuming;
-    // Pull every locally-available message per chat. WhatsApp Web's IndexedDB
-    // is the real ceiling — we just stop capping below that.
-    const limit = opts.limit ?? Infinity;
+    // 10k/chat is the ceiling. Unlimited (Infinity) caused Puppeteer
+    // detached-Frame failures on very large chats — the in-memory
+    // message array got too big and the WhatsApp Web tab recycled.
+    // 10k covers virtually all real chat history; bump WHATSAPP_MSG_LIMIT
+    // env var if you genuinely have a chat deeper than that.
+    const limit = opts.limit ?? (Number(process.env.WHATSAPP_MSG_LIMIT) || 10000);
     let msgCount = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);
 
     for (let i = 0; i < chats.length; i++) {
