@@ -6,6 +6,8 @@
 
 A self-hosted **personal CRM** (or PRM — personal relationship manager, if you prefer) that pulls your conversations from WhatsApp, Gmail, LinkedIn, Telegram, SMS, and Google Contacts into one searchable place — then surfaces who you should be talking to, and why. Without sending a byte to a third party.
 
+[![CI](https://github.com/zalatar242/minty/actions/workflows/ci.yml/badge.svg)](https://github.com/zalatar242/minty/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/zalatar242/minty?display_name=tag&sort=semver)](https://github.com/zalatar242/minty/releases)
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](./LICENSE)
 [![Node](https://img.shields.io/badge/node-%E2%89%A520-green.svg)](https://nodejs.org/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](./CONTRIBUTING.md)
