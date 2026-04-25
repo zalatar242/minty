@@ -68,8 +68,58 @@ const UPLOAD_BODY_MAX = 50 * 1024 * 1024;   // 50 MB for multipart uploads
     }
 })();
 
+// "12025551234@c.us" -> "wa_12025551234". Strips any non-digit so the
+// contact ID matches what crm/merge.js's waStableId produces from
+// whatsapp/contacts.json's `c.number` field.
+function widToContactId(wid) {
+    if (!wid) return null;
+    const digits = String(wid).replace(/@.*$/, '').replace(/[^0-9]/g, '');
+    return digits ? `wa_${digits}` : null;
+}
+
+function selfIdentityPath(uuid) {
+    return path.join(getUserDataDir(uuid), 'self.json');
+}
+
+// Persisted at data/<uuid>/self.json:
+//   { whatsapp: { wid, pushname }, contactIds: ["wa_12025551234", ...],
+//     phones: ["12025551234"], emails: [...] }
+// contactIds covers WhatsApp; phones/emails are reserved for explicit
+// future overrides (e.g. when the user owns multiple numbers).
+function loadSelfIdentity(uuid) {
+    try {
+        const raw = fs.readFileSync(selfIdentityPath(uuid), 'utf8');
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch { return {}; }
+}
+
+function saveSelfIdentity(uuid, patch) {
+    const cur = loadSelfIdentity(uuid);
+    const merged = { ...cur, ...patch, updatedAt: new Date().toISOString() };
+    const ids = new Set(cur.contactIds || []);
+    if (patch.whatsapp?.wid) {
+        const cid = widToContactId(patch.whatsapp.wid);
+        if (cid) ids.add(cid);
+    }
+    if (Array.isArray(patch.contactIds)) patch.contactIds.forEach(id => ids.add(id));
+    merged.contactIds = [...ids];
+    try {
+        const p = selfIdentityPath(uuid);
+        fs.mkdirSync(path.dirname(p), { recursive: true });
+        const tmp = `${p}.tmp-${process.pid}`;
+        fs.writeFileSync(tmp, JSON.stringify(merged, null, 2));
+        fs.renameSync(tmp, p);
+        try { fs.chmodSync(p, 0o600); } catch { /* ignore */ }
+    } catch (e) {
+        console.error('[self] save failed:', e.message);
+    }
+    return merged;
+}
+
 function getUserPaths(uuid) {
     const base = path.join(DATA, 'unified');
+    const self = loadSelfIdentity(uuid);
     return {
         contacts:     path.join(base, 'contacts.json'),
         interactions: path.join(base, 'interactions.json'),
@@ -78,7 +128,7 @@ function getUserPaths(uuid) {
         digest:       path.join(base, 'digest.json'),
         goals:        path.join(base, 'goals.json'),
         queryIndex:   path.join(base, 'query-index.json'),
-        selfIds:      new Set(),
+        selfIds:      new Set(self.contactIds || []),
     };
 }
 
@@ -86,19 +136,23 @@ function getUserPaths(uuid) {
 // Data loading
 // ---------------------------------------------------------------------------
 
-// In-memory contacts cache: avoid re-reading 5MB+ file on every request
+// In-memory contacts cache: avoid re-reading 5MB+ file on every request.
+// We cache the *raw* parsed array and apply selfIds filtering on each call,
+// so a fresh self-identity capture takes effect on the next request without
+// waiting for contacts.json to be re-merged.
 const _contactsCache = {};
 function loadContacts(paths) {
     const key = paths.contacts;
     try {
         const mtime = fs.statSync(key).mtimeMs;
+        let raw;
         if (_contactsCache[key] && _contactsCache[key].mtime === mtime) {
-            return _contactsCache[key].data;
+            raw = _contactsCache[key].raw;
+        } else {
+            raw = JSON.parse(fs.readFileSync(key, 'utf8'));
+            _contactsCache[key] = { mtime, raw };
         }
-        let data = JSON.parse(fs.readFileSync(key, 'utf8'));
-        if (paths.selfIds?.size) data = data.filter(c => !paths.selfIds.has(c.id));
-        _contactsCache[key] = { mtime, data };
-        return data;
+        return paths.selfIds?.size ? raw.filter(c => !paths.selfIds.has(c.id)) : raw;
     } catch {
         return [];
     }
@@ -2344,6 +2398,18 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     client.on('ready', async () => {
         waClients[uuid].status = 'ready';
         console.log(`WhatsApp ready for user ${uuid}, exporting...`);
+        // Capture the user's own WhatsApp identity so the merger doesn't surface
+        // them as a top contact (Note-to-Self chat is the usual culprit).
+        try {
+            const wid = client.info?.wid?._serialized || null;
+            const pushname = client.info?.pushname || null;
+            if (wid) {
+                saveSelfIdentity(uuid, { whatsapp: { wid, pushname } });
+                console.log(`[self] WhatsApp identity captured: ${pushname || '(no name)'} <${wid}>`);
+            }
+        } catch (e) {
+            console.error('[self] WhatsApp identity capture failed:', e.message);
+        }
         const mergeOut = paths.contacts ? path.dirname(paths.contacts) : path.join(dataDir, 'unified');
         fs.mkdirSync(mergeOut, { recursive: true });
         const runIncrementalMerge = () => {
@@ -2413,6 +2479,25 @@ function autoResumeWhatsapp(uuid) {
 
 function handleListNotifications(req, res, params, paths, uuid) {
     json(res, { notifications: notifications.list(getUserDataDir(uuid)) });
+}
+
+// POST /api/self/whatsapp — pulls the user's own wid/pushname from the
+// currently-connected wweb.js client. Useful when 'ready' already fired
+// before identity-capture shipped (so saveSelfIdentity didn't run).
+function handleCaptureSelfWhatsapp(req, res, params, paths, uuid) {
+    const session = waClients[uuid];
+    if (!session || !session.client || session.status !== 'ready') {
+        return json(res, { error: 'WhatsApp not connected (status=' + (session?.status || 'none') + ')' }, 400);
+    }
+    const wid = session.client.info?.wid?._serialized || null;
+    const pushname = session.client.info?.pushname || null;
+    if (!wid) return json(res, { error: 'client.info.wid not yet available — try again in a moment' }, 503);
+    saveSelfIdentity(uuid, { whatsapp: { wid, pushname } });
+    json(res, { ok: true, wid, pushname, identity: loadSelfIdentity(uuid) });
+}
+
+function handleGetSelfIdentity(req, res, params, paths, uuid) {
+    json(res, { identity: loadSelfIdentity(uuid) });
 }
 
 function handleDismissNotification(req, res, [source], paths, uuid) {
@@ -3315,6 +3400,8 @@ const ROUTES = [
     ['POST', /^\/api\/whatsapp\/lid-map$/,               handleSaveLidMap],
     ['GET',  /^\/api\/notifications$/,                   handleListNotifications],
     ['POST', /^\/api\/notifications\/([a-zA-Z]+)\/dismiss$/, handleDismissNotification],
+    ['GET',  /^\/api\/self$/,                            handleGetSelfIdentity],
+    ['POST', /^\/api\/self\/whatsapp$/,                  handleCaptureSelfWhatsapp],
     ['GET',  /^\/api\/meta$/,                            (req, res) => json(res, {
         demo: IS_DEMO,
         dataDir: DATA,
