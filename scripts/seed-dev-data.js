@@ -215,29 +215,39 @@ function buildWhatsApp(contacts, outDir) {
             messages,
         };
     }
-    // Add a couple of synthetic group chats
+    // Add a couple of synthetic group chats. Mirrors the real WhatsApp export
+    // shape: participants are plain strings, group messages have from=<chatId>
+    // and author=<sender id>. We also sprinkle a few @lid participants since
+    // real exports have ~50% @lid coverage.
     const allWa = contacts.filter(c => c.coverage.whatsapp);
     for (const gname of ['Founders Dinner Club', 'SF AI crew']) {
         if (allWa.length < 3) break;
         const id = `${Math.floor(rand() * 1e12)}@g.us`;
         const pickParticipants = shuffle(allWa).slice(0, Math.min(8, allWa.length));
+        // 1-2 @lid anonymous lurkers — represent unsaved group members
+        const anonLids = Array.from({ length: between(1, 2) }, () =>
+            `${Math.floor(rand() * 1e15)}@lid`);
         chats[gname] = {
             meta: {
                 id, name: gname, isGroup: true,
-                participants: pickParticipants.map(c => ({
-                    id: c.phone.replace('+', '') + '@c.us',
-                    isAdmin: false, isSuperAdmin: false,
-                })),
+                participants: [
+                    ...pickParticipants.map(c => c.phone.replace('+', '') + '@c.us'),
+                    ...anonLids,
+                ],
                 createdAt: randomTimestamp(0.2),
             },
             messages: Array.from({ length: between(6, 20) }, (_v, i) => {
-                const author = pick(pickParticipants);
+                // Most messages from named members; ~30% from an anon lid
+                const useAnon = rand() < 0.3 && anonLids.length > 0;
+                const authorId = useAnon
+                    ? pick(anonLids)
+                    : pick(pickParticipants).phone.replace('+', '') + '@c.us';
                 return {
                     id: `${id}_${i}`,
                     timestamp: randomTimestamp(0.8),
-                    from: author.phone.replace('+', '') + '@c.us',
-                    to: id,
-                    body: pickMessage(author.category),
+                    from: id,                          // group id (mirrors real shape)
+                    author: authorId,                  // actual sender
+                    body: pickMessage(useAnon ? 'operator' : pickParticipants[0].category),
                     type: 'chat',
                 };
             }),

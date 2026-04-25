@@ -1289,24 +1289,153 @@ function handleGetGroupDetail(req, res, [chatId], paths, uuid) {
     const signals = extractGroupSignals(sorted);
     const pinnedMessages = rawChatEntry?.meta?.pinnedMessages || [];
 
+    // Resolve `from` (WA ids like 12847989915@c.us) to contact display name
+    // so the UI shows "Hana Abebe" instead of a raw phone number.
+    const resolveFrom = buildWhatsappFromResolver(paths);
+
+    // Roster: hydrate member contact ids → name + role for the participant list.
+    const contacts = loadContacts(paths);
+    const byContactId = new Map(contacts.map(c => [c.id, c]));
+    const roster = (membership?.members || []).map(cid => {
+        const c = byContactId.get(cid);
+        if (!c) return null;
+        return {
+            id: c.id,
+            name: c.name || formatPhoneFallback(c) || '(unknown)',
+            phones: c.phones || [],
+            position: c.sources?.linkedin?.position || c.sources?.googleContacts?.title || null,
+            company: c.sources?.linkedin?.company || c.sources?.googleContacts?.org || null,
+            relationshipScore: c.relationshipScore || 0,
+        };
+    }).filter(Boolean);
+
     json(res, {
         chatId,
         name,
         category,
         messageCount: msgs.length,
         lastMessageAt: sorted[0]?.timestamp || null,
-        messages: sorted.slice(0, 50).map(m => ({
-            timestamp: m.timestamp,
-            from: m.from,
-            body: m.body || '',
-        })),
-        pinnedMessages,
+        messages: sorted.slice(0, 50).map(m => {
+            const r = resolveFrom(m.from);
+            return {
+                timestamp: m.timestamp,
+                from: m.from,
+                fromName: r.name,
+                fromContactId: r.contactId,
+                fromKind: r.kind,
+                body: m.body || '',
+            };
+        }),
+        pinnedMessages: pinnedMessages.map(m => {
+            const r = resolveFrom(m.from || m.author);
+            return { ...m, fromName: r.name, fromContactId: r.contactId, fromKind: r.kind };
+        }),
         rosterCount: membership?.size || 0,
+        roster,
         owner: membership?.owner || rawChatEntry?.meta?.owner || null,
         createdAt: membership?.createdAt || rawChatEntry?.meta?.createdAt || null,
         description: membership?.description || rawChatEntry?.meta?.description || null,
         signals,
     });
+}
+
+/**
+ * Build a function: rawFrom (e.g. "12847989915@c.us", "+12847989915", "me") →
+ *   { name, contactId } using the loaded contact list.
+ *
+ * Also returns a graceful fallback for ids we can't resolve so the UI never
+ * has to display a raw @c.us / phone number.
+ */
+function buildWhatsappFromResolver(paths) {
+    const contacts = loadContacts(paths);
+    const byKey = new Map();
+    // lid-map.json bridges @lid → @c.us when the user has the mapping
+    let lidMap = {};
+    try {
+        lidMap = JSON.parse(fs.readFileSync(path.join(DATA, 'whatsapp/lid-map.json'), 'utf8')) || {};
+    } catch { lidMap = {}; }
+
+    for (const c of contacts) {
+        if (c.sources?.whatsapp?.id) byKey.set(c.sources.whatsapp.id, c);
+        for (const phone of c.phones || []) {
+            const digits = String(phone).replace(/[^0-9]/g, '');
+            if (digits) {
+                byKey.set(digits, c);
+                byKey.set(digits + '@c.us', c);
+                byKey.set('+' + digits, c);
+            }
+        }
+    }
+    return function resolve(rawFrom) {
+        if (!rawFrom) return { name: null, contactId: null, kind: 'unknown' };
+        if (rawFrom === 'me' || rawFrom === 'Me') return { name: 'You', contactId: null, kind: 'self' };
+
+        // 1) Try direct id match
+        let c = byKey.get(rawFrom);
+        // 2) For @lid: try the lid-map first, then fall through to digit lookup
+        if (!c && typeof rawFrom === 'string' && rawFrom.endsWith('@lid')) {
+            const mapped = lidMap[rawFrom];
+            if (mapped) c = byKey.get(mapped) || byKey.get(String(mapped).replace(/[^0-9]/g, ''));
+        }
+        // 3) Phone-digit lookup catches the @c.us variants
+        if (!c) c = byKey.get(String(rawFrom).replace(/[^0-9]/g, ''));
+        if (!c) c = byKey.get(String(rawFrom).split('@')[0]);
+
+        if (c && c.name) return { name: c.name, contactId: c.id, kind: 'named' };
+        if (c) {
+            const phone = formatPhoneFallback(c);
+            const isLidOnly = c.isAnonymousLid
+                || (c.sources?.whatsapp?.id && c.sources.whatsapp.id.endsWith('@lid'));
+            if (isLidOnly && !phone) {
+                return { name: 'Group member', contactId: c.id, kind: 'anon-lid' };
+            }
+            return {
+                name: phone || 'Group member',
+                contactId: c.id,
+                kind: phone ? 'phone' : 'anon-lid',
+            };
+        }
+
+        // 4) Unresolved — humanise raw forms
+        if (typeof rawFrom === 'string') {
+            if (rawFrom.endsWith('@lid')) {
+                // Truly anonymous — the @lid isn't in lidMap and isn't a saved contact
+                return { name: 'Group member', contactId: null, kind: 'anon-lid' };
+            }
+            if (rawFrom.endsWith('@c.us')) {
+                const digits = rawFrom.split('@')[0];
+                return { name: formatPhoneNumber('+' + digits), contactId: null, kind: 'phone' };
+            }
+            if (rawFrom.endsWith('@g.us')) {
+                // Should never reach the message-from path after the merge.js
+                // group `author`-vs-`from` fix; defensive fallback only.
+                return { name: 'Group', contactId: null, kind: 'group' };
+            }
+        }
+        return { name: String(rawFrom), contactId: null, kind: 'raw' };
+    };
+}
+
+/**
+ * Pretty-print a phone number into a human-readable form when no name exists.
+ * Best-effort — a full libphonenumber port isn't worth the dependency.
+ */
+function formatPhoneNumber(p) {
+    if (!p) return null;
+    const digits = String(p).replace(/[^0-9]/g, '');
+    if (digits.length === 11 && digits.startsWith('1')) {
+        return '+1 (' + digits.slice(1, 4) + ') ' + digits.slice(4, 7) + '-' + digits.slice(7);
+    }
+    if (digits.length === 12 && digits.startsWith('44')) {
+        return '+44 ' + digits.slice(2, 6) + ' ' + digits.slice(6);
+    }
+    if (digits.length >= 8) return '+' + digits;
+    return p;
+}
+
+function formatPhoneFallback(c) {
+    if (c.phones && c.phones.length) return formatPhoneNumber(c.phones[0]);
+    return null;
 }
 
 function handleRunMerge(req, res, params, paths , ) {
@@ -3960,6 +4089,27 @@ nav {
 .group-detail-header { padding: 14px 20px; border-bottom: 1px solid #1e2740; flex-shrink: 0; }
 .group-detail-header h3 { font-size: 1rem; font-weight: 700; color: #f1f5f9; margin-bottom: 4px; }
 .group-detail-header p { font-size: 0.78rem; color: #4a5568; }
+
+.group-msg-from-link { color: var(--accent-hover); cursor: pointer; }
+.group-msg-from-link:hover { color: var(--accent); text-decoration: underline; }
+.group-roster {
+  padding: 12px 16px; border-top: 1px solid var(--border);
+  display: flex; flex-wrap: wrap; gap: 6px;
+  background: rgba(99,102,241,0.02);
+}
+.group-roster-title {
+  width: 100%; font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.1em; font-weight: 600; color: var(--text-muted);
+  margin-bottom: 4px;
+}
+.group-roster-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; padding: 4px 10px; border-radius: 12px;
+  background: var(--bg-card); border: 1px solid var(--border);
+  color: var(--text-secondary); cursor: pointer;
+}
+.group-roster-chip:hover { border-color: var(--accent); color: var(--text-primary); }
+.group-roster-chip-anon { font-style: italic; cursor: default; opacity: 0.7; }
 .group-detail-body { flex: 1; display: flex; overflow: hidden; gap: 0; }
 .group-feed { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
 .group-msg { background: #1a1f2e; border-radius: 8px; padding: 8px 12px; }
@@ -6541,10 +6691,15 @@ async function loadGroupDetail(chatId) {
   const feedHtml = g.messages.map(m => {
     const d = m.timestamp ? new Date(m.timestamp).toLocaleDateString('en-GB', { day:'numeric', month:'short' }) : '';
     const t = m.timestamp ? new Date(m.timestamp).toLocaleTimeString('en-GB', { hour:'2-digit', minute:'2-digit' }) : '';
-    const from = m.from && m.from !== 'me' ? m.from.replace(/@.*/, '') : 'You';
+    // Server-resolved fromName (handles @c.us → contact name, @lid → 'Group member',
+    // raw phone → +XX formatted) — never show the raw id.
+    const display = m.fromName || (m.from === 'me' ? 'You' : 'Group member');
+    const clickable = m.fromContactId
+      ? \`<span class="group-msg-from group-msg-from-link" onclick="event.stopPropagation();openContact('\${jsAttr(m.fromContactId)}')">\${esc(display)}</span>\`
+      : \`<span class="group-msg-from">\${esc(display)}</span>\`;
     return \`<div class="group-msg">
       <div class="group-msg-meta">
-        <span class="group-msg-from">\${esc(from)}</span>
+        \${clickable}
         <span>\${d} \${t}</span>
       </div>
       <div class="group-msg-body">\${esc(m.body)}</div>
@@ -6583,7 +6738,7 @@ async function loadGroupDetail(chatId) {
   const pinnedHtml = pinned.length ? \`<div class="signal-section" style="background:var(--surface-alt,#1a1f2b);padding:12px;border-radius:6px;margin-bottom:12px">
     <div class="signal-title">📌 Pinned <span style="color:#374151">\${pinned.length}</span></div>
     \${pinned.map(m => {
-      const who = m.from && m.from !== 'me' ? m.from.replace(/@.*/, '') : 'You';
+      const who = m.fromName || (m.from === 'me' ? 'You' : 'Group member');
       return \`<div class="signal-item" style="margin-bottom:8px">
         <div style="font-weight:600;font-size:0.72rem;color:var(--text-muted)">\${esc(who)} · \${fmtDate(m.timestamp)}</div>
         <div style="color:var(--text-primary);font-size:0.82rem;margin-top:2px">\${esc((m.body || '').slice(0, 280))}</div>
@@ -6604,12 +6759,25 @@ async function loadGroupDetail(chatId) {
     ? \` · Created \${new Date(g.createdAt).toLocaleDateString('en-GB', { month:'short', year:'numeric' })}\`
     : '';
 
+  // Roster — show known members as clickable chips, anonymous LIDs as a count
+  const roster = g.roster || [];
+  const namedMembers = roster.filter(r => r.name && !/^\\+/.test(r.name) && r.name !== '(unknown)');
+  const phoneOnly = roster.filter(r => r.name && /^\\+/.test(r.name));
+  const anonCount = (g.rosterCount || roster.length) - namedMembers.length - phoneOnly.length;
+  const rosterHtml = roster.length ? \`<div class="group-roster">
+    <div class="group-roster-title">Roster — \${g.rosterCount || roster.length} member\${(g.rosterCount || roster.length) === 1 ? '' : 's'}</div>
+    \${namedMembers.slice(0, 60).map(r => \`<span class="group-roster-chip" onclick="openContact('\${jsAttr(r.id)}')">\${esc(r.name)}\${r.company ? ' · ' + esc(r.company) : ''}</span>\`).join('')}
+    \${phoneOnly.slice(0, 20).map(r => \`<span class="group-roster-chip" onclick="openContact('\${jsAttr(r.id)}')">\${esc(r.name)}</span>\`).join('')}
+    \${anonCount > 0 ? \`<span class="group-roster-chip group-roster-chip-anon">+\${anonCount} anonymous</span>\` : ''}
+  </div>\` : '';
+
   detail.innerHTML = \`
     <div class="group-detail-header">
       <h3>\${esc(g.name)} <span class="group-cat \${catCls}" style="vertical-align:middle">\${esc(g.category)}</span></h3>
       <p>\${metaHeader}\${createdStr}</p>
       \${descHtml}
     </div>
+    \${rosterHtml}
     <div class="group-detail-body">
       <div class="group-feed">\${pinnedHtml}\${feedHtml || (pinned.length ? '' : '<div class="loading">No messages found</div>')}</div>
       <div class="group-signals">
