@@ -38,7 +38,7 @@ We do **not** use a CLA. If Minty ever offers a commercial license alongside AGP
 
 New here? Read [ARCHITECTURE.md](./ARCHITECTURE.md) first — 10-min tour of the codebase. Then:
 
-- **First time looking for something to do:** filter issues by [`good first issue`](https://github.com/zalatar242/minty/labels/good%20first%20issue) and [`help wanted`](https://github.com/zalatar242/minty/labels/help%20wanted). If none are open, the highest-leverage drive-by fixes are usually: fixing a bug you hit yourself, improving an importer for a source you actually use, or tightening the matcher with a test fixture.
+- **First time looking for something to do:** filter issues by [`good first issue`](https://github.com/zalatar242/minty/labels/good%20first%20issue) and [`help wanted`](https://github.com/zalatar242/minty/labels/help%20wanted). The full label taxonomy is declarative in [`.github/labels.json`](./.github/labels.json) — maintainers run `npm run labels:sync` to provision them. If none are open, the highest-leverage drive-by fixes are usually: fixing a bug you hit yourself, improving an importer for a source you actually use, or tightening the matcher with a test fixture.
 - **Adding a new importer:** see ARCHITECTURE.md → "Where to start as a contributor".
 - **Touching matching:** read `crm/MATCHING.md` and add a fixture under `tests/unit/`.
 

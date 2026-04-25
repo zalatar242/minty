@@ -1,0 +1,107 @@
+[
+  {
+    "name": "good first issue",
+    "color": "7057ff",
+    "description": "Good for newcomers — small scope, clear acceptance criteria"
+  },
+  {
+    "name": "help wanted",
+    "color": "008672",
+    "description": "Maintainer would welcome a PR for this"
+  },
+  {
+    "name": "bug",
+    "color": "d73a4a",
+    "description": "Something isn't working"
+  },
+  {
+    "name": "enhancement",
+    "color": "a2eeef",
+    "description": "New feature or improvement to existing functionality"
+  },
+  {
+    "name": "docs",
+    "color": "0075ca",
+    "description": "Improvements or additions to documentation"
+  },
+  {
+    "name": "dependencies",
+    "color": "0366d6",
+    "description": "Dependency updates (Dependabot writes here)"
+  },
+  {
+    "name": "ci",
+    "color": "ededed",
+    "description": "CI / build / release tooling"
+  },
+  {
+    "name": "security",
+    "color": "ee0701",
+    "description": "Security-relevant. Use private advisories for vulns, not public issues"
+  },
+  {
+    "name": "performance",
+    "color": "fbca04",
+    "description": "Speed, memory, or scalability work"
+  },
+  {
+    "name": "ux",
+    "color": "c5def5",
+    "description": "User experience / UI polish"
+  },
+  {
+    "name": "matching",
+    "color": "5319e7",
+    "description": "Cross-source contact matching (crm/match.js, MATCHING.md)"
+  },
+  {
+    "name": "importer/whatsapp",
+    "color": "25d366",
+    "description": "WhatsApp source"
+  },
+  {
+    "name": "importer/linkedin",
+    "color": "0a66c2",
+    "description": "LinkedIn source (ZIP or auto-sync)"
+  },
+  {
+    "name": "importer/telegram",
+    "color": "26a5e4",
+    "description": "Telegram source"
+  },
+  {
+    "name": "importer/email",
+    "color": "ea4335",
+    "description": "Gmail / IMAP source"
+  },
+  {
+    "name": "importer/google-contacts",
+    "color": "4285f4",
+    "description": "Google Contacts source"
+  },
+  {
+    "name": "importer/sms",
+    "color": "9b59b6",
+    "description": "SMS source"
+  },
+  {
+    "name": "needs repro",
+    "color": "fef2c0",
+    "description": "Maintainer needs reproducible steps to act on this"
+  },
+  {
+    "name": "needs design",
+    "color": "f9d0c4",
+    "description": "Blocked on a product/UX decision before implementation"
+  },
+  {
+    "name": "wontfix",
+    "color": "ffffff",
+    "description": "Out of scope — see VISION.md / CONTRIBUTING.md non-goals"
+  },
+  {
+    "name": "duplicate",
+    "color": "cfd3d7",
+    "description": "Duplicate of another issue"
+  }
+]
