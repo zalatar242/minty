@@ -40,6 +40,23 @@ test('[Progress] updateProgress merges patch into existing record', () => {
     fs.rmSync(d, { recursive: true, force: true });
 });
 
+test('[Progress] isActive returns false for stale records (killed mid-sync)', () => {
+    // Mid-sync record whose updatedAt is older than STALE_AFTER_MS — process died.
+    const stale = {
+        source: 'whatsapp',
+        step: 'messages',
+        current: 255,
+        total: 736,
+        updatedAt: new Date(Date.now() - P.STALE_AFTER_MS - 1000).toISOString(),
+    };
+    assert.equal(P.isActive(stale), false);
+    assert.equal(P.isStale(stale), true);
+
+    const fresh = { ...stale, updatedAt: new Date().toISOString() };
+    assert.equal(P.isActive(fresh), true);
+    assert.equal(P.isStale(fresh), false);
+});
+
 test('[Progress] finishProgress marks step=done; isActive returns false', () => {
     const d = mkTempDir();
     P.startProgress(d, 'sms');

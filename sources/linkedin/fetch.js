@@ -30,7 +30,11 @@ const PROFILE_DIR = process.env.LINKEDIN_PROFILE_DIR || path.join(LINKEDIN_DIR, 
 const STAGING_DIR = path.join(LINKEDIN_DIR, '.scraped-staging');
 const LOCK_PATH = path.join(LINKEDIN_DIR, '.scrape.lock');
 
-const THROTTLE_MS = Number(process.env.LINKEDIN_THROTTLE_MS) || 2000;
+// Default 1000ms between page navigations. Humans click faster than 2s; 1s is
+// still well within human-like bounds while cutting scrape time roughly in half.
+// Bump higher if you want to be extra cautious, lower if you're willing to
+// accept slightly more risk for speed.
+const THROTTLE_MS = Number(process.env.LINKEDIN_THROTTLE_MS) || 1000;
 // Message-thread cap. Default: unlimited (scrape every thread). Set a positive
 // integer via LINKEDIN_SYNC_MESSAGE_CAP to limit for speed. Unlimited on an
 // account with N threads takes roughly N × (THROTTLE_MS × 6 + 1s) seconds —
@@ -47,6 +51,16 @@ const SKIP_DETAILS = process.env.LINKEDIN_SKIP_DETAILS === '1';
 // clobber ZIP-imported historical invitations. Turn on explicitly to track
 // pending. See README for the historical-vs-pending tradeoff.
 const SCRAPE_INVITATIONS = process.env.LINKEDIN_SCRAPE_INVITATIONS === '1';
+// Parallelism for the per-contact detail backfill. Default 3 tabs — same
+// authenticated session, LinkedIn sees multi-tab browsing (common in humans).
+// Higher = faster but more concurrent requests; higher detection risk.
+// 0 / invalid / empty = use default of 3. Explicit 1 = serial.
+const DETAIL_CONCURRENCY = (() => {
+    const raw = process.env.LINKEDIN_DETAIL_CONCURRENCY;
+    if (!raw) return 3;
+    const n = Number(raw);
+    return (!Number.isFinite(n) || n < 1) ? 1 : Math.floor(n);
+})();
 
 // --- sync-state.json -------------------------------------------------------
 // Delegated to sources/linkedin/sync-state.js which handles atomic writes
@@ -167,45 +181,78 @@ async function scrapeConnectionsList(page) {
     return records;
 }
 
-// --- Scrape: per-contact detail (Eng M6 — reuse single page) --------------
+// --- Scrape: per-contact detail (parallelized across N tabs) ---------------
+// Previously serial — one goto per contact, ~2.5h for 3600 contacts. Now a
+// worker pool of DETAIL_CONCURRENCY tabs against the same persistent context
+// (shared session cookie, just parallel DOM instances). Same per-tab rate
+// limiting; total throughput ≈ DETAIL_CONCURRENCY × serial throughput.
 
-async function scrapeContactDetails(page, connections) {
-    if (SKIP_DETAILS) return connections;
-    const out = [];
-    for (let i = 0; i < connections.length; i++) {
-        const c = connections[i];
-        const slugMatch = c.profileUrl && /\/in\/([^/?#]+)/.exec(c.profileUrl);
-        if (!slugMatch) { out.push(c); continue; }
-        const overlayUrl = SELECTORS.CONTACT_INFO_MODAL.urlTemplate.replace('{slug}', slugMatch[1]);
-        let email = '', connectedOn = '';
-        try {
-            await page.goto(overlayUrl, { waitUntil: 'domcontentloaded' });
-            assertOk(page);
-            ({ email, connectedOn } = await page.evaluate((sels) => {
-                const pickAttr = (ss, attr) => {
-                    for (const s of ss) { const el = document.querySelector(s); if (el && el.getAttribute(attr)) return el.getAttribute(attr); }
-                    return '';
-                };
-                const pickText = (ss) => {
-                    for (const s of ss) { const el = document.querySelector(s); if (el) return (el.textContent || '').trim(); }
-                    return '';
-                };
-                const mailto = pickAttr(sels.email, 'href');
-                return {
-                    email: mailto ? mailto.replace(/^mailto:/i, '').trim() : pickText(sels.email),
-                    connectedOn: pickText(sels.connectedOn).replace(/^connected\s+/i, '').trim(),
-                };
-            }, SELECTORS.CONTACT_INFO_MODAL));
-        } catch (err) {
-            if (err && err.code === 'SESSION') throw err;
-            // Individual overlay failures are non-fatal.
-        }
-        out.push(Object.assign({}, c, { email, connectedOn }));
-        if (i % 10 === 0) setProgress('details', i, connections.length);
-        await sleep(THROTTLE_MS);
+async function scrapeOneContactDetail(page, c) {
+    const slugMatch = c.profileUrl && /\/in\/([^/?#]+)/.exec(c.profileUrl);
+    if (!slugMatch) return c;
+    const overlayUrl = SELECTORS.CONTACT_INFO_MODAL.urlTemplate.replace('{slug}', slugMatch[1]);
+    let email = '', connectedOn = '';
+    try {
+        await page.goto(overlayUrl, { waitUntil: 'domcontentloaded' });
+        assertOk(page);
+        ({ email, connectedOn } = await page.evaluate((sels) => {
+            const pickAttr = (ss, attr) => {
+                for (const s of ss) { const el = document.querySelector(s); if (el && el.getAttribute(attr)) return el.getAttribute(attr); }
+                return '';
+            };
+            const pickText = (ss) => {
+                for (const s of ss) { const el = document.querySelector(s); if (el) return (el.textContent || '').trim(); }
+                return '';
+            };
+            const mailto = pickAttr(sels.email, 'href');
+            return {
+                email: mailto ? mailto.replace(/^mailto:/i, '').trim() : pickText(sels.email),
+                connectedOn: pickText(sels.connectedOn).replace(/^connected\s+/i, '').trim(),
+            };
+        }, SELECTORS.CONTACT_INFO_MODAL));
+    } catch (err) {
+        if (err && err.code === 'SESSION') throw err;
+        // Individual overlay failures are non-fatal.
     }
-    setProgress('details', connections.length, connections.length);
-    return out;
+    return Object.assign({}, c, { email, connectedOn });
+}
+
+async function scrapeContactDetails(context, connections) {
+    if (SKIP_DETAILS) return connections;
+    const total = connections.length;
+    const results = new Array(total);
+    // Shared cursor to allocate indices to workers; shared done counter for progress.
+    let cursor = 0, done = 0;
+    let sessionErr = null;
+
+    async function worker(workerIndex) {
+        const page = workerIndex === 0 ? context.pages()[0] || await context.newPage() : await context.newPage();
+        try {
+            while (true) {
+                if (sessionErr) break;
+                const idx = cursor++;
+                if (idx >= total) break;
+                try {
+                    results[idx] = await scrapeOneContactDetail(page, connections[idx]);
+                } catch (err) {
+                    if (err && err.code === 'SESSION') { sessionErr = err; break; }
+                    results[idx] = connections[idx];
+                }
+                done++;
+                if (done % 10 === 0 || done === total) setProgress('details', done, total);
+                await sleep(THROTTLE_MS);
+            }
+        } finally {
+            if (workerIndex !== 0) { try { await page.close(); } catch (_) {} }
+        }
+    }
+
+    const workerCount = Math.min(DETAIL_CONCURRENCY, total);
+    await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i)));
+    if (sessionErr) throw sessionErr;
+    setProgress('details', total, total);
+    // Preserve original order; any missing (race condition, shouldn't happen) falls back to input.
+    return connections.map((c, i) => results[i] || c);
 }
 
 // --- Scrape: messaging -----------------------------------------------------
@@ -235,16 +282,86 @@ async function scrapeMessages(page) {
                 const m = /\/messaging\/thread\/([^/?#]+)/.exec(anchorHref);
                 if (m) fallbackId = m[1];
             }
-            return { id: fallbackId, href: anchorHref, folder };
+            // Best-effort last-activity timestamp. ISO first (from <time> attrs),
+            // falls back to visible text ("2h", "Yesterday", "Jan 15"). Used
+            // only to skip unchanged threads on incremental syncs — when in
+            // doubt (missing/unparsable), we scrape.
+            let lastIso = '';
+            for (const s of (sels.threadTimestampIso || [])) {
+                const el = it.querySelector(s);
+                if (el) {
+                    lastIso = el.getAttribute('datetime') || el.getAttribute('title') || '';
+                    if (lastIso) break;
+                }
+            }
+            let lastText = '';
+            for (const s of (sels.threadTimestampText || [])) {
+                const el = it.querySelector(s);
+                if (el) { lastText = (el.textContent || '').trim(); if (lastText) break; }
+            }
+            return { id: fallbackId, href: anchorHref, folder, lastIso, lastText };
         });
     }, SELECTORS.MESSAGING_INBOX);
 
-    const capped = threads.filter((t) => t.id).slice(0, MESSAGE_CAP);
-    // Time estimate — each thread costs ~1 goto + 5 scrolls + extract ≈ 6 × THROTTLE_MS + ~1s overhead.
-    const estSecondsPerThread = (THROTTLE_MS * 6 / 1000) + 1;
+    // Incremental skip: on repeat runs, skip threads whose last-activity is
+    // clearly older than sync-state.json.linkedin.lastSync. Unparsable or
+    // missing timestamps → scrape (safe fallback). First run (no lastSync) →
+    // scrape everything.
+    let filtered = threads.filter((t) => t.id);
+    const linkedinState = syncState.readLinkedIn(DATA_DIR) || {};
+    const lastSyncMs = linkedinState.lastSync ? Date.parse(linkedinState.lastSync) : null;
+    let skippedAsUnchanged = 0;
+    if (lastSyncMs && !Number.isNaN(lastSyncMs)) {
+        const before = filtered.length;
+        filtered = filtered.filter((t) => {
+            const iso = t.lastIso ? Date.parse(t.lastIso) : NaN;
+            if (!Number.isNaN(iso)) return iso > lastSyncMs; // clean skip signal
+            // No ISO — try to parse common relative forms. Be conservative:
+            // anything we don't recognize, scrape.
+            const text = (t.lastText || '').toLowerCase();
+            // Very recent (seconds / minutes / hours / "now") — always newer than any lastSync.
+            if (/^\d+s$/.test(text) || /^\d+m$/.test(text) || /^\d+h$/.test(text) || text === 'now' || text === 'just now') return true;
+            // "Yesterday" thread is ~24h old. Newer than lastSync iff lastSync > 24h ago.
+            if (/yesterday/.test(text)) return Date.now() - lastSyncMs > 24 * 3600 * 1000;
+            // Relative Nd / Nw / Nmo / Ny. The thread is roughly (N × unit) old;
+            // it's newer than lastSync iff (now - age) > lastSync.
+            const relUnits = [
+                [/^(\d+)d$/, 86400 * 1000],
+                [/^(\d+)w$/, 7 * 86400 * 1000],
+                [/^(\d+)mo$/, 30 * 86400 * 1000],
+                [/^(\d+)y$/, 365 * 86400 * 1000],
+            ];
+            for (const [re, unitMs] of relUnits) {
+                const m = re.exec(text);
+                if (m) return (Date.now() - Number(m[1]) * unitMs) > lastSyncMs;
+            }
+            // Absolute "Jan 15" / "jan 15" / "Mar 3" — no year. Try current year;
+            // if the result lies in the future (e.g. Dec in January), it was last year.
+            const absMatch = /^([a-z]{3})\s+(\d{1,2})$/.exec(text);
+            if (absMatch) {
+                const year = new Date().getFullYear();
+                const tryA = Date.parse(`${absMatch[1]} ${absMatch[2]}, ${year}`);
+                if (!Number.isNaN(tryA)) {
+                    const resolved = tryA > Date.now()
+                        ? Date.parse(`${absMatch[1]} ${absMatch[2]}, ${year - 1}`)
+                        : tryA;
+                    if (!Number.isNaN(resolved)) return resolved > lastSyncMs;
+                }
+            }
+            return true; // unknown format → scrape (safe fallback)
+        });
+        skippedAsUnchanged = before - filtered.length;
+    }
+    const capped = filtered.slice(0, MESSAGE_CAP);
+    // Time estimate — adaptive scroll typically stabilizes in 1-2 iterations.
+    // Per-thread cost ≈ goto + 2 × THROTTLE_MS on average + ~1s extract.
+    const estSecondsPerThread = (THROTTLE_MS * 2 / 1000) + 1.5;
     const estMinutes = Math.ceil((capped.length * estSecondsPerThread) / 60);
     const unboundedNote = (MESSAGE_CAP === Infinity) ? '' : ` (capped at ${MESSAGE_CAP})`;
-    console.log(`Scraping ${capped.length} message thread${capped.length === 1 ? '' : 's'}${unboundedNote} — estimated ${estMinutes} min. Ctrl+C to abort.`);
+    const skipNote = skippedAsUnchanged > 0
+        ? ` (${skippedAsUnchanged} thread${skippedAsUnchanged === 1 ? '' : 's'} skipped as unchanged since last sync)`
+        : '';
+    console.log(`Scraping ${capped.length} message thread${capped.length === 1 ? '' : 's'}${unboundedNote}${skipNote} — estimated ${estMinutes} min. Ctrl+C to abort.`);
     const allRows = []; // [{ record, context }]
 
     for (let i = 0; i < capped.length; i++) {
@@ -256,11 +373,29 @@ async function scrapeMessages(page) {
             await page.goto(threadUrl, { waitUntil: 'domcontentloaded' });
             assertOk(page);
             await page.waitForTimeout(THROTTLE_MS);
-            for (let k = 0; k < 5; k++) {
-                await page.evaluate(() => {
-                    const m = document.querySelector('.msg-s-message-list, ul.msg-s-message-list-content');
-                    if (m) m.scrollTop = 0;
-                });
+            // Adaptive scroll: load older messages by scrolling to top repeatedly,
+            // but stop as soon as two consecutive scrolls don't load new bubbles.
+            // Most threads have < 50 messages and stabilize in 1-2 scrolls; the
+            // old fixed 5-iteration loop wasted 3-4 scrolls on those. Capped at 8
+            // iterations so pathological threads can't hang.
+            let prevCount = -1, stableStreak = 0;
+            for (let k = 0; k < 8; k++) {
+                const count = await page.evaluate((sels) => {
+                    for (const s of sels.container) {
+                        const m = document.querySelector(s);
+                        if (m) { m.scrollTop = 0; break; }
+                    }
+                    for (const s of sels.bubble) {
+                        const found = document.querySelectorAll(s);
+                        if (found.length) return found.length;
+                    }
+                    return 0;
+                }, { container: SELECTORS.MESSAGE_THREAD.messageListContainer, bubble: SELECTORS.MESSAGE_THREAD.messageBubble });
+                // Two consecutive stable counts = done. Single-tick stability
+                // is too eager on slow networks where LinkedIn lazy-loads —
+                // count might plateau briefly between batches.
+                if (count === prevCount) { stableStreak++; if (stableStreak >= 2) break; }
+                else { stableStreak = 0; prevCount = count; }
                 await page.waitForTimeout(THROTTLE_MS);
             }
             const threadData = await page.evaluate((sels) => {
@@ -424,7 +559,7 @@ async function run() {
 
         // 2+3. Connections + detail.
         const listRecords = await scrapeConnectionsList(page);
-        const detailed = await scrapeContactDetails(page, listRecords);
+        const detailed = await scrapeContactDetails(context, listRecords);
 
         // 4. Row-floor (Eng M3) then atomic write.
         try { enforceRowFloor('Connections.csv', detailed.length); }

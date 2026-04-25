@@ -20,6 +20,10 @@ const {
     computeGroupSignalScores,
 } = require('./people-graph');
 const sourceProgress = require('../sources/_shared/progress');
+const notifications = require('./notifications');
+const observability = require('./observability');
+
+observability.init();
 
 const PORT = Number(process.env.PORT) || 3456;
 const HOST = process.env.HOST || '127.0.0.1'; // set HOST=0.0.0.0 to expose on LAN
@@ -2275,10 +2279,22 @@ async function handleRemoveEmailAccount(req, res, params, paths, uuid) {
 
 // WhatsApp session management (per user)
 const waClients = {}; // uuid -> { client, qr, status }
+const waSilentResume = new Set(); // uuids whose current init was auto-triggered (no UI watching)
 
 async function handleWhatsappStart(req, res, params, paths, uuid) {
-    if (waClients[uuid]?.status === 'ready') return json(res, { status: 'already_connected' });
-    if (waClients[uuid]?.status === 'qr_pending') return json(res, { status: 'qr_pending' });
+    const existing = waClients[uuid];
+    if (existing) {
+        const s = existing.status;
+        // Anything except a terminal failure short-circuits — a second
+        // client.initialize() against the same .wwebjs_auth would clash on
+        // Puppeteer's userDataDir SingletonLock and crash the running session.
+        if (s === 'ready') return json(res, { status: 'already_connected' });
+        if (s === 'qr_pending') return json(res, { status: 'qr_pending' });
+        if (s === 'initializing' || s === 'authenticated' || s === 'done') {
+            return json(res, { status: s });
+        }
+        // s === 'auth_failure' or 'error': fall through and re-init.
+    }
 
     let Client, LocalAuth;
     try {
@@ -2307,9 +2323,23 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
         });
         waClients[uuid].status = 'qr_pending';
         console.log(`WhatsApp QR ready for user ${uuid}`);
+        // If we got here on a silent boot resume, the persisted session is
+        // gone — surface a banner so the user knows to come back and rescan.
+        if (waSilentResume.has(uuid)) {
+            notifications.set(dataDir, 'whatsapp', {
+                needsReauth: true,
+                pauseSync: true,
+                message: 'WhatsApp session expired — open Sources and rescan the QR.',
+            });
+            waSilentResume.delete(uuid);
+        }
     });
 
-    client.on('authenticated', () => { waClients[uuid].status = 'authenticated'; });
+    client.on('authenticated', () => {
+        waClients[uuid].status = 'authenticated';
+        notifications.dismiss(dataDir, 'whatsapp');
+        waSilentResume.delete(uuid);
+    });
 
     client.on('ready', async () => {
         waClients[uuid].status = 'ready';
@@ -2342,7 +2372,15 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
         }
     });
 
-    client.on('auth_failure', () => { waClients[uuid].status = 'auth_failure'; });
+    client.on('auth_failure', () => {
+        waClients[uuid].status = 'auth_failure';
+        notifications.set(dataDir, 'whatsapp', {
+            needsReauth: true,
+            pauseSync: true,
+            message: 'WhatsApp authentication failed — open Sources to reconnect.',
+        });
+        waSilentResume.delete(uuid);
+    });
 
     client.initialize().catch(e => {
         console.error('WhatsApp init error:', e);
@@ -2350,6 +2388,36 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     });
 
     json(res, { status: 'starting' });
+}
+
+// Boot-time silent resume. If the user has a previously paired WhatsApp session
+// on disk, re-initialize the client so the live message listener attaches and
+// stale incremental data catches up. If the persisted session is invalid we
+// surface a banner via notifications.set() and skip future resume attempts
+// (handleWhatsappStart's qr/auth_failure handlers do that themselves).
+function autoResumeWhatsapp(uuid) {
+    if (waClients[uuid]) return; // already running or in QR flow
+    const dataDir = getUserDataDir(uuid);
+    if (notifications.isPaused(dataDir, 'whatsapp')) return; // user hasn't reconnected yet
+    const authDir = path.join(dataDir, '.wwebjs_auth');
+    if (!fs.existsSync(authDir)) return; // user never connected — nothing to resume
+    const paths = getUserPaths(uuid);
+    waSilentResume.add(uuid);
+    const fakeRes = { writeHead: () => {}, end: () => {} };
+    handleWhatsappStart({}, fakeRes, [], paths, uuid)
+        .catch(e => {
+            waSilentResume.delete(uuid);
+            console.error('[autosync] WhatsApp auto-resume failed:', e.message);
+        });
+}
+
+function handleListNotifications(req, res, params, paths, uuid) {
+    json(res, { notifications: notifications.list(getUserDataDir(uuid)) });
+}
+
+function handleDismissNotification(req, res, [source], paths, uuid) {
+    notifications.dismiss(getUserDataDir(uuid), source);
+    json(res, { ok: true });
 }
 
 function handleWhatsappProfilePic(req, res, [encodedId], paths, uuid) {
@@ -2403,7 +2471,11 @@ function handleWhatsappStatus(req, res, params, paths, uuid) {
 function handleWhatsappProgress(req, res, params, paths, uuid) {
     const session = waClients[uuid];
     const progress = session?.progress || readExportProgress(uuid);
-    const active = !!progress && progress.step !== 'done';
+    const live = !!session;
+    const active = !!progress
+        && progress.step !== 'done'
+        && progress.step !== 'error'
+        && (live || !sourceProgress.isStale(progress));
     json(res, { active, progress: progress || null });
 }
 
@@ -2564,7 +2636,9 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
     }
 
     const firstRun = !resuming;
-    const limit = opts.limit ?? (firstRun ? 50 : 500);
+    // Pull every locally-available message per chat. WhatsApp Web's IndexedDB
+    // is the real ceiling — we just stop capping below that.
+    const limit = opts.limit ?? Infinity;
     let msgCount = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);
 
     for (let i = 0; i < chats.length; i++) {
@@ -3239,6 +3313,8 @@ const ROUTES = [
     ['GET',  /^\/api\/meetings\/([^/]+)\/debrief$/,      handleGetDebrief],
     ['POST', /^\/api\/meetings\/([^/]+)\/debrief$/,      handleSaveDebrief],
     ['POST', /^\/api\/whatsapp\/lid-map$/,               handleSaveLidMap],
+    ['GET',  /^\/api\/notifications$/,                   handleListNotifications],
+    ['POST', /^\/api\/notifications\/([a-zA-Z]+)\/dismiss$/, handleDismissNotification],
     ['GET',  /^\/api\/meta$/,                            (req, res) => json(res, {
         demo: IS_DEMO,
         dataDir: DATA,
@@ -3370,6 +3446,7 @@ const server = http.createServer(async (req, res) => {
                 await handler(req, res, m.slice(1).map(decodeURIComponent), paths, uuid);
             } catch (e) {
                 console.error(e);
+                observability.captureException(e, { route: pattern.toString(), method });
                 res.writeHead(500); res.end(e.message);
             }
             return;
@@ -3404,6 +3481,14 @@ server.listen(PORT, HOST, () => {
     } catch (e) {
         console.error('[sync] Failed to start sync daemon:', e.message);
     }
+
+    // Auto-resume WhatsApp if previously paired. Stagger 5s after boot so the
+    // sync daemon initializes first and we don't fight Puppeteer for the
+    // event loop during startup.
+    setTimeout(() => {
+        try { autoResumeWhatsapp(SINGLE_USER_UUID); }
+        catch (e) { console.error('[autosync] WhatsApp boot resume failed:', e.message); }
+    }, 5 * 1000);
 });
 
 // ---------------------------------------------------------------------------
@@ -3867,6 +3952,29 @@ nav {
 }
 .sync-warn-banner svg { flex-shrink: 0; margin-top: 1px; }
 .sync-warn-icon { width: 14px; height: 14px; }
+
+/* Sticky re-auth banner (set by auto-sync on session failure) */
+.notif-banner {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: flex-start; gap: 10px;
+  background: rgba(180, 83, 9, 0.96); color: #fff;
+  padding: 10px 14px; font-size: 0.78rem; line-height: 1.35;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+  border-bottom: 1px solid rgba(0,0,0,0.15);
+}
+.notif-banner-text { flex: 1; }
+.notif-banner-source { font-weight: 600; margin-right: 6px; text-transform: capitalize; }
+.notif-banner-action {
+  background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.3);
+  color: #fff; padding: 4px 10px; border-radius: 6px;
+  font-size: 0.72rem; cursor: pointer; white-space: nowrap;
+}
+.notif-banner-action:hover { background: rgba(255,255,255,0.28); }
+.notif-banner-dismiss {
+  background: transparent; border: 0; color: #fff; opacity: 0.7;
+  font-size: 1rem; cursor: pointer; padding: 0 4px; line-height: 1;
+}
+.notif-banner-dismiss:hover { opacity: 1; }
 
 /* Global sync toast (shown while a background import is running) */
 .sync-toast {
@@ -4671,6 +4779,8 @@ body { background: var(--bg); }
 </head>
 <body>
 
+<div id="notif-banners"></div>
+
 <div id="sync-toast" class="sync-toast" style="display:none" onclick="showView('sources')" role="status" aria-live="polite">
   <span class="sync-toast-spinner" aria-hidden="true"></span>
   <span class="sync-toast-text" id="sync-toast-text">Syncing WhatsApp…</span>
@@ -5112,6 +5222,45 @@ const SOURCE_LABELS = {
 };
 function labelForSource(key) { return SOURCE_LABELS[key] || key; }
 
+async function pollNotifications() {
+  const host = document.getElementById('notif-banners');
+  if (!host) return;
+  let notifs = {};
+  try {
+    const r = await fetch(BASE + '/api/notifications');
+    if (!r.ok) return;
+    const data = await r.json();
+    notifs = (data && data.notifications) || {};
+  } catch { return; }
+
+  const keys = Object.keys(notifs);
+  if (keys.length === 0) { host.innerHTML = ''; return; }
+
+  host.innerHTML = keys.map(key => {
+    const n = notifs[key] || {};
+    const label = labelForSource(key);
+    const msg = esc(n.message || (label + ' needs attention.'));
+    const target = key === 'whatsapp' ? "showView('sources')" : '';
+    return \`
+      <div class="notif-banner" role="alert">
+        <span class="notif-banner-text">
+          <span class="notif-banner-source">\${esc(label)}:</span>\${msg}
+        </span>
+        \${target ? \`<button class="notif-banner-action" onclick="\${target}">Open Sources</button>\` : ''}
+        <button class="notif-banner-action" onclick="dismissNotification('\${esc(key)}')">I've re-authed</button>
+        <button class="notif-banner-dismiss" aria-label="Dismiss" onclick="dismissNotification('\${esc(key)}')">×</button>
+      </div>
+    \`;
+  }).join('');
+}
+
+async function dismissNotification(key) {
+  try {
+    await fetch(BASE + '/api/notifications/' + encodeURIComponent(key) + '/dismiss', { method: 'POST' });
+  } catch { /* ignore */ }
+  pollNotifications();
+}
+
 async function pollSyncToast() {
   try {
     const r = await fetch(BASE + '/api/sync/progress');
@@ -5185,6 +5334,202 @@ async function pollSyncToast() {
       toast.style.display = 'none';
     }
   } catch {}
+  // Active LinkedIn wins (opt-in, rarer), then active WhatsApp, then any "just-done" state.
+  const active = (li && li.active && li) || (wa && wa.active && wa);
+  if (active) {
+    toast.style.display = 'flex';
+    toast.classList.remove('success');
+    text.textContent = active.label;
+    fill.style.width = (active.pct != null ? active.pct : 10) + '%';
+    return;
+  }
+  // Show LinkedIn done for 8s after completion, same for WhatsApp.
+  if (li && li.done && Date.now() - syncToastLiLastDone < 8000) {
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = li.label || 'LinkedIn sync complete'; fill.style.width = '100%'; return;
+  }
+  if (li && li.done && !syncToastLiLastDone) {
+    syncToastLiLastDone = Date.now();
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = li.label || 'LinkedIn sync complete'; fill.style.width = '100%';
+    setTimeout(() => { toast.style.display = 'none'; }, 8000);
+    return;
+  }
+  if (wa && wa.done && Date.now() - syncToastLastDoneAt < 8000) {
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = wa.label || 'WhatsApp sync complete'; fill.style.width = '100%'; return;
+  }
+  if (wa && wa.done && !syncToastLastDoneAt) {
+    syncToastLastDoneAt = Date.now();
+    toast.classList.add('success'); toast.style.display = 'flex';
+    text.textContent = wa.label || 'WhatsApp sync complete'; fill.style.width = '100%';
+    setTimeout(() => { toast.style.display = 'none'; }, 8000);
+    return;
+  }
+  toast.style.display = 'none';
+}
+
+// ============================================================
+// Command palette (Cmd/Ctrl+K)
+// ============================================================
+let paletteResults = [];
+let paletteActiveIdx = 0;
+let paletteDebounce = null;
+
+function openPalette() {
+  const o = document.getElementById('palette-overlay');
+  if (!o) return;
+  o.classList.add('open');
+  const input = document.getElementById('palette-input');
+  input.value = '';
+  paletteActiveIdx = 0;
+  paletteQuery('');
+  setTimeout(() => { input.focus(); input.select(); }, 10);
+}
+
+function closePalette() {
+  document.getElementById('palette-overlay')?.classList.remove('open');
+}
+
+async function paletteQuery(q) {
+  try {
+    const r = await fetch(BASE + '/api/palette?q=' + encodeURIComponent(q));
+    if (!r.ok) return;
+    const data = await r.json();
+    paletteResults = data.results || [];
+    paletteActiveIdx = 0;
+    renderPalette();
+  } catch {}
+}
+
+function renderPalette() {
+  const el = document.getElementById('palette-results');
+  if (!el) return;
+  if (paletteResults.length === 0) {
+    el.innerHTML = '<div class="palette-empty">No matches yet — try a name, company, or message snippet.</div>';
+    return;
+  }
+  // Group by type for display
+  const order = ['contact', 'conversation', 'goal', 'company', 'nav'];
+  const labels = { contact: 'People', conversation: 'In conversations', goal: 'Goals', company: 'Companies', nav: 'Go to' };
+  const groups = {};
+  paletteResults.forEach((r, i) => {
+    if (!groups[r.type]) groups[r.type] = [];
+    groups[r.type].push({ ...r, _idx: i });
+  });
+  const parts = [];
+  for (const key of order) {
+    if (!groups[key]) continue;
+    parts.push('<div class="palette-group"><div class="palette-group-label">' + labels[key] + '</div>');
+    for (const r of groups[key]) {
+      parts.push(paletteItemHtml(r));
+    }
+    parts.push('</div>');
+  }
+  el.innerHTML = parts.join('');
+  paletteUpdateActive();
+}
+
+function paletteItemHtml(r) {
+  const active = r._idx === paletteActiveIdx ? ' active' : '';
+  const badge = r.type.charAt(0).toUpperCase() + r.type.slice(1);
+  const initials = (r.label || '?').split(/\\s+/).slice(0,2).map(s => s.charAt(0).toUpperCase()).join('');
+  const ring = r.type === 'contact' ? '<span class="palette-score-ring ' + tierFor(r.relationshipScore) + '"></span>' : '';
+  const avatar = r.type === 'contact' ? '<div class="palette-item-avatar">' + escapeHtml(initials) + '</div>' : '<div class="palette-item-avatar" style="background:linear-gradient(135deg,#1e2d45,#4b5563)">·</div>';
+  return '<div class="palette-item' + active + '" data-idx="' + r._idx + '" onclick="paletteSelect(' + r._idx + ')">'
+    + avatar
+    + ring
+    + '<div class="palette-item-body">'
+    + '<div class="palette-item-title">' + escapeHtml(r.label || '') + '</div>'
+    + (r.sublabel ? '<div class="palette-item-sub">' + escapeHtml(r.sublabel) + '</div>' : '')
+    + '</div>'
+    + '<span class="palette-item-type">' + badge + '</span>'
+    + '</div>';
+}
+
+function tierFor(score) {
+  if (score == null) return 'none';
+  if (score >= 70) return 'strong';
+  if (score >= 40) return 'good';
+  if (score >= 20) return 'warm';
+  if (score > 0)   return 'fading';
+  return 'none';
+}
+
+function escapeHtml(s) {
+  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function paletteUpdateActive() {
+  document.querySelectorAll('.palette-item').forEach(el => {
+    el.classList.toggle('active', Number(el.getAttribute('data-idx')) === paletteActiveIdx);
+  });
+  const active = document.querySelector('.palette-item.active');
+  if (active) active.scrollIntoView({ block: 'nearest' });
+}
+
+function paletteSelect(idx) {
+  const r = paletteResults[idx];
+  if (!r) return;
+  closePalette();
+  if (r.type === 'nav') { showView(r.action); return; }
+  if (r.type === 'contact') { showContact(r.id); return; }
+  if (r.type === 'conversation') {
+    if (r.contactId) showContact(r.contactId);
+    return;
+  }
+  if (r.type === 'goal') {
+    showView('today');
+    return;
+  }
+  if (r.type === 'company') {
+    // Jump to Ask prefilled with "at <company>"
+    showView('ask');
+    const input = document.getElementById('ask-input');
+    if (input) { input.value = 'at ' + r.name; input.focus(); }
+    return;
+  }
+}
+
+document.addEventListener('keydown', (e) => {
+  const isOpen = document.getElementById('palette-overlay')?.classList.contains('open');
+  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+    e.preventDefault(); isOpen ? closePalette() : openPalette(); return;
+  }
+  if (!isOpen) return;
+  if (e.key === 'Escape') { e.preventDefault(); closePalette(); return; }
+  if (e.key === 'ArrowDown') {
+    e.preventDefault();
+    if (paletteResults.length === 0) return;
+    paletteActiveIdx = (paletteActiveIdx + 1) % paletteResults.length;
+    paletteUpdateActive(); return;
+  }
+  if (e.key === 'ArrowUp') {
+    e.preventDefault();
+    if (paletteResults.length === 0) return;
+    paletteActiveIdx = (paletteActiveIdx - 1 + paletteResults.length) % paletteResults.length;
+    paletteUpdateActive(); return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    paletteSelect(paletteActiveIdx); return;
+  }
+});
+
+document.addEventListener('click', (e) => {
+  const overlay = document.getElementById('palette-overlay');
+  if (!overlay?.classList.contains('open')) return;
+  if (e.target === overlay) closePalette();
+});
+
+function wirePaletteInput() {
+  const input = document.getElementById('palette-input');
+  if (!input) return;
+  input.addEventListener('input', () => {
+    clearTimeout(paletteDebounce);
+    const q = input.value;
+    paletteDebounce = setTimeout(() => paletteQuery(q), 80);
+  });
 }
 
 // ============================================================
@@ -5359,6 +5704,9 @@ async function init() {
     pollSyncToast();
     syncToastPoller = setInterval(pollSyncToast, 2000);
   }
+  // Notification banners (re-auth, etc.) — poll every 30s
+  pollNotifications();
+  setInterval(pollNotifications, 30 * 1000);
 
   // Load contacts in background and populate People view when ready
   const listEl = document.getElementById('contact-list');
@@ -8104,11 +8452,12 @@ function renderMentionsInline(text) {
 // HTML-decodes the attribute before the JS parser sees it, so we JS-escape
 // first, then HTML-escape. esc() alone is NOT safe in this position.
 function jsAttr(s) {
-  // This function is embedded inside a template literal in server.js's HTML,
-  // so every \\ halves to a \ at render time. We need the *rendered* JS to
-  // contain: .replace(/\\/g, '\\\\'); i.e. source requires 4 backslashes to
-  // output 2. Same for \\r and \\n. Tested by parsing the served HTML's
-  // inline script with new Function() — must succeed without SyntaxError.
+  // NOTE: this whole <script> is inside the server-side \`const HTML = \\\`...\\\`\`
+  // template literal. Every \\ in THIS source is halved by Node before the
+  // browser sees it. So to produce a browser-visible regex \\\\ (matching one
+  // backslash) we need \\\\\\\\ in source; to produce a browser-visible string
+  // \\\\\\\\ (two backslashes) we need \\\\\\\\\\\\\\\\ in source. Same for \\r / \\n.
+  // Tested by tests/unit/ui-js-syntax.test.js parsing served HTML inline JS.
   const jsEscaped = String(s||'')
     .replace(/\\\\/g, '\\\\\\\\')
     .replace(/'/g, "\\\\'")

@@ -109,8 +109,10 @@ client.on('ready', async () => {
     console.log(`Found ${chats.length} chats. Exporting...`);
 
     const firstRun = Object.keys(existingChats).length === 0 && !lastExportUnix;
-    const fetchLimit = firstRun ? 50 : 2000;
-    if (firstRun) console.log(`First run — using ${fetchLimit} msgs/chat. Re-run later to backfill more.`);
+    // Pull every locally-available message per chat. WhatsApp Web's IndexedDB
+    // is the real ceiling — we just stop capping below that.
+    const fetchLimit = Infinity;
+    if (firstRun) console.log('First run — fetching all locally-available messages per chat. Big accounts can take a while.');
 
     const result = { ...existingChats };
     let totalMsgs = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);

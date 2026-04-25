@@ -308,7 +308,12 @@ test('cross-process: child holds lock, parent gets ELOCKED, succeeds after child
     }
 });
 
-test('cross-process: child dies ungracefully, parent steals stale lock', async () => {
+// SIGKILL doesn't cross-process the same way on Windows — spawn() there
+// doesn't surface a 'SIGKILL' signal name on ungraceful termination. The
+// underlying steal-on-dead-PID behavior still works on Windows (tested
+// via the pure-function isStale path above); this cross-process helper
+// test is POSIX-specific.
+test('cross-process: child dies ungracefully, parent steals stale lock', { skip: process.platform === 'win32' }, async () => {
     const p = tmpLockPath();
     try {
         const { ready, exited } = spawnChild(p, 'die');

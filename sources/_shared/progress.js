@@ -180,9 +180,22 @@ function clearProgress(dataDir, source) {
     }
 }
 
+// A live import ticks updatedAt every few seconds. Anything older is from a
+// process that died/was killed mid-sync, not actually running.
+const STALE_AFTER_MS = 2 * 60 * 1000;
+
+function isStale(record, now = Date.now()) {
+    if (!record || !record.updatedAt) return false;
+    const t = Date.parse(record.updatedAt);
+    if (Number.isNaN(t)) return false;
+    return (now - t) > STALE_AFTER_MS;
+}
+
 function isActive(record) {
     if (!record) return false;
-    return record.step !== 'done' && record.step !== 'error';
+    if (record.step === 'done' || record.step === 'error') return false;
+    if (isStale(record)) return false;
+    return true;
 }
 
 function percent(record) {
@@ -227,6 +240,8 @@ module.exports = {
     listProgress,
     listActive,
     isActive,
+    isStale,
+    STALE_AFTER_MS,
     percent,
     buildPayload, // exposed for tests
 };

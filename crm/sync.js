@@ -18,11 +18,12 @@ const fs = require('fs');
 const path = require('path');
 const https = require('https');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 
 const { fetchCalendarEvents, processMeetings } = require('./calendar');
+const notifications = require('./notifications');
 
 // ---------------------------------------------------------------------------
 // Pure functions (exported for testing)
@@ -843,6 +844,68 @@ function startSyncDaemon(uuid, userDataDir) {
         pollCalendar().catch(e => console.error('[sync] Calendar initial poll error:', e.message));
     }, 45 * 1000);
     cleanups.push(() => clearTimeout(calendarInitial));
+
+    // ── LinkedIn periodic auto-sync (opt-in via MINTY_LINKEDIN_AUTOSYNC=1) ─
+
+    const LINKEDIN_AUTO_POLL_MS = 24 * 60 * 60 * 1000; // 24h
+    if (process.env.MINTY_LINKEDIN_AUTOSYNC === '1') {
+        let liChild = null;
+
+        function runLinkedInSync(reason) {
+            if (liChild) return;
+            if (notifications.isPaused(userDataDir, 'linkedin')) return;
+
+            const s = loadSyncState(statePath);
+            // Don't re-fetch if we synced very recently (boot kick guard)
+            if (reason === 'boot' && s.linkedin?.lastSyncAt
+                && !isStale(s.linkedin.lastSyncAt, LINKEDIN_AUTO_POLL_MS - 5 * 60 * 1000)) {
+                return;
+            }
+
+            console.log(`[autosync] LinkedIn: spawning fetch.js (${reason})`);
+            liChild = spawn(process.execPath, ['sources/linkedin/fetch.js'], {
+                cwd: ROOT,
+                env: { ...process.env, MINTY_LINKEDIN_AUTOSYNC: '1' },
+                stdio: ['ignore', 'pipe', 'pipe'],
+            });
+
+            let stderr = '';
+            liChild.stderr.on('data', d => { stderr += String(d); process.stderr.write(d); });
+            liChild.stdout.on('data', d => process.stdout.write(d));
+
+            liChild.on('exit', (code) => {
+                liChild = null;
+                if (code === 0) {
+                    const s2 = loadSyncState(statePath);
+                    s2.linkedin = { ...(s2.linkedin || {}), status: 'ok', lastSyncAt: new Date().toISOString() };
+                    saveSyncState(statePath, s2);
+                    notifications.dismiss(userDataDir, 'linkedin');
+                    console.log('[autosync] LinkedIn: complete');
+                } else {
+                    const looksLikeAuth = /session|auth|expired|login|sign[-\s]?in|cookie/i.test(stderr);
+                    if (looksLikeAuth) {
+                        notifications.set(userDataDir, 'linkedin', {
+                            needsReauth: true,
+                            pauseSync: true,
+                            message: 'LinkedIn session expired — run `MINTY_LINKEDIN_AUTOSYNC=1 npm run linkedin:connect` to re-auth.',
+                        });
+                    }
+                    const s2 = loadSyncState(statePath);
+                    s2.linkedin = { ...(s2.linkedin || {}), status: 'error', lastErrorAt: new Date().toISOString() };
+                    saveSyncState(statePath, s2);
+                    console.error(`[autosync] LinkedIn: exit ${code}${looksLikeAuth ? ' (auth banner posted)' : ''}`);
+                }
+            });
+        }
+
+        const liInterval = setInterval(() => runLinkedInSync('tick'), LINKEDIN_AUTO_POLL_MS);
+        cleanups.push(() => clearInterval(liInterval));
+
+        const liInitial = setTimeout(() => runLinkedInSync('boot'), 90 * 1000);
+        cleanups.push(() => clearTimeout(liInitial));
+
+        cleanups.push(() => { if (liChild) liChild.kill('SIGTERM'); });
+    }
 
     console.log(`[sync] Daemon started for user ${uuid}`);
 

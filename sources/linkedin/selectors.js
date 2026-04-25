@@ -127,6 +127,20 @@ const MESSAGING_INBOX = {
         'p.msg-overlay-list-bubble__message-snippet',
     ],
 
+    // Timestamp shown next to each conversation on the inbox. Usually relative
+    // ("2h", "Yesterday", "Jan 15") in visible text, with an ISO datetime in a
+    // `title` or `datetime` attribute on a <time> element. We read the ISO
+    // when available and use it to skip threads unchanged since lastSync. If
+    // no ISO is present, we scrape the thread (safe fallback).
+    threadTimestampIso: [
+        'time[datetime]',
+        'time[title]',
+    ],
+    threadTimestampText: [
+        '.msg-conversation-card__time-stamp',
+        'time',
+    ],
+
     // Tabs — inbox / archived / unread / InMail. We use the tab label to
     // populate the FOLDER column.
     folderTab: [
@@ -138,6 +152,13 @@ const MESSAGING_INBOX = {
 // /messaging/thread/<id>/
 const MESSAGE_THREAD = {
     urlTemplate: 'https://www.linkedin.com/messaging/thread/{id}/',
+
+    // The scrollable container that holds all bubbles. Used by the adaptive
+    // scroll loop to scroll-to-top and trigger history loading.
+    messageListContainer: [
+        '.msg-s-message-list',
+        'ul.msg-s-message-list-content',
+    ],
 
     // Each message bubble in a thread. drift sentinel.
     messageBubble: [
@@ -200,9 +221,76 @@ const MESSAGE_THREAD = {
     ],
 };
 
+// /login and related auth flows. Used by connect.js auto-login mode.
+const LOGIN = {
+    url: 'https://www.linkedin.com/login',
+
+    // Email / username field on the classic login form.
+    emailInput: [
+        '#username',
+        'input[name="session_key"]',
+        'input[autocomplete="username"]',
+    ],
+
+    // Password field.
+    passwordInput: [
+        '#password',
+        'input[name="session_password"]',
+        'input[autocomplete="current-password"]',
+    ],
+
+    // Submit button on the email+password form.
+    submitButton: [
+        'button[type="submit"][aria-label*="Sign in"]',
+        'button[type="submit"].btn__primary--large',
+        'button[type="submit"]',
+    ],
+
+    // URL patterns that indicate a successful login landing page.
+    successUrlPatterns: [
+        '/feed',
+        '/mynetwork',
+        '/in/', // profile page
+    ],
+};
+
+// Two-step verification / challenge interstitials. TOTP (authenticator-app)
+// only — SMS/email challenges require the user to read the code from their
+// phone and still need the manual flow.
+const CHALLENGE = {
+    // Pages/URLs that indicate a challenge is active.
+    urlPatterns: [
+        '/checkpoint/',
+        '/uas/consumer-login-submit',
+    ],
+
+    // TOTP code input. LinkedIn rotates the selector occasionally.
+    // First try the W3C standard attribute (autocomplete="one-time-code" is
+    // the spec'd hint for TOTP / SMS OTP inputs — browsers autofill from
+    // clipboard / SMS based on this). Falls through to LinkedIn-specific
+    // selectors, then narrow fallbacks that require 6-digit constraint.
+    totpInput: [
+        'input[autocomplete="one-time-code"]',
+        'input[name="pin"]',
+        '#input__email_verification_pin',
+        'input[aria-label*="verification code" i]',
+        // Narrowed fallback: inputmode="numeric" is common on phone-number
+        // and CAPTCHA fields too. Requiring maxlength=6 picks up TOTP-shaped
+        // inputs only.
+        'input[inputmode="numeric"][maxlength="6"]',
+    ],
+
+    totpSubmit: [
+        'button[type="submit"][data-litms-control-urn*="verify"]',
+        'button[type="submit"]',
+    ],
+};
+
 module.exports = {
     CONNECTIONS_LIST,
     CONTACT_INFO_MODAL,
     MESSAGING_INBOX,
     MESSAGE_THREAD,
+    LOGIN,
+    CHALLENGE,
 };
