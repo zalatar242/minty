@@ -2403,7 +2403,11 @@ function handleWhatsappStatus(req, res, params, paths, uuid) {
 function handleWhatsappProgress(req, res, params, paths, uuid) {
     const session = waClients[uuid];
     const progress = session?.progress || readExportProgress(uuid);
-    const active = !!progress && progress.step !== 'done';
+    const live = !!session;
+    const active = !!progress
+        && progress.step !== 'done'
+        && progress.step !== 'error'
+        && (live || !sourceProgress.isStale(progress));
     json(res, { active, progress: progress || null });
 }
 
