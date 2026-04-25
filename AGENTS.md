@@ -61,9 +61,11 @@ This means AI work happens once per scheduled run, and the product stays free to
 
 1. **Write tests** for every new pure function (in `tests/unit/`) and every new API route (integration test if applicable)
 2. **Run `npm test`** again — ALL tests must pass before committing. If a test fails, fix the code, not the test (unless the test itself is wrong)
-3. **Verify the UI** — no JS errors in the browser console, API returns sensible data
-4. **Commit with a clear message**: `feat: [description]`, `fix: [description]`, `refactor: [description]`
-5. **One PR = one topic.** Bundled PRs get closed (see CONTRIBUTING.md)
+3. **Run `npm run test:e2e`** if you touched routes, the SPA, or anything user-facing. Smokes live in `tests/e2e/` and seed `data-e2e/` automatically. Six smokes should pass in ~2s.
+4. **Verify the UI** — no JS errors in the browser console, API returns sensible data. The Chrome DevTools MCP is wired in `.mcp.json`, so you can ask the agent to drive a real browser instead of guessing.
+5. **Commit with a clear message**: `feat: [description]`, `fix: [description]`, `refactor: [description]`
+6. **One PR = one topic.** Bundled PRs get closed (see CONTRIBUTING.md)
+7. **Push runs preflight automatically** (lint + unit + e2e) via `.githooks/pre-push`. Bypass with `--no-verify` only when you have a reason.
 
 ---
 
