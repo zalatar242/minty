@@ -21,6 +21,7 @@ const {
 } = require('./people-graph');
 const sourceProgress = require('../sources/_shared/progress');
 const notifications = require('./notifications');
+const userConfig = require('./config');
 const observability = require('./observability');
 
 observability.init();
@@ -1363,7 +1364,47 @@ function handleGetSettings(_req, res) {
         demo: { dir: demoDir, ...stat(demoDir) },
         real: { dir: realDir, ...stat(realDir) },
         envOverride: !!(process.env.CRM_DATA_DIR || process.env.MINTY_DEMO),
+        runtimeConfig: userConfig.getRedactedConfig(DATA),
+        playwrightAvailable: linkedInPlaywrightAvailable(),
     });
+}
+
+/**
+ * POST /api/settings/linkedin-autosync  { enabled: boolean }
+ * Persists to data/config.json and immediately fires a manual run if turning
+ * on (so the user doesn't wait 90s for the boot kick to elapse).
+ */
+async function handleSetLinkedinAutosync(req, res) {
+    if (userConfig.envForces('linkedinAutosync')) {
+        return json(res, { error: 'MINTY_LINKEDIN_AUTOSYNC env var is set — unset it to control from the UI' }, 409);
+    }
+    const body_ = await body(req);
+    const enabled = !!(body_ && body_.enabled);
+    userConfig.updateConfig(DATA, { linkedinAutosync: enabled });
+    if (enabled) {
+        try { syncDaemons[SINGLE_USER_UUID]?.triggerLinkedInSync?.(); }
+        catch (e) { console.error('[settings] LinkedIn manual trigger failed:', e.message); }
+    }
+    json(res, { ok: true, enabled, runtimeConfig: userConfig.getRedactedConfig(DATA) });
+}
+
+/**
+ * POST /api/settings/oauth  { provider: 'google'|'microsoft', clientId, clientSecret? }
+ * clientSecret is optional — omit to keep the previously-set value.
+ */
+async function handleSetOAuthConfig(req, res) {
+    const body_ = await body(req);
+    const provider = body_ && body_.provider;
+    if (!['google', 'microsoft'].includes(provider)) {
+        return json(res, { error: 'provider must be "google" or "microsoft"' }, 400);
+    }
+    const patch = { [provider]: {} };
+    if (typeof body_.clientId === 'string') patch[provider].clientId = body_.clientId.trim();
+    if (typeof body_.clientSecret === 'string' && body_.clientSecret.length > 0) {
+        patch[provider].clientSecret = body_.clientSecret;
+    }
+    userConfig.updateConfig(DATA, patch);
+    json(res, { ok: true, runtimeConfig: userConfig.getRedactedConfig(DATA) });
 }
 
 /**
@@ -1793,14 +1834,14 @@ function handleGetSources(req, res, params, paths, uuid) {
         result[s] = sourceMeta;
     }
     // Also indicate whether Google OAuth is configured
-    result._googleOAuthEnabled = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+    result._googleOAuthEnabled = !!(userConfig.getGoogleClient(DATA).id && userConfig.getGoogleClient(DATA).secret);
     result._microsoftOAuthEnabled = !!(process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_CLIENT_SECRET);
-    result._linkedinAutoSyncEnabled = LINKEDIN_AUTOSYNC_ENABLED;
+    result._linkedinAutoSyncEnabled = linkedinAutosyncEnabled();
     // Include playwrightAvailable so the SPA can show "install needed" hints
     // without polling /api/linkedin/status separately. Fixes the pwMissing
     // logic in renderSourceForm that was always falsy because this field was
     // only populated by /api/linkedin/status, not by /api/sources.
-    result._linkedin = LINKEDIN_AUTOSYNC_ENABLED
+    result._linkedin = linkedinAutosyncEnabled()
         ? { ...readLinkedInState(), playwrightAvailable: linkedInPlaywrightAvailable() }
         : { status: 'disconnected', playwrightAvailable: false };
     json(res, result);
@@ -1953,12 +1994,12 @@ function httpsGet(hostname, path, token) {
 async function handleEmailDeviceStart(req, res, params, paths, uuid) {
     const { provider } = await body(req);
     if (provider === 'google') {
-        if (!process.env.GOOGLE_CLIENT_ID) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
+        if (!userConfig.getGoogleClient(DATA).id) return json(res, { error: 'Google OAuth client ID not set — open Settings to configure' }, 400);
         const state = crypto.randomBytes(16).toString('hex');
         pendingOAuth[state] = { uuid, expiresAt: Date.now() + 10 * 60 * 1000, purpose: 'gmail' };
         res.setHeader('Set-Cookie', `oauth_state=${state}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600`);
         const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-            client_id: process.env.GOOGLE_CLIENT_ID,
+            client_id: userConfig.getGoogleClient(DATA).id,
             redirect_uri: oauthCallbackUrl(req),
             response_type: 'code',
             scope: 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email',
@@ -1993,8 +2034,8 @@ async function handleEmailDevicePoll(req, res, params, paths, uuid) {
     try {
         if (provider === 'google') {
             tokens = await httpsPost('oauth2.googleapis.com', '/token',
-                new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID,
-                    client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                new URLSearchParams({ client_id: userConfig.getGoogleClient(DATA).id,
+                    client_secret: userConfig.getGoogleClient(DATA).secret,
                     device_code: flow.device_code,
                     grant_type: 'urn:ietf:params:oauth:grant-type:device_code' }).toString());
         } else {
@@ -2077,12 +2118,12 @@ async function handleEmailDevicePoll(req, res, params, paths, uuid) {
 }
 
 async function handleGoogleContactsOAuthStart(req, res, params, paths, uuid) {
-    if (!process.env.GOOGLE_CLIENT_ID) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
+    if (!userConfig.getGoogleClient(DATA).id) return json(res, { error: 'Google OAuth client ID not set — open Settings to configure' }, 400);
     const state = crypto.randomBytes(16).toString('hex');
     pendingOAuth[state] = { uuid, expiresAt: Date.now() + 10 * 60 * 1000, purpose: 'google-contacts' };
     res.setHeader('Set-Cookie', `oauth_state=${state}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600`);
     const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_id: userConfig.getGoogleClient(DATA).id,
         redirect_uri: oauthCallbackUrl(req),
         response_type: 'code',
         scope: 'https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/userinfo.email',
@@ -2166,8 +2207,8 @@ async function handleOAuthCallback(req, res) {
     try {
         tokens = await httpsPost('oauth2.googleapis.com', '/token',
             new URLSearchParams({
-                client_id: process.env.GOOGLE_CLIENT_ID,
-                client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                client_id: userConfig.getGoogleClient(DATA).id,
+                client_secret: userConfig.getGoogleClient(DATA).secret,
                 code,
                 redirect_uri: oauthCallbackUrl(req),
                 grant_type: 'authorization_code',
@@ -2277,14 +2318,14 @@ async function handleSyncGoogleContacts(req, res, params, paths, uuid) {
     const googleAcc = accounts.find(a => a.provider === 'google' && a.refreshToken);
     if (!googleAcc) return json(res, { error: 'No connected Google account. Connect Gmail first.', needs_reauth: true }, 400);
 
-    if (!process.env.GOOGLE_CLIENT_ID) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
+    if (!userConfig.getGoogleClient(DATA).id) return json(res, { error: 'Google OAuth client ID not set — open Settings to configure' }, 400);
 
     // Refresh the access token
     let tokens;
     try {
         tokens = await httpsPost('oauth2.googleapis.com', '/token',
-            new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID,
-                client_secret: process.env.GOOGLE_CLIENT_SECRET,
+            new URLSearchParams({ client_id: userConfig.getGoogleClient(DATA).id,
+                client_secret: userConfig.getGoogleClient(DATA).secret,
                 refresh_token: googleAcc.refreshToken,
                 grant_type: 'refresh_token' }).toString());
     } catch (e) {
@@ -3293,7 +3334,10 @@ async function handleNetworkQuery(req, res, _params, paths) {
 // also enforce Origin/Sec-Fetch-Site (via sources/linkedin/origin-check.js) to
 // prevent a drive-by webpage from spawning a Chromium process on the user's machine.
 
-const LINKEDIN_AUTOSYNC_ENABLED = process.env.MINTY_LINKEDIN_AUTOSYNC === '1';
+// Now a runtime check (was a const) so the Settings UI toggle takes effect
+// without a server restart. Routes registered below still ignore POSTs when
+// the flag is off — see linkedinAutosyncEnabled() at each handler entry.
+function linkedinAutosyncEnabled() { return userConfig.isLinkedInAutosyncEnabled(DATA); }
 
 function readLinkedInState() {
     try {
@@ -3307,7 +3351,7 @@ function linkedInPlaywrightAvailable() {
 }
 
 function linkedInGate(req, res) {
-    if (!LINKEDIN_AUTOSYNC_ENABLED) { res.writeHead(404); res.end('not found'); return false; }
+    if (!linkedinAutosyncEnabled()) { res.writeHead(404); res.end('not found'); return false; }
     if (req.method === 'POST') {
         let originCheck;
         try {
@@ -3411,6 +3455,8 @@ const ROUTES = [
     ['GET',  /^\/api\/settings$/,                        handleGetSettings],
     ['POST', /^\/api\/settings\/mode$/,                  handleSetMode],
     ['POST', /^\/api\/settings\/seed-demo$/,             handleSeedDemo],
+    ['POST', /^\/api\/settings\/linkedin-autosync$/,     handleSetLinkedinAutosync],
+    ['POST', /^\/api\/settings\/oauth$/,                 handleSetOAuthConfig],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -8637,6 +8683,9 @@ function renderSettings(s) {
       </div>
     </div>
 
+    \${renderLinkedinAutosyncCard(s)}
+    \${renderGoogleOAuthCard(s)}
+
     <div class="settings-card">
       <div class="settings-card-title">About</div>
       <div class="settings-row"><div class="settings-row-label">Version</div><div class="settings-row-value">\${esc(s.dataDir.split('/').pop())} · v\${esc((window.__BASE__ || '') || 'dev')}</div></div>
@@ -8647,6 +8696,96 @@ function renderSettings(s) {
       </div>
     </div>
   \`;
+}
+
+function renderLinkedinAutosyncCard(s) {
+  const cfg = s.runtimeConfig || {};
+  const enabled = !!cfg.linkedinAutosync;
+  const envForced = !!cfg.envForces?.linkedinAutosync;
+  const pwAvailable = !!s.playwrightAvailable;
+
+  const badge = enabled
+    ? '<span class="settings-mode-badge real">enabled</span>'
+    : '<span class="settings-mode-badge demo">disabled</span>';
+
+  const envNote = envForced
+    ? '<div class="settings-note settings-note-warn">MINTY_LINKEDIN_AUTOSYNC env var is set — unset it to control from the UI.</div>'
+    : '';
+
+  const pwNote = !pwAvailable
+    ? '<div class="settings-note settings-note-warn">Playwright not installed — run <code>npm run linkedin:setup</code> in your terminal first.</div>'
+    : '';
+
+  const blocked = envForced || !pwAvailable;
+  const action = enabled
+    ? '<button class="settings-btn settings-btn-secondary" onclick="setLinkedinAutosync(false)">Disable</button>'
+    : '<button class="settings-btn" onclick="setLinkedinAutosync(true)"' + (blocked ? ' disabled' : '') + '>Enable</button>';
+
+  return \`
+    <div class="settings-card">
+      <div class="settings-card-title">LinkedIn auto-sync</div>
+      <div class="settings-row">
+        <div class="settings-row-label">Status</div>
+        <div class="settings-row-value">\${badge}</div>
+      </div>
+      <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
+        Pulls connections + messages on a 24h schedule via a headless browser.
+        Experimental and ToS-adjacent. Requires <code>npm run linkedin:connect</code>
+        once to authenticate.
+      </div>
+      \${pwNote}
+      \${envNote}
+      <div class="settings-actions">\${action}</div>
+    </div>
+  \`;
+}
+
+function renderGoogleOAuthCard(s) {
+  const c = s.runtimeConfig?.google || {};
+  const envIdForced = !!s.runtimeConfig?.envForces?.google?.clientId;
+  const envSecretForced = !!s.runtimeConfig?.envForces?.google?.clientSecret;
+  const idVal = c.clientId ? esc(c.clientId) : '';
+  const secretPlaceholder = c.clientSecretSet ? c.clientSecretMasked : '';
+  return \`
+    <div class="settings-card">
+      <div class="settings-card-title">Google OAuth (Gmail · Calendar · Contacts)</div>
+      <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px">
+        <label style="font-size:11px;color:var(--text-muted)">Client ID \${envIdForced ? '<span style="color:#b45309">(set via env)</span>' : ''}</label>
+        <input id="g-client-id" type="text" value="\${idVal}" \${envIdForced ? 'disabled' : ''} placeholder="123-abc.apps.googleusercontent.com" style="padding:8px 10px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:6px;font-size:12px;font-family:monospace">
+      </div>
+      <div class="settings-row" style="flex-direction:column;align-items:stretch;gap:6px">
+        <label style="font-size:11px;color:var(--text-muted)">Client Secret \${envSecretForced ? '<span style="color:#b45309">(set via env)</span>' : ''}</label>
+        <input id="g-client-secret" type="password" placeholder="\${secretPlaceholder || 'GOCSPX-…'}" \${envSecretForced ? 'disabled' : ''} style="padding:8px 10px;border:1px solid var(--border);background:var(--bg);color:var(--text);border-radius:6px;font-size:12px;font-family:monospace">
+      </div>
+      <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
+        Get credentials from <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Google Cloud Console → Credentials</a>.
+        Leave secret blank to keep the previously-saved value.
+      </div>
+      <div class="settings-actions">
+        <button class="settings-btn" onclick="saveGoogleOAuth()" \${envIdForced && envSecretForced ? 'disabled' : ''}>Save</button>
+      </div>
+    </div>
+  \`;
+}
+
+async function setLinkedinAutosync(enabled) {
+  const r = await fetch(BASE + '/api/settings/linkedin-autosync', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  }).then(r => r.json());
+  if (r.error) { alert(r.error); return; }
+  loadSettings();
+}
+
+async function saveGoogleOAuth() {
+  const clientId = document.getElementById('g-client-id')?.value.trim();
+  const clientSecret = document.getElementById('g-client-secret')?.value;
+  const r = await fetch(BASE + '/api/settings/oauth', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ provider: 'google', clientId, clientSecret }),
+  }).then(r => r.json());
+  if (r.error) { alert(r.error); return; }
+  loadSettings();
 }
 
 async function setMode(mode) {
