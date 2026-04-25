@@ -4,6 +4,7 @@ A rolling log of open-source-quality improvements made by an autonomous loop whi
 
 ## Shipped
 
+- **2026-04-25** — Added `.github/dependabot.yml` (weekly, grouped minor+patch into one PR, low PR cap). Borrowed grouping pattern from Plausible/analytics + Standard Notes — keeps the review burden sane for a solo maintainer.
 - **2026-04-25** — Added `ARCHITECTURE.md` so newcomers can orient in <10 min. Borrowed structure from [matklad's "ARCHITECTURE.md" pattern](https://matklad.github.io/2021/02/06/ARCHITECTURE.md.html) (bird's-eye → map of code → data flow → invariants → glossary), tailored to Minty's actual layout.
 
 ## Needs user (human judgment / GitHub UI)

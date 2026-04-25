@@ -1,0 +1,56 @@
+# Dependabot — keep deps current with low review burden for a solo maintainer.
+# Grouping pattern borrowed from Plausible/analytics + Standard Notes (low
+# open-PR cap, direct-deps only, weekly cadence).
+#
+# https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+
+updates:
+  # Application dependencies (root package.json).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    allow:
+      - dependency-type: "direct"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      # Roll up all minor + patch upgrades into ONE PR per week.
+      # Majors stay as individual PRs for human review.
+      minor-and-patch:
+        applies-to: version-updates
+        update-types:
+          - "minor"
+          - "patch"
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # GitHub Actions used by the workflows in .github/workflows/.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns:
+          - "*"
