@@ -9067,9 +9067,19 @@ function renderSourceForm(key, status, connected) {
       + '<button class="source-btn secondary" style="width:100%" onclick="document.getElementById(\\'file-linkedin\\').click()">Choose file — Connections.csv, messages.csv, Invitations.csv</button>'
       + '<label class="drop-zone" id="dz-linkedin" ondragover="dzOver(event,\\'linkedin\\')" ondragleave="dzLeave(\\'linkedin\\')" ondrop="dzDrop(event,\\'linkedin\\')" style="margin-top:6px;padding:10px;font-size:0.72rem">or drop here</label>'
       + '<div class="source-log" id="log-linkedin"></div>';
-    const footer = !autoEnabled ? '' : pwMissing
-      ? '<div style="margin-top:10px;font-size:0.7rem;color:#8892a4">Auto-sync needs Playwright. Run <code>npm run linkedin:setup</code> in your terminal.</div>'
-      : '<div style="margin-top:10px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();connectLinkedIn()" style="color:#6366f1">Enable auto-sync (experimental — ToS-adjacent, see README)</a></div>';
+    let footer;
+    if (!autoEnabled) {
+      // Most-discoverable state: ZIP upload is shown, but tell the user the
+      // browser-based auto-sync alternative exists and where to enable it.
+      footer = '<div style="margin-top:10px;font-size:0.7rem;color:#8892a4">Prefer auto-sync via headless browser? <a href="#" onclick="event.preventDefault();showView(\\'settings\\')" style="color:#6366f1">Enable in Settings</a> (experimental — ToS-adjacent).</div>';
+    } else if (pwMissing) {
+      footer = '<div style="margin-top:10px;font-size:0.7rem;color:#8892a4">Auto-sync needs Playwright. Run <code>npm run linkedin:setup</code> in your terminal.</div>';
+    } else if (li.status === 'disconnected') {
+      // Auto-sync enabled but no session yet — guide to the connect flow.
+      footer = '<div style="margin-top:10px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();connectLinkedIn()" style="color:#6366f1">Connect via browser to start auto-sync</a></div>';
+    } else {
+      footer = '';
+    }
     el.innerHTML = zipBtn + footer;
     return;
   }
