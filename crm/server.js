@@ -2279,8 +2279,19 @@ const waClients = {}; // uuid -> { client, qr, status }
 const waSilentResume = new Set(); // uuids whose current init was auto-triggered (no UI watching)
 
 async function handleWhatsappStart(req, res, params, paths, uuid) {
-    if (waClients[uuid]?.status === 'ready') return json(res, { status: 'already_connected' });
-    if (waClients[uuid]?.status === 'qr_pending') return json(res, { status: 'qr_pending' });
+    const existing = waClients[uuid];
+    if (existing) {
+        const s = existing.status;
+        // Anything except a terminal failure short-circuits — a second
+        // client.initialize() against the same .wwebjs_auth would clash on
+        // Puppeteer's userDataDir SingletonLock and crash the running session.
+        if (s === 'ready') return json(res, { status: 'already_connected' });
+        if (s === 'qr_pending') return json(res, { status: 'qr_pending' });
+        if (s === 'initializing' || s === 'authenticated' || s === 'done') {
+            return json(res, { status: s });
+        }
+        // s === 'auth_failure' or 'error': fall through and re-init.
+    }
 
     let Client, LocalAuth;
     try {
