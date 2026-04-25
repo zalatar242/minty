@@ -4,6 +4,8 @@ A rolling log of open-source-quality improvements made by an autonomous loop whi
 
 ## Shipped
 
+- **2026-04-25** — Added `.github/CODEOWNERS` (solo maintainer for now) so review routing surfaces in the GitHub UI. Pattern is GitHub's stock CODEOWNERS recommendation.
+- **2026-04-25** — Added a "Supported versions" table to `SECURITY.md` (pre-1.0 latest-only policy). Pattern from Keep a Changelog ecosystem + GitHub's security-policy template.
 - **2026-04-25** — Deepened `CONTRIBUTING.md`: "Where to start" pointer to ARCHITECTURE.md, `good first issue` guidance, dev-setup with `core.hooksPath`, full Testing section listing every script. Pattern borrowed from Node.js core's CONTRIBUTING (concrete commands over prose) + Excalidraw (explicit "where to start" block).
 - **2026-04-25** — Added `.github/dependabot.yml` (weekly, grouped minor+patch into one PR, low PR cap). Borrowed grouping pattern from Plausible/analytics + Standard Notes — keeps the review burden sane for a solo maintainer.
 - **2026-04-25** — Added `ARCHITECTURE.md` so newcomers can orient in <10 min. Borrowed structure from [matklad's "ARCHITECTURE.md" pattern](https://matklad.github.io/2021/02/06/ARCHITECTURE.md.html) (bird's-eye → map of code → data flow → invariants → glossary), tailored to Minty's actual layout.

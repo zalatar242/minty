@@ -1,0 +1,7 @@
+# Code owners — auto-requests review from listed accounts on matching PRs.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+#
+# Solo maintainer for now. As the project picks up area-specific contributors,
+# split ownership per directory (e.g. importers).
+
+* @zalatar242

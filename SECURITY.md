@@ -1,5 +1,14 @@
 # Security Policy
 
+## Supported versions
+
+Security fixes are applied to the latest released `0.x` minor only. Pre-1.0, we don't backport — please update to the latest before reporting.
+
+| Version  | Supported          |
+|----------|--------------------|
+| 0.3.x    | :white_check_mark: |
+| < 0.3    | :x:                |
+
 ## Reporting a vulnerability
 
 **Please do not file public GitHub issues for security vulnerabilities.**
