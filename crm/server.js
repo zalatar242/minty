@@ -22,6 +22,7 @@ const {
 const sourceProgress = require('../sources/_shared/progress');
 const notifications = require('./notifications');
 const observability = require('./observability');
+const userConfig = require('./config');
 
 observability.init();
 
@@ -1312,11 +1313,11 @@ function handleGetSettings(_req, res) {
         real: { dir: realDir, ...stat(realDir) },
         envOverride: !!(process.env.CRM_DATA_DIR || process.env.MINTY_DEMO),
         linkedinAutosync: {
-            enabled: LINKEDIN_AUTOSYNC_ENABLED,
-            persisted: readPersistedLinkedInAutosync(),
+            enabled: isLinkedInAutosyncEnabled(),
             playwrightAvailable,
             envForced: process.env.MINTY_LINKEDIN_AUTOSYNC === '1',
         },
+        config: userConfig.getRedactedConfig(DATA),
     });
 }
 
@@ -1348,24 +1349,41 @@ async function handleSetMode(req, res) {
  */
 /**
  * POST /api/settings/linkedin-autosync  { enabled: boolean }
- * Persists the auto-sync flag to minty-mode.json. Server-side gating is
- * bound at boot (so the LinkedIn endpoints can stay closed when disabled),
- * which means a toggle requires a restart — surfaced clearly to the UI.
+ * Persists to data/config.json. Hot-reloaded — gating is now a runtime
+ * call (isLinkedInAutosyncEnabled), so the toggle takes effect immediately
+ * with no server restart required.
  */
 async function handleSetLinkedInAutosync(req, res) {
     const body_ = await body(req);
     const enabled = !!(body_ && body_.enabled);
-    let mode = {};
-    try { mode = JSON.parse(fs.readFileSync(MODE_FILE, 'utf8')) || {}; } catch { mode = {}; }
-    mode.linkedinAutosync = enabled;
-    mode.updatedAt = new Date().toISOString();
-    fs.writeFileSync(MODE_FILE, JSON.stringify(mode, null, 2));
+    userConfig.updateConfig(DATA, { linkedinAutosync: enabled });
     json(res, {
         ok: true,
         savedEnabled: enabled,
-        currentEnabled: LINKEDIN_AUTOSYNC_ENABLED,
-        restartRequired: enabled !== LINKEDIN_AUTOSYNC_ENABLED,
+        currentEnabled: isLinkedInAutosyncEnabled(),
+        restartRequired: false,
     });
+}
+
+/**
+ * POST /api/settings/oauth  { provider, clientId, clientSecret }
+ * Persists OAuth credentials for a provider (google or microsoft) into
+ * data/config.json. Hot-reloaded — Gmail / Google Contacts / Calendar
+ * connect flows pick up the new credentials on the next request.
+ */
+async function handleSetOAuth(req, res) {
+    const body_ = await body(req);
+    const provider = body_ && body_.provider;
+    if (!['google', 'microsoft'].includes(provider)) {
+        return json(res, { error: 'provider must be "google" or "microsoft"' }, 400);
+    }
+    const patch = { [provider]: {} };
+    if (typeof body_.clientId === 'string')     patch[provider].clientId = body_.clientId.trim();
+    if (typeof body_.clientSecret === 'string' && body_.clientSecret.trim()) {
+        patch[provider].clientSecret = body_.clientSecret.trim();
+    }
+    userConfig.updateConfig(DATA, patch);
+    json(res, { ok: true, config: userConfig.getRedactedConfig(DATA) });
 }
 
 async function handleSeedDemo(_req, res) {
@@ -1769,14 +1787,14 @@ function handleGetSources(req, res, params, paths, uuid) {
         result[s] = sourceMeta;
     }
     // Also indicate whether Google OAuth is configured
-    result._googleOAuthEnabled = !!(process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET);
+    result._googleOAuthEnabled = !!(userConfig.getGoogleClient(DATA).id && userConfig.getGoogleClient(DATA).secret);
     result._microsoftOAuthEnabled = !!(process.env.MICROSOFT_CLIENT_ID && process.env.MICROSOFT_CLIENT_SECRET);
-    result._linkedinAutoSyncEnabled = LINKEDIN_AUTOSYNC_ENABLED;
+    result._linkedinAutoSyncEnabled = isLinkedInAutosyncEnabled();
     // Include playwrightAvailable so the SPA can show "install needed" hints
     // without polling /api/linkedin/status separately. Fixes the pwMissing
     // logic in renderSourceForm that was always falsy because this field was
     // only populated by /api/linkedin/status, not by /api/sources.
-    result._linkedin = LINKEDIN_AUTOSYNC_ENABLED
+    result._linkedin = isLinkedInAutosyncEnabled()
         ? { ...readLinkedInState(), playwrightAvailable: linkedInPlaywrightAvailable() }
         : { status: 'disconnected', playwrightAvailable: false };
     json(res, result);
@@ -1929,12 +1947,12 @@ function httpsGet(hostname, path, token) {
 async function handleEmailDeviceStart(req, res, params, paths, uuid) {
     const { provider } = await body(req);
     if (provider === 'google') {
-        if (!process.env.GOOGLE_CLIENT_ID) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
+        if (!userConfig.getGoogleClient(DATA).id) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
         const state = crypto.randomBytes(16).toString('hex');
         pendingOAuth[state] = { uuid, expiresAt: Date.now() + 10 * 60 * 1000, purpose: 'gmail' };
         res.setHeader('Set-Cookie', `oauth_state=${state}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600`);
         const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-            client_id: process.env.GOOGLE_CLIENT_ID,
+            client_id: userConfig.getGoogleClient(DATA).id,
             redirect_uri: oauthCallbackUrl(req),
             response_type: 'code',
             scope: 'https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email',
@@ -1969,8 +1987,8 @@ async function handleEmailDevicePoll(req, res, params, paths, uuid) {
     try {
         if (provider === 'google') {
             tokens = await httpsPost('oauth2.googleapis.com', '/token',
-                new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID,
-                    client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                new URLSearchParams({ client_id: userConfig.getGoogleClient(DATA).id,
+                    client_secret: userConfig.getGoogleClient(DATA).secret,
                     device_code: flow.device_code,
                     grant_type: 'urn:ietf:params:oauth:grant-type:device_code' }).toString());
         } else {
@@ -2053,12 +2071,12 @@ async function handleEmailDevicePoll(req, res, params, paths, uuid) {
 }
 
 async function handleGoogleContactsOAuthStart(req, res, params, paths, uuid) {
-    if (!process.env.GOOGLE_CLIENT_ID) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
+    if (!userConfig.getGoogleClient(DATA).id) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
     const state = crypto.randomBytes(16).toString('hex');
     pendingOAuth[state] = { uuid, expiresAt: Date.now() + 10 * 60 * 1000, purpose: 'google-contacts' };
     res.setHeader('Set-Cookie', `oauth_state=${state}; HttpOnly; Path=/; SameSite=Lax; Max-Age=600`);
     const authUrl = 'https://accounts.google.com/o/oauth2/v2/auth?' + new URLSearchParams({
-        client_id: process.env.GOOGLE_CLIENT_ID,
+        client_id: userConfig.getGoogleClient(DATA).id,
         redirect_uri: oauthCallbackUrl(req),
         response_type: 'code',
         scope: 'https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/userinfo.email',
@@ -2142,8 +2160,8 @@ async function handleOAuthCallback(req, res) {
     try {
         tokens = await httpsPost('oauth2.googleapis.com', '/token',
             new URLSearchParams({
-                client_id: process.env.GOOGLE_CLIENT_ID,
-                client_secret: process.env.GOOGLE_CLIENT_SECRET,
+                client_id: userConfig.getGoogleClient(DATA).id,
+                client_secret: userConfig.getGoogleClient(DATA).secret,
                 code,
                 redirect_uri: oauthCallbackUrl(req),
                 grant_type: 'authorization_code',
@@ -2253,14 +2271,14 @@ async function handleSyncGoogleContacts(req, res, params, paths, uuid) {
     const googleAcc = accounts.find(a => a.provider === 'google' && a.refreshToken);
     if (!googleAcc) return json(res, { error: 'No connected Google account. Connect Gmail first.', needs_reauth: true }, 400);
 
-    if (!process.env.GOOGLE_CLIENT_ID) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
+    if (!userConfig.getGoogleClient(DATA).id) return json(res, { error: 'GOOGLE_CLIENT_ID not set' }, 400);
 
     // Refresh the access token
     let tokens;
     try {
         tokens = await httpsPost('oauth2.googleapis.com', '/token',
-            new URLSearchParams({ client_id: process.env.GOOGLE_CLIENT_ID,
-                client_secret: process.env.GOOGLE_CLIENT_SECRET,
+            new URLSearchParams({ client_id: userConfig.getGoogleClient(DATA).id,
+                client_secret: userConfig.getGoogleClient(DATA).secret,
                 refresh_token: googleAcc.refreshToken,
                 grant_type: 'refresh_token' }).toString());
     } catch (e) {
@@ -3233,23 +3251,15 @@ async function handleNetworkQuery(req, res, _params, paths) {
 }
 
 // ── LinkedIn auto-sync (opt-in, experimental) ──────────────────────────────
-// Two ways to enable, in order of precedence:
-//   1. MINTY_LINKEDIN_AUTOSYNC=1 env var (immediate, no restart needed for
-//      future runs but the current process must be set up that way at boot)
-//   2. minty-mode.json { linkedinAutosync: true } — toggled from Settings UI
-//      via POST /api/settings/linkedin-autosync. Read at server boot.
-//
-// All endpoints return 404 when the flag is unset — this is the feature's
-// kill-switch. POST endpoints also enforce Origin/Sec-Fetch-Site (via
-// sources/linkedin/origin-check.js) to prevent a drive-by webpage from
-// spawning a Chromium process on the user's machine.
+// Now a runtime config flag — toggleable from Settings UI without restart.
+// All endpoints return 404 when the flag is unset (kill-switch). POST
+// endpoints also enforce Origin/Sec-Fetch-Site (via sources/linkedin/
+// origin-check.js) to prevent a drive-by webpage from spawning a Chromium
+// process on the user's machine.
 
-function readPersistedLinkedInAutosync() {
-    try { return !!JSON.parse(fs.readFileSync(MODE_FILE, 'utf8')).linkedinAutosync; }
-    catch { return false; }
+function isLinkedInAutosyncEnabled() {
+    return userConfig.isLinkedInAutosyncEnabled(DATA);
 }
-const LINKEDIN_AUTOSYNC_ENABLED = process.env.MINTY_LINKEDIN_AUTOSYNC === '1'
-    || readPersistedLinkedInAutosync();
 
 function readLinkedInState() {
     try {
@@ -3263,7 +3273,7 @@ function linkedInPlaywrightAvailable() {
 }
 
 function linkedInGate(req, res) {
-    if (!LINKEDIN_AUTOSYNC_ENABLED) { res.writeHead(404); res.end('not found'); return false; }
+    if (!isLinkedInAutosyncEnabled()) { res.writeHead(404); res.end('not found'); return false; }
     if (req.method === 'POST') {
         let originCheck;
         try {
@@ -3366,6 +3376,7 @@ const ROUTES = [
     ['POST', /^\/api\/settings\/mode$/,                  handleSetMode],
     ['POST', /^\/api\/settings\/seed-demo$/,             handleSeedDemo],
     ['POST', /^\/api\/settings\/linkedin-autosync$/,     handleSetLinkedInAutosync],
+    ['POST', /^\/api\/settings\/oauth$/,                 handleSetOAuth],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -4517,6 +4528,14 @@ nav {
   border: 1px solid var(--border); font-size: 11px; padding: 4px 10px;
 }
 .settings-btn-secondary:hover { border-color: var(--accent); color: var(--text-primary); }
+.settings-input {
+  width: 100%; max-width: 420px;
+  padding: 7px 10px; border-radius: 6px;
+  background: var(--bg); border: 1px solid var(--border);
+  color: var(--text-primary); font-size: 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+.settings-input:focus { outline: 0; border-color: var(--accent); }
 .settings-note {
   margin: 12px 0; padding: 10px 12px; border-radius: 8px;
   font-size: 12px; color: var(--text-secondary);
@@ -8607,6 +8626,33 @@ function renderSettings(s) {
     </div>
 
     <div class="settings-card">
+      <div class="settings-card-title">Google OAuth (Gmail · Google Contacts · Calendar)</div>
+      <div class="settings-row" style="font-size:11px;color:var(--text-muted);line-height:1.6">
+        Paste your Google OAuth client ID and secret. Get them from
+        <a href="https://console.cloud.google.com/apis/credentials" target="_blank" style="color:var(--accent-hover)">console.cloud.google.com → Credentials</a>
+        (OAuth client type: <em>Desktop app</em>). Stored locally in <code>data/config.json</code> with 0600 perms.
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label">Client ID</div>
+        <div class="settings-row-value">
+          <input id="oauth-google-id" class="settings-input" placeholder="123456-abc.apps.googleusercontent.com"
+                 value="\${esc((s.config && s.config.google && s.config.google.clientId) || '')}" />
+        </div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label">Client Secret</div>
+        <div class="settings-row-value">
+          <input id="oauth-google-secret" class="settings-input" type="password"
+                 placeholder="\${esc((s.config && s.config.google && s.config.google.clientSecretMasked) || 'GOCSPX-…')}" />
+          \${(s.config && s.config.google && s.config.google.clientSecretSet) ? '<span style="font-size:11px;color:var(--text-muted);margin-left:8px">currently set — leave blank to keep</span>' : ''}
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button class="settings-btn" onclick="setOAuth('google')">Save Google credentials</button>
+      </div>
+    </div>
+
+    <div class="settings-card">
       <div class="settings-card-title">LinkedIn auto-sync</div>
       <div class="settings-row">
         <div class="settings-row-label">Status</div>
@@ -8661,9 +8707,21 @@ async function setLinkedinAutosync(enabled) {
     body: JSON.stringify({ enabled }),
   }).then(r => r.json());
   if (r.error) { alert(r.error); return; }
-  if (r.restartRequired) {
-    alert('LinkedIn auto-sync ' + (enabled ? 'enabled' : 'disabled') + '. Restart Minty to apply:\\n\\n  Stop the current process (Ctrl+C in the terminal),\\n  then run:  npm run crm');
-  }
+  loadSettings();
+  loadSources && document.getElementById('view-sources') && loadSources();
+}
+
+async function setOAuth(provider) {
+  const idEl = document.getElementById('oauth-' + provider + '-id');
+  const secretEl = document.getElementById('oauth-' + provider + '-secret');
+  const payload = { provider };
+  if (idEl) payload.clientId = idEl.value;
+  if (secretEl && secretEl.value.trim()) payload.clientSecret = secretEl.value;
+  const r = await fetch(BASE + '/api/settings/oauth', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }).then(r => r.json());
+  if (r.error) { alert(r.error); return; }
   loadSettings();
 }
 
@@ -9190,7 +9248,7 @@ Object.assign(window, {
   startEmailDevice, removeEmailAccount,
   copyName, copyIntro,
   loadGroupDetail, saveLidLabels,
-  loadSettings, setMode, seedDemo, setLinkedinAutosync,
+  loadSettings, setMode, seedDemo, setLinkedinAutosync, setOAuth,
   reviewDecide, reviewBack,
   saveScoreOverride, clearScoreOverride, toggleScoreOverride,
   openDraftPanel, copyDraft,
