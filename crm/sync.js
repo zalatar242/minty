@@ -900,7 +900,7 @@ function startSyncDaemon(uuid, userDataDir) {
                     notifications.set(userDataDir, 'linkedin', {
                         needsReauth: true,
                         pauseSync: true,
-                        message: 'LinkedIn session expired — run `npm run linkedin:connect` to re-auth.',
+                        message: 'LinkedIn session expired — open Settings → LinkedIn → Reconnect.',
                     });
                 }
                 const s2 = loadSyncState(statePath);

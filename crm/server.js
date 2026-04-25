@@ -4087,9 +4087,19 @@ nav {
 .sync-warn-banner svg { flex-shrink: 0; margin-top: 1px; }
 .sync-warn-icon { width: 14px; height: 14px; }
 
-/* Sticky re-auth banner (set by auto-sync on session failure) */
+/* Sticky re-auth banner (set by auto-sync on session failure).
+   #notif-banners is the fixed-position top strip; .notif-banner is each
+   alert inside it. Without position:fixed the alert inherited body's
+   flex-row layout and got squeezed between the sidebar and main. */
+#notif-banners {
+  position: fixed; top: 0; left: 0; right: 0;
+  z-index: 100;
+  display: flex; flex-direction: column;
+  pointer-events: none;
+}
+#notif-banners:empty { display: none; }
 .notif-banner {
-  position: sticky; top: 0; z-index: 50;
+  pointer-events: auto;
   display: flex; align-items: flex-start; gap: 10px;
   background: rgba(180, 83, 9, 0.96); color: #fff;
   padding: 10px 14px; font-size: 0.78rem; line-height: 1.35;
