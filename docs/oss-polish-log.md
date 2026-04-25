@@ -4,6 +4,7 @@ A rolling log of open-source-quality improvements made by an autonomous loop whi
 
 ## Shipped
 
+- **2026-04-25** — Added `tests/README.md` orienting contributors who land in the tests folder: layer overview, when-to-add-what table, fixture/PII rules, CI summary. Pattern from Node.js core / Vitest contributor docs.
 - **2026-04-25** — Added `.editorconfig` (4-space JS, 2-space JSON/YAML, LF, UTF-8). Keeps whitespace consistent across VSCode/JetBrains/Vim contributors. Standard EditorConfig pattern — borrowed from Excalidraw + Plausible.
 - **2026-04-25** — Added `.github/labels.json` (21 labels: workflow, severity, source-area, triage) + `scripts/sync-labels.js` and `npm run labels:sync` so labels are version-controlled and provisionable with `gh label create --force`. Pattern from Probot/`label-sync` ecosystem — declarative JSON > clicking through GitHub UI.
 - **2026-04-25** — Slimmed README "Project structure" to a 6-line redirect to ARCHITECTURE.md (was 26 lines duplicating it). Single source of truth.
