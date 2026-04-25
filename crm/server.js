@@ -1366,6 +1366,7 @@ function handleGetSettings(_req, res) {
         envOverride: !!(process.env.CRM_DATA_DIR || process.env.MINTY_DEMO),
         runtimeConfig: userConfig.getRedactedConfig(DATA),
         playwrightAvailable: linkedInPlaywrightAvailable(),
+        linkedinState: readLinkedInState(),
     });
 }
 
@@ -3377,7 +3378,7 @@ function handleLinkedInStatus(req, res) {
 function handleLinkedInConnect(req, res) {
     if (!linkedInGate(req, res)) return;
     if (!linkedInPlaywrightAvailable()) {
-        json(res, { error: 'playwright-missing', message: 'Run: npm run linkedin:setup' }, 503); return;
+        json(res, { error: 'playwright-missing', message: 'Playwright is not installed. Run npm install in the project directory once.' }, 503); return;
     }
     const state = readLinkedInState();
     if (state.status === 'syncing') { json(res, { error: 'sync in progress' }, 409); return; }
@@ -3396,12 +3397,12 @@ function handleLinkedInConnect(req, res) {
 function handleLinkedInSync(req, res) {
     if (!linkedInGate(req, res)) return;
     if (!linkedInPlaywrightAvailable()) {
-        json(res, { error: 'playwright-missing', message: 'Run: npm run linkedin:setup' }, 503); return;
+        json(res, { error: 'playwright-missing', message: 'Playwright is not installed. Run npm install in the project directory once.' }, 503); return;
     }
     const state = readLinkedInState();
     if (state.status === 'syncing') { json(res, { error: 'sync in progress' }, 409); return; }
     if (state.status === 'disconnected') {
-        json(res, { error: 'not connected', message: 'Run: npm run linkedin:connect (or click Enable auto-sync)' }, 400); return;
+        json(res, { error: 'not connected', message: 'Click Connect to LinkedIn in Settings first.' }, 400); return;
     }
     const { spawn } = require('child_process');
     const scriptPath = path.resolve(__dirname, '../sources/linkedin/fetch.js');
@@ -8712,39 +8713,71 @@ function renderLinkedinAutosyncCard(s) {
   const enabled = !!cfg.linkedinAutosync;
   const envForced = !!cfg.envForces?.linkedinAutosync;
   const pwAvailable = !!s.playwrightAvailable;
+  const li = s.linkedinState || { status: 'disconnected' };
+  const liStatus = li.status || 'disconnected';
+  const lastSyncIso = li.lastSyncAt || li.lastSync;
+  const lastSyncStr = lastSyncIso ? fmtSyncAge(lastSyncIso) : null;
 
-  const badge = enabled
-    ? '<span class="settings-mode-badge real">enabled</span>'
+  const badgeMap = {
+    disconnected:  ['demo',  'disabled'],
+    connecting:    ['pending', 'connecting…'],
+    connected:     ['real',  'connected'],
+    syncing:       ['pending', 'syncing…'],
+    challenge:     ['demo',  'needs reconnect'],
+    error:         ['demo',  'error'],
+  };
+  const liBadgePair = enabled ? (badgeMap[liStatus] || badgeMap.connected) : badgeMap.disconnected;
+  const enabledBadge = enabled
+    ? '<span class="settings-mode-badge ' + liBadgePair[0] + '">' + esc(liBadgePair[1]) + '</span>'
     : '<span class="settings-mode-badge demo">disabled</span>';
+
+  const lastSyncNote = enabled && lastSyncStr
+    ? '<div class="settings-row" style="font-size:11px;color:var(--text-muted)">Last sync: ' + esc(lastSyncStr) + '</div>'
+    : '';
 
   const envNote = envForced
     ? '<div class="settings-note settings-note-warn">MINTY_LINKEDIN_AUTOSYNC env var is set — unset it to control from the UI.</div>'
     : '';
 
   const pwNote = !pwAvailable
-    ? '<div class="settings-note settings-note-warn">Playwright not installed — run <code>npm run linkedin:setup</code> in your terminal first.</div>'
+    ? '<div class="settings-note settings-note-warn">Playwright is not installed. Run <code>npm install</code> in the project directory once, then reload — no further terminal commands needed after that.</div>'
     : '';
 
-  const blocked = envForced || !pwAvailable;
-  const action = enabled
-    ? '<button class="settings-btn settings-btn-secondary" onclick="setLinkedinAutosync(false)">Disable</button>'
-    : '<button class="settings-btn" onclick="setLinkedinAutosync(true)"' + (blocked ? ' disabled' : '') + '>Enable</button>';
+  const buttons = [];
+  if (enabled) {
+    if (pwAvailable) {
+      if (liStatus === 'disconnected' || liStatus === 'challenge') {
+        buttons.push('<button class="settings-btn" onclick="connectLinkedIn()">' + (liStatus === 'challenge' ? 'Reconnect to LinkedIn' : 'Connect to LinkedIn') + '</button>');
+      } else if (liStatus === 'connected' || liStatus === 'error') {
+        buttons.push('<button class="settings-btn" onclick="syncLinkedInNow()">Sync now</button>');
+        buttons.push('<button class="settings-btn settings-btn-secondary" onclick="connectLinkedIn()">Reconnect</button>');
+      }
+      // syncing/connecting: no extra buttons; toast shows progress
+    }
+    if (!envForced) {
+      buttons.push('<button class="settings-btn settings-btn-secondary" onclick="setLinkedinAutosync(false)">Disable auto-sync</button>');
+    }
+  } else {
+    const blocked = envForced || !pwAvailable;
+    buttons.push('<button class="settings-btn" onclick="setLinkedinAutosync(true)"' + (blocked ? ' disabled' : '') + '>Enable auto-sync</button>');
+  }
 
   return \`
     <div class="settings-card">
       <div class="settings-card-title">LinkedIn auto-sync</div>
       <div class="settings-row">
         <div class="settings-row-label">Status</div>
-        <div class="settings-row-value">\${badge}</div>
+        <div class="settings-row-value">\${enabledBadge}</div>
       </div>
+      \${lastSyncNote}
       <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
         Pulls connections + messages on a 24h schedule via a headless browser.
-        Experimental and ToS-adjacent. Requires <code>npm run linkedin:connect</code>
-        once to authenticate.
+        Click <b>Connect to LinkedIn</b> once and a Chromium window opens for
+        you to log in — no terminal needed. Experimental and ToS-adjacent.
       </div>
       \${pwNote}
       \${envNote}
-      <div class="settings-actions">\${action}</div>
+      <div class="settings-actions">\${buttons.join(' ')}</div>
     </div>
   \`;
 }
@@ -9126,10 +9159,21 @@ async function syncLinkedIn() {
 async function connectLinkedIn() {
   if (!confirm('This opens a Chromium window on this machine for you to log into LinkedIn. Continue?')) return;
   const r = await fetch(BASE + '/api/linkedin/connect', { method: 'POST', credentials: 'same-origin' });
+  const d = await r.json().catch(() => ({}));
   if (r.status === 403) return alert('CSRF check failed. Reload and try again.');
-  if (r.status === 503) return alert('Playwright not installed. Run: npm run linkedin:setup');
-  if (r.status === 409) return alert('A sync is already running. Wait for it to finish.');
-  alert('Chromium window should be opening on this machine. Log into LinkedIn there, then close the window.');
+  if (r.status === 503) return alert(d.message || 'Playwright is not installed. Run "npm install" in the project directory once.');
+  if (r.status === 409) return alert(d.message || 'A sync is already running. Wait for it to finish.');
+  alert('A Chromium window is opening on this machine. Log into LinkedIn there, then close the window when done.');
+  // Refresh Settings if it's open so the card reflects the new state.
+  if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
+}
+
+async function syncLinkedInNow() {
+  const r = await fetch(BASE + '/api/linkedin/sync', { method: 'POST', credentials: 'same-origin' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return alert(d.message || d.error || ('Sync failed: ' + r.status));
+  alert('LinkedIn sync started. You\\'ll see progress in the toast.');
+  if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
 }
 function switchLinkedInMode(/* mode */) {
   alert('Mode switching is not persisted in Phase 1. For the ZIP flow, use: npm run linkedin:import-zip');
