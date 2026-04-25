@@ -210,33 +210,15 @@ Everything else — contacts, messages, insights, timelines — lives in `data/`
 
 ## Project structure
 
+For the full guided tour — data flow, invariants, glossary — see [ARCHITECTURE.md](./ARCHITECTURE.md).
+
 ```
-crm/
-  server.js          # HTTP server + single-page UI
-  merge.js           # cross-source dedup and merge
-  match.js           # matching engine (WhatsApp ↔ LinkedIn etc.)
-  schema.js          # Contact + Interaction data shapes
-  sync.js            # background sync daemon
-  calendar.js        # Google Calendar integration
-  reconnect.js       # reconnect-draft templates
-  network-query.js   # natural-language network search
-  staleness.js       # stale data detection
-  analyze.js         # AI insights pipeline (batch)
-  digest.js          # weekly digest builder
-  ai.js              # AI backend abstraction (claude / ollama)
-  utils.js           # shared pure utils (scoring, ranking)
-  query.js           # CLI search + stats
-sources/
-  whatsapp/          # WhatsApp Web exporter
-  linkedin/          # LinkedIn ZIP parser
-  telegram/          # Telegram JSON parser
-  email/             # IMAP fetcher
-  google-contacts/
-  sms/
-  apollo/            # optional contact enrichment
-tests/unit/          # Node built-in test runner suite
-ee/                  # reserved for future commercial features
-data/                # your local data (gitignored)
+crm/        # the unified app (HTTP server + SPA, merge, query, AI)
+sources/    # one importer per data source
+ee/         # reserved for future commercial features
+data/       # your local data (gitignored)
+docs/       # long-form docs + ADRs
+tests/      # unit / integration / e2e
 ```
 
 ## Architecture: AI without API credits
