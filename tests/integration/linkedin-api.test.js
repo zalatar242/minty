@@ -149,86 +149,14 @@ test('[LinkedInAPI/B]: feature flag "true" → enabled (case-sensitive per spec)
 });
 
 // ===========================================================================
-// Phase C — live-endpoint tests (PENDING: server wiring not landed yet)
-// TODO: unskip once server.js handlers land
+// Phase C — live-endpoint tests
 // ===========================================================================
-//
-// The intended pattern when unskipping:
-//
-//   const { createServer } = require('../../crm/server.js');
-//   const server = createServer({ dataDir, env: { MINTY_LINKEDIN_AUTOSYNC: '1' } });
-//   const port = await listen(server);
-//   const res = await fetch(`http://localhost:${port}/api/linkedin/status`, {
-//       headers: { Origin: `http://localhost:${port}` },
-//   });
-//   assert.equal(res.status, 200);
-//   ...
-//
-// server.js today does not export createServer (or an equivalent
-// test-friendly factory). When it does, these tests become live.
-
-test(
-    '[LinkedInAPI/C]: GET /api/linkedin/status returns 200 when MINTY_LINKEDIN_AUTOSYNC=1',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: GET /api/linkedin/status returns 404 when MINTY_LINKEDIN_AUTOSYNC is unset (feature-flag gate)',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: GET /api/linkedin/status reflects current sync-state.json payload',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: POST /api/linkedin/sync with valid Origin spawns child and returns 202 Accepted',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: POST /api/linkedin/sync with missing/bad Origin returns 403 (C1 CSRF)',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: POST /api/linkedin/sync while sync already running returns 409 Conflict (lock held)',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: POST /api/linkedin/connect passes same-origin check and spawns headful Chromium',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: POST /api/linkedin/connect with bad Origin returns 403',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: POST /api/linkedin/sync returns 503 when playwright module not loadable',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: status enum transitions disconnected → connecting → connected → syncing → connected (happy path)',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
-
-test(
-    '[LinkedInAPI/C]: POST /api/linkedin/sync returns after child process STARTS, not after it finishes',
-    { skip: 'TODO: unskip once server.js handlers land' },
-    () => {},
-);
+// These previously held empty placeholder bodies marked
+// `{ skip: 'TODO: unskip once server.js handlers land' }`. The handlers
+// (handleLinkedInStatus, handleLinkedInSync, handleLinkedInConnect) are now
+// in server.js, but live-server tests need a refactor of server.js to expose
+// a test-friendly factory (currently the file binds PORT 3456 at require
+// time). Until that refactor lands, real coverage of the endpoints is via
+// e2e Playwright suites in tests/e2e/. The placeholders were removed because
+// empty test bodies provide no assertion value and were creating misleading
+// "skipped" noise in the default run.
