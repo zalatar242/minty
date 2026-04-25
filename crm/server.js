@@ -9103,10 +9103,9 @@ function renderSourceForm(key, status, connected) {
       }[li.status] || 'Connected';
       const color = (li.status === 'error' || li.status === 'challenge') ? '#f87171' : (li.status === 'syncing' ? '#fbbf24' : '#34d399');
       const cta = li.status === 'challenge' ? '<button class="source-btn secondary" style="font-size:0.7rem;padding:4px 10px" onclick="connectLinkedIn()">Reconnect</button>'
-                : '<button class="source-btn secondary sync-now-btn" style="font-size:0.7rem;padding:4px 10px" onclick="syncLinkedIn()" ' + (li.status === 'syncing' ? 'disabled' : '') + '>Sync now</button>';
+                : '<button class="source-btn secondary sync-now-btn" style="font-size:0.7rem;padding:4px 10px" onclick="syncLinkedInNow()" ' + (li.status === 'syncing' ? 'disabled' : '') + '>Sync now</button>';
       el.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
-        + '<span style="font-size:0.76rem;color:' + color + '">● ' + copy + '</span>' + cta + '</div>'
-        + '<div style="margin-top:8px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();switchLinkedInMode(\\'zip\\')" style="color:#6366f1">Prefer the safer ZIP import? Switch to file upload</a></div>';
+        + '<span style="font-size:0.76rem;color:' + color + '">● ' + copy + '</span>' + cta + '</div>';
       if (li.status === 'syncing') startLinkedInPoll();
       return;
     }
@@ -9161,11 +9160,10 @@ function startLinkedInPoll() {
   }, 5000);
 }
 async function syncLinkedIn() {
-  const r = await fetch(BASE + '/api/linkedin/sync', { method: 'POST', credentials: 'same-origin' });
-  if (r.status === 403) return alert('CSRF check failed. Reload the page and try again.');
-  if (r.status === 503) return alert('Playwright not installed. Run: npm run linkedin:setup');
-  if (r.status === 409) return alert('A sync is already in progress.');
-  if (r.status === 400) return alert('Connect LinkedIn first (Enable auto-sync).');
+  // Kept as a thin alias so legacy onclick handlers stay working — all
+  // call sites now use syncLinkedInNow() directly. This re-enters that
+  // path but also refreshes the Sources view afterwards.
+  await syncLinkedInNow();
   await loadSources();
   startLinkedInPoll();
 }
@@ -9189,7 +9187,9 @@ async function syncLinkedInNow() {
   if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
 }
 function switchLinkedInMode(/* mode */) {
-  alert('Mode switching is not persisted in Phase 1. For the ZIP flow, use: npm run linkedin:import-zip');
+  // Legacy hook — the Sources view's LinkedIn card now shows both flows
+  // (browser connect + ZIP disclosure) in a single layout, so users no
+  // longer need to "switch modes". Kept as a no-op for any cached UI.
 }
 
 function reconnectSource(key) { renderSourceForm(key, {}, false); }
