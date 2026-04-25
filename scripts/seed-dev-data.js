@@ -471,9 +471,11 @@ function buildExtras(contacts, outDir) {
     const insights = {};
     for (const c of unifiedContacts) {
         if (c.isGroup) continue;
+        if (!c.name) continue; // skip anonymous @lid lurkers — no name to draft against
         if (rand() > 0.7) continue;
         const src = contacts.find(sc => sc.fullName === c.name);
         const category = src ? src.category : 'operator';
+        const firstName = c.name.split(/\s+/)[0] || 'there';
         insights[c.id] = {
             topics: shuffle(TOPICS[category] || TOPICS.operator).slice(0, 3),
             openLoops: rand() < 0.35 ? [`Follow up on ${pick(TOPICS[category] || TOPICS.operator)}`] : [],
@@ -481,7 +483,7 @@ function buildExtras(contacts, outDir) {
             meetingBrief: c.name + ' — ' + (src && src.title ? src.title + ' at ' + src.company : 'contact') +
                 '. Most recent chats have been about ' + pick(TOPICS[category] || TOPICS.operator) + '.',
             keywords: shuffle(['plan', 'team', 'hire', 'round', 'deal', 'ship', 'design', 'data']).slice(0, 5),
-            reconnectDraft: `Hey ${c.name.split(' ')[0]}, been a minute — last we caught up it was about ${pick(TOPICS[category] || TOPICS.operator)}. Quick question for you: [your ask]. Up for a call this week?`,
+            reconnectDraft: `Hey ${firstName}, been a minute — last we caught up it was about ${pick(TOPICS[category] || TOPICS.operator)}. Quick question for you: [your ask]. Up for a call this week?`,
             analyzedAt: new Date().toISOString(),
         };
     }
