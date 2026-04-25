@@ -1264,6 +1264,63 @@ function loadWhatsAppChatsRaw() {
     } catch { return {}; }
 }
 
+function loadLidMap() {
+    try { return JSON.parse(fs.readFileSync(path.join(DATA, 'whatsapp/lid-map.json'), 'utf8')) || {}; }
+    catch { return {}; }
+}
+
+function saveLidMap(map) {
+    const p = path.join(DATA, 'whatsapp/lid-map.json');
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(map, null, 2));
+}
+
+/**
+ * POST /api/whatsapp/lid-map  { mapping: { "<lid@lid>": "<contactId or @c.us id>" } }
+ * Persists user-curated @lid → contact assignments. Clears the in-memory
+ * resolver caches so the new mapping takes effect on the next group fetch
+ * without needing a full merge re-run.
+ */
+async function handleSaveLidMap(req, res, _params, paths) {
+    const body_ = await body(req);
+    const mapping = body_ && body_.mapping;
+    if (!mapping || typeof mapping !== 'object') {
+        return json(res, { error: 'mapping object required' }, 400);
+    }
+    const current = loadLidMap();
+    const contacts = loadContacts(paths);
+    const byContactId = new Map(contacts.map(c => [c.id, c]));
+
+    let added = 0, removed = 0;
+    for (const [lid, target] of Object.entries(mapping)) {
+        if (!lid.endsWith('@lid')) continue;
+        if (target === null || target === '') {
+            if (current[lid]) { delete current[lid]; removed++; }
+            continue;
+        }
+        // target may be a contact id (e.g. wa_447383719797) or already a @c.us id.
+        let resolvedTo = target;
+        if (!String(target).endsWith('@c.us') && !String(target).endsWith('@lid')) {
+            const c = byContactId.get(target);
+            if (c?.sources?.whatsapp?.id && c.sources.whatsapp.id.endsWith('@c.us')) {
+                resolvedTo = c.sources.whatsapp.id;
+            } else if (c?.phones?.[0]) {
+                const digits = String(c.phones[0]).replace(/[^0-9]/g, '');
+                resolvedTo = digits + '@c.us';
+            } else {
+                continue; // can't map without an @c.us anchor
+            }
+        }
+        current[lid] = resolvedTo;
+        added++;
+    }
+    saveLidMap(current);
+    // Clear caches so the resolver picks up the new map immediately.
+    Object.keys(_interactionIndex).forEach(k => delete _interactionIndex[k]);
+    Object.keys(_searchIndex).forEach(k => delete _searchIndex[k]);
+    json(res, { ok: true, added, removed, totalMappings: Object.keys(current).length });
+}
+
 function handleGetGroupDetail(req, res, [chatId], paths, uuid) {
     const idx = getInteractionIndex(paths, uuid);
     const msgs = idx.byChatId[chatId] || [];
@@ -1309,6 +1366,31 @@ function handleGetGroupDetail(req, res, [chatId], paths, uuid) {
         };
     }).filter(Boolean);
 
+    // Aggregate unresolved @lid senders so the UI can offer a labelling
+    // affordance. For each anon-lid id we surface message count + a sample
+    // body, plus suggestedContacts (named roster members the user hasn't
+    // seen as a known sender yet — best candidates for the assignment).
+    const senderStats = {}; // sender id → { count, sample, kind }
+    for (const m of sorted) {
+        if (!m.from) continue;
+        if (!senderStats[m.from]) senderStats[m.from] = { id: m.from, count: 0, sample: '', kind: null };
+        senderStats[m.from].count++;
+        if (!senderStats[m.from].sample && m.body) senderStats[m.from].sample = m.body.slice(0, 80);
+    }
+    const seenContactIds = new Set();
+    for (const sid of Object.keys(senderStats)) {
+        const r = resolveFrom(sid);
+        senderStats[sid].kind = r.kind;
+        senderStats[sid].name = r.name;
+        if (r.contactId) seenContactIds.add(r.contactId);
+    }
+    const unresolvedSenders = Object.values(senderStats)
+        .filter(s => s.kind === 'anon-lid' || (s.kind === 'phone' && s.id && s.id.endsWith('@lid')))
+        .sort((a, b) => b.count - a.count);
+    // Suggest roster members not already attributed to any sender — most likely
+    // candidates for the @lid behind the messages.
+    const candidateRoster = roster.filter(r => !seenContactIds.has(r.id));
+
     json(res, {
         chatId,
         name,
@@ -1326,6 +1408,8 @@ function handleGetGroupDetail(req, res, [chatId], paths, uuid) {
                 body: m.body || '',
             };
         }),
+        unresolvedSenders,
+        suggestedContacts: candidateRoster,
         pinnedMessages: pinnedMessages.map(m => {
             const r = resolveFrom(m.from || m.author);
             return { ...m, fromName: r.name, fromContactId: r.contactId, fromKind: r.kind };
@@ -3068,6 +3152,7 @@ const ROUTES = [
     ['GET',  /^\/api\/meetings\/debriefs\/pending$/,     handleGetPendingDebriefs],
     ['GET',  /^\/api\/meetings\/([^/]+)\/debrief$/,      handleGetDebrief],
     ['POST', /^\/api\/meetings\/([^/]+)\/debrief$/,      handleSaveDebrief],
+    ['POST', /^\/api\/whatsapp\/lid-map$/,               handleSaveLidMap],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -4110,6 +4195,47 @@ nav {
 }
 .group-roster-chip:hover { border-color: var(--accent); color: var(--text-primary); }
 .group-roster-chip-anon { font-style: italic; cursor: default; opacity: 0.7; }
+
+/* @lid labelling panel */
+.lid-label-panel {
+  margin: 14px 16px; padding: 12px;
+  background: rgba(99,102,241,0.06);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.lid-label-title {
+  font-size: 12px; font-weight: 600; color: var(--text-primary);
+  margin-bottom: 10px;
+}
+.lid-label-help { font-weight: 400; color: var(--text-muted); font-size: 11px; }
+.lid-label-row {
+  display: flex; gap: 8px; align-items: center; margin-bottom: 6px;
+}
+.lid-label-info { flex: 1; min-width: 0; display: flex; gap: 8px; align-items: center; }
+.lid-label-count {
+  font-size: 11px; padding: 2px 7px; border-radius: 8px;
+  background: rgba(99,102,241,0.15); color: var(--accent-hover);
+  font-weight: 600; flex-shrink: 0;
+}
+.lid-label-sample {
+  font-size: 11px; color: var(--text-secondary); font-style: italic;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.lid-label-select {
+  background: var(--bg-card); border: 1px solid var(--border);
+  color: var(--text-secondary); font-size: 11px;
+  padding: 4px 6px; border-radius: 6px; min-width: 140px;
+  font-family: inherit;
+}
+.lid-label-select:focus { border-color: var(--accent); outline: 0; }
+.lid-label-more { font-size: 11px; color: var(--text-muted); margin: 6px 0; }
+.lid-label-save {
+  margin-top: 8px; padding: 6px 12px;
+  background: var(--accent); color: white; border: 0;
+  border-radius: 6px; font-size: 12px; font-weight: 500;
+  cursor: pointer; font-family: inherit;
+}
+.lid-label-save:hover { background: var(--accent-hover); }
+.lid-label-save:disabled { opacity: 0.5; cursor: default; }
 .group-detail-body { flex: 1; display: flex; overflow: hidden; gap: 0; }
 .group-feed { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
 .group-msg { background: #1a1f2e; border-radius: 8px; padding: 8px 12px; }
@@ -6671,6 +6797,30 @@ function renderGroupsList(groups) {
   }).join('');
 }
 
+async function saveLidLabels(chatId) {
+  const mapping = {};
+  document.querySelectorAll('.lid-label-select').forEach(sel => {
+    const lid = sel.dataset.lid;
+    const target = sel.value;
+    if (lid && target) mapping[lid] = target;
+  });
+  if (Object.keys(mapping).length === 0) return;
+  const btn = document.querySelector('.lid-label-save');
+  if (btn) { btn.disabled = true; btn.textContent = 'Saving…'; }
+  try {
+    const r = await fetch(BASE + '/api/whatsapp/lid-map', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mapping }),
+    }).then(r => r.json());
+    if (btn) btn.textContent = 'Saved · ' + r.added + ' label' + (r.added === 1 ? '' : 's');
+    // Reload group detail so messages re-render with the new names
+    setTimeout(() => loadGroupDetail(chatId), 400);
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = 'Save labels'; }
+    console.error('lid-map save failed', e);
+  }
+}
+
 async function loadGroupDetail(chatId) {
   // Highlight selected
   document.querySelectorAll('.group-item').forEach(el => el.classList.remove('active'));
@@ -6759,6 +6909,29 @@ async function loadGroupDetail(chatId) {
     ? \` · Created \${new Date(g.createdAt).toLocaleDateString('en-GB', { month:'short', year:'numeric' })}\`
     : '';
 
+  // Anonymous-sender labelling — give the user a way to assign each unique
+  // @lid sender to a roster member, persisted to data/whatsapp/lid-map.json.
+  const unresolved = g.unresolvedSenders || [];
+  const candidates = g.suggestedContacts || [];
+  const labelHtml = unresolved.length ? \`<div class="lid-label-panel">
+    <div class="lid-label-title">
+      \${unresolved.length} anonymous sender\${unresolved.length === 1 ? '' : 's'} in this group
+      <span class="lid-label-help">— WhatsApp redacts unsaved members. Match them to roster contacts and the names will stick across all groups.</span>
+    </div>
+    \${unresolved.slice(0, 12).map((s, i) => \`<div class="lid-label-row">
+      <div class="lid-label-info">
+        <span class="lid-label-count">\${s.count}</span>
+        <span class="lid-label-sample">"\${esc((s.sample || '(no text)').slice(0, 70))}"</span>
+      </div>
+      <select class="lid-label-select" data-lid="\${jsAttr(s.id)}" id="lid-sel-\${i}">
+        <option value="">— assign to —</option>
+        \${candidates.map(c => \`<option value="\${esc(c.id)}">\${esc(c.name)}\${c.company ? ' · ' + esc(c.company) : ''}</option>\`).join('')}
+      </select>
+    </div>\`).join('')}
+    \${unresolved.length > 12 ? '<div class="lid-label-more">+ ' + (unresolved.length - 12) + ' more — top 12 shown.</div>' : ''}
+    <button class="lid-label-save" onclick="saveLidLabels('\${jsAttr(g.chatId)}')">Save labels</button>
+  </div>\` : '';
+
   // Roster — show known members as clickable chips, anonymous LIDs as a count
   const roster = g.roster || [];
   const namedMembers = roster.filter(r => r.name && !/^\\+/.test(r.name) && r.name !== '(unknown)');
@@ -6779,7 +6952,7 @@ async function loadGroupDetail(chatId) {
     </div>
     \${rosterHtml}
     <div class="group-detail-body">
-      <div class="group-feed">\${pinnedHtml}\${feedHtml || (pinned.length ? '' : '<div class="loading">No messages found</div>')}</div>
+      <div class="group-feed">\${labelHtml}\${pinnedHtml}\${feedHtml || (pinned.length ? '' : '<div class="loading">No messages found</div>')}</div>
       <div class="group-signals">
         <div class="signal-title" style="margin-bottom:12px">Signals</div>
         \${urlSection}\${hiringSection}\${eventSection}\${introSection}
@@ -8496,7 +8669,7 @@ Object.assign(window, {
   connectEmail, emailAutoHost, startWhatsapp,
   startEmailDevice, removeEmailAccount,
   copyName, copyIntro,
-  loadGroupDetail,
+  loadGroupDetail, saveLidLabels,
   reviewDecide, reviewBack,
   saveScoreOverride, clearScoreOverride, toggleScoreOverride,
   openDraftPanel, copyDraft,
