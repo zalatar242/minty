@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Runs preflight before every push. Bypass with `git push --no-verify` if needed.
+
+set -e
+
+ROOT="$(git rev-parse --show-toplevel)"
+exec "$ROOT/scripts/preflight.sh"
