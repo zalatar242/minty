@@ -21,6 +21,9 @@ const {
 } = require('./people-graph');
 const sourceProgress = require('../sources/_shared/progress');
 const notifications = require('./notifications');
+const observability = require('./observability');
+
+observability.init();
 
 const PORT = Number(process.env.PORT) || 3456;
 const HOST = process.env.HOST || '127.0.0.1'; // set HOST=0.0.0.0 to expose on LAN
@@ -2633,7 +2636,9 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
     }
 
     const firstRun = !resuming;
-    const limit = opts.limit ?? (firstRun ? 50 : 500);
+    // Pull every locally-available message per chat. WhatsApp Web's IndexedDB
+    // is the real ceiling — we just stop capping below that.
+    const limit = opts.limit ?? Infinity;
     let msgCount = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);
 
     for (let i = 0; i < chats.length; i++) {
@@ -3441,6 +3446,7 @@ const server = http.createServer(async (req, res) => {
                 await handler(req, res, m.slice(1).map(decodeURIComponent), paths, uuid);
             } catch (e) {
                 console.error(e);
+                observability.captureException(e, { route: pattern.toString(), method });
                 res.writeHead(500); res.end(e.message);
             }
             return;
