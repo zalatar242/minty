@@ -48,8 +48,8 @@ New here? Read [ARCHITECTURE.md](./ARCHITECTURE.md) first — 10-min tour of the
 git clone https://github.com/zalatar242/minty.git
 cd minty
 npm install
-git config core.hooksPath .githooks   # enables pre-push preflight
-npm run crm                            # http://localhost:3456
+npm run hooks:install   # enables the pre-push preflight (one-time)
+npm run crm             # http://localhost:3456
 ```
 
 - All data goes in `data/` (gitignored)
