@@ -1,0 +1,44 @@
+name: Feature request
+description: Suggest an idea or improvement
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing: please skim [VISION.md](https://github.com/zalatar242/minty/blob/main/VISION.md) and the "out of scope" section in [CONTRIBUTING.md](https://github.com/zalatar242/minty/blob/main/CONTRIBUTING.md). Common non-goals: TypeScript migration, cloud sync, external LLM API integration in core, multi-tenant features.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem would this solve? Who feels this pain?
+      placeholder: When I'm prepping for a meeting, I can't see…
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: Describe the feature. Mockups, API sketches, and user flows welcome.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to solve the same problem, and why this one is better.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: I've read VISION.md and CONTRIBUTING.md "out of scope" — this is aligned with project direction
+          required: true
+        - label: I'd be willing to contribute a PR for this
+          required: false

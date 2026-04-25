@@ -4,6 +4,7 @@ A rolling log of open-source-quality improvements made by an autonomous loop whi
 
 ## Shipped
 
+- **2026-04-25** — Converted issue templates from `.md` to GitHub's YAML form templates (`.yml`). Required fields, typed inputs, `source` dropdown for importer-bug triage. Pattern from Cal.com / Excalidraw — typed forms catch missing repro info before it hits the maintainer.
 - **2026-04-25** — Added live status badges to README: CI status (workflows/ci.yml) + Latest release (auto-updates from GitHub release tags). Pattern from Excalidraw / Plausible — live signals before vanity badges.
 - **2026-04-25** — Added `RELEASING.md` documenting versioning policy, cadence, step-by-step cut, and hotfix flow. Borrowed structure from Keep a Changelog ecosystem (Vue.js / Tailwind release docs) — exact CLI commands, no hand-waving.
 - **2026-04-25** — Added `.github/CODEOWNERS` (solo maintainer for now) so review routing surfaces in the GitHub UI. Pattern is GitHub's stock CODEOWNERS recommendation.
