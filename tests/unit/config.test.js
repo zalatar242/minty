@@ -27,7 +27,9 @@ test('[Config] returns defaults when no file exists', () => {
     const d = mkTemp();
     cfg.invalidate();
     const c = cfg.getConfig(d);
-    assert.equal(c.linkedinAutosync, false);
+    // Default-on: actual scraping still requires the user to click Connect,
+    // so default-true here just means the periodic ticker is wired up.
+    assert.equal(c.linkedinAutosync, true);
     assert.equal(c.demoMode, false);
     assert.equal(c.google.clientId, '');
     assert.equal(c.google.clientSecret, '');

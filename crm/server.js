@@ -5283,6 +5283,13 @@ body { background: var(--bg); }
 
   <!-- Sources -->
   <div id="view-sources" style="display:none">
+    <div id="sources-welcome" style="display:none;max-width:720px;margin-bottom:20px;padding:18px 20px;background:linear-gradient(135deg,rgba(99,102,241,0.12),rgba(139,92,246,0.08));border:1px solid rgba(99,102,241,0.25);border-radius:12px">
+      <div style="font-size:1.05rem;font-weight:700;color:#f0f4ff;margin-bottom:6px">👋 Welcome to Minty</div>
+      <div style="font-size:0.8rem;color:#a5b4cf;line-height:1.55;margin-bottom:0">
+        Connect your first source below to see who matters in your network.
+        WhatsApp + LinkedIn give the most signal — both stay 100% local on your machine.
+      </div>
+    </div>
     <div style="margin-bottom:24px;max-width:720px;display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
       <div>
         <h2 style="font-size:1.25rem;font-weight:700;color:#f0f4ff;letter-spacing:-0.025em;margin-bottom:4px">Data Sources</h2>
@@ -5708,6 +5715,14 @@ async function init() {
       if (listEl) listEl.innerHTML = '<div class="loading" style="color:#ef4444">Render error: ' + e.message + '</div>';
     }
     loadReviewCount();
+    // First-time UX: zero contacts means a fresh install. Drop the user
+    // straight onto Sources with a welcome banner so the first thing they
+    // see is the path to importing data, not an empty Today screen.
+    if (allContacts.length === 0) {
+      const welcome = document.getElementById('sources-welcome');
+      if (welcome) welcome.style.display = 'block';
+      try { showView('sources'); } catch {}
+    }
   }).catch(e => {
     if (listEl) listEl.innerHTML = '<div class="loading" style="color:#ef4444">Failed to load contacts: ' + e.message + '</div>';
   });
@@ -8709,9 +8724,6 @@ function renderSettings(s) {
 }
 
 function renderLinkedinAutosyncCard(s) {
-  const cfg = s.runtimeConfig || {};
-  const enabled = !!cfg.linkedinAutosync;
-  const envForced = !!cfg.envForces?.linkedinAutosync;
   const pwAvailable = !!s.playwrightAvailable;
   const li = s.linkedinState || { status: 'disconnected' };
   const liStatus = li.status || 'disconnected';
@@ -8719,24 +8731,17 @@ function renderLinkedinAutosyncCard(s) {
   const lastSyncStr = lastSyncIso ? fmtSyncAge(lastSyncIso) : null;
 
   const badgeMap = {
-    disconnected:  ['demo',  'disabled'],
+    disconnected:  ['demo',    'not connected'],
     connecting:    ['pending', 'connecting…'],
-    connected:     ['real',  'connected'],
+    connected:     ['real',    'connected'],
     syncing:       ['pending', 'syncing…'],
-    challenge:     ['demo',  'needs reconnect'],
-    error:         ['demo',  'error'],
+    challenge:     ['demo',    'needs reconnect'],
+    error:         ['demo',    'error'],
   };
-  const liBadgePair = enabled ? (badgeMap[liStatus] || badgeMap.connected) : badgeMap.disconnected;
-  const enabledBadge = enabled
-    ? '<span class="settings-mode-badge ' + liBadgePair[0] + '">' + esc(liBadgePair[1]) + '</span>'
-    : '<span class="settings-mode-badge demo">disabled</span>';
+  const [badgeClass, badgeLabel] = badgeMap[liStatus] || badgeMap.disconnected;
 
-  const lastSyncNote = enabled && lastSyncStr
+  const lastSyncNote = lastSyncStr
     ? '<div class="settings-row" style="font-size:11px;color:var(--text-muted)">Last sync: ' + esc(lastSyncStr) + '</div>'
-    : '';
-
-  const envNote = envForced
-    ? '<div class="settings-note settings-note-warn">MINTY_LINKEDIN_AUTOSYNC env var is set — unset it to control from the UI.</div>'
     : '';
 
   const pwNote = !pwAvailable
@@ -8744,39 +8749,30 @@ function renderLinkedinAutosyncCard(s) {
     : '';
 
   const buttons = [];
-  if (enabled) {
-    if (pwAvailable) {
-      if (liStatus === 'disconnected' || liStatus === 'challenge') {
-        buttons.push('<button class="settings-btn" onclick="connectLinkedIn()">' + (liStatus === 'challenge' ? 'Reconnect to LinkedIn' : 'Connect to LinkedIn') + '</button>');
-      } else if (liStatus === 'connected' || liStatus === 'error') {
-        buttons.push('<button class="settings-btn" onclick="syncLinkedInNow()">Sync now</button>');
-        buttons.push('<button class="settings-btn settings-btn-secondary" onclick="connectLinkedIn()">Reconnect</button>');
-      }
-      // syncing/connecting: no extra buttons; toast shows progress
+  if (pwAvailable) {
+    if (liStatus === 'disconnected' || liStatus === 'challenge') {
+      buttons.push('<button class="settings-btn" onclick="connectLinkedIn()">' + (liStatus === 'challenge' ? 'Reconnect to LinkedIn' : 'Connect to LinkedIn') + '</button>');
+    } else if (liStatus === 'connected' || liStatus === 'error') {
+      buttons.push('<button class="settings-btn" onclick="syncLinkedInNow()">Sync now</button>');
+      buttons.push('<button class="settings-btn settings-btn-secondary" onclick="connectLinkedIn()">Reconnect</button>');
     }
-    if (!envForced) {
-      buttons.push('<button class="settings-btn settings-btn-secondary" onclick="setLinkedinAutosync(false)">Disable auto-sync</button>');
-    }
-  } else {
-    const blocked = envForced || !pwAvailable;
-    buttons.push('<button class="settings-btn" onclick="setLinkedinAutosync(true)"' + (blocked ? ' disabled' : '') + '>Enable auto-sync</button>');
+    // syncing/connecting: no actions; the toast surfaces progress.
   }
 
   return \`
     <div class="settings-card">
-      <div class="settings-card-title">LinkedIn auto-sync</div>
+      <div class="settings-card-title">LinkedIn</div>
       <div class="settings-row">
         <div class="settings-row-label">Status</div>
-        <div class="settings-row-value">\${enabledBadge}</div>
+        <div class="settings-row-value"><span class="settings-mode-badge \${badgeClass}">\${esc(badgeLabel)}</span></div>
       </div>
       \${lastSyncNote}
       <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
-        Pulls connections + messages on a 24h schedule via a headless browser.
         Click <b>Connect to LinkedIn</b> once and a Chromium window opens for
-        you to log in — no terminal needed. Experimental and ToS-adjacent.
+        you to log in — no terminal needed. After that, connections + messages
+        sync automatically every 24h. Experimental and ToS-adjacent.
       </div>
       \${pwNote}
-      \${envNote}
       <div class="settings-actions">\${buttons.join(' ')}</div>
     </div>
   \`;
@@ -9109,20 +9105,27 @@ function renderSourceForm(key, status, connected) {
       + '<button class="source-btn secondary" style="width:100%" onclick="document.getElementById(\\'file-linkedin\\').click()">Choose file — Connections.csv, messages.csv, Invitations.csv</button>'
       + '<label class="drop-zone" id="dz-linkedin" ondragover="dzOver(event,\\'linkedin\\')" ondragleave="dzLeave(\\'linkedin\\')" ondrop="dzDrop(event,\\'linkedin\\')" style="margin-top:6px;padding:10px;font-size:0.72rem">or drop here</label>'
       + '<div class="source-log" id="log-linkedin"></div>';
-    let footer;
-    if (!autoEnabled) {
-      // Most-discoverable state: ZIP upload is shown, but tell the user the
-      // browser-based auto-sync alternative exists and where to enable it.
-      footer = '<div style="margin-top:10px;font-size:0.7rem;color:#8892a4">Prefer auto-sync via headless browser? <a href="#" onclick="event.preventDefault();showView(\\'settings\\')" style="color:#6366f1">Enable in Settings</a> (experimental — ToS-adjacent).</div>';
-    } else if (pwMissing) {
-      footer = '<div style="margin-top:10px;font-size:0.7rem;color:#8892a4">Auto-sync needs Playwright. Run <code>npm run linkedin:setup</code> in your terminal.</div>';
-    } else if (li.status === 'disconnected') {
-      // Auto-sync enabled but no session yet — guide to the connect flow.
-      footer = '<div style="margin-top:10px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();connectLinkedIn()" style="color:#6366f1">Connect via browser to start auto-sync</a></div>';
-    } else {
-      footer = '';
-    }
-    el.innerHTML = zipBtn + footer;
+    // Two-method picker: browser-connect is primary (recommended for
+    // ongoing sync), ZIP upload is a secondary disclosure for users who
+    // prefer not to grant a headless-browser session.
+    const pwBlocker = autoEnabled && pwMissing
+      ? '<div style="margin-top:6px;font-size:0.7rem;color:#8892a4">Playwright not installed — run <code>npm install</code> in the project directory once, then reload.</div>'
+      : '';
+    const browserPrimary = autoEnabled
+      ? (pwMissing
+          ? ''
+          : '<button class="source-btn" style="width:100%" onclick="connectLinkedIn()">Connect to LinkedIn</button>'
+            + '<div style="margin-top:6px;font-size:0.7rem;color:#8892a4">Opens a Chromium window for one-time login. Auto-syncs on a 24h schedule afterwards. Experimental — ToS-adjacent.</div>')
+      : '';
+    const zipDisclosure =
+        '<details style="margin-top:14px">'
+      + '  <summary style="font-size:0.75rem;color:var(--text-muted);cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;user-select:none;-webkit-user-select:none">'
+      + '    <span style="font-size:0.5rem;opacity:0.5">▶</span> '
+      + (autoEnabled ? 'Or upload a ZIP file instead' : 'Upload a ZIP file')
+      + '  </summary>'
+      + '  <div style="margin-top:8px">' + zipBtn + '</div>'
+      + '</details>';
+    el.innerHTML = browserPrimary + pwBlocker + zipDisclosure;
     return;
   }
 
