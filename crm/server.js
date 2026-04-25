@@ -20,6 +20,7 @@ const {
     computeGroupSignalScores,
 } = require('./people-graph');
 const sourceProgress = require('../sources/_shared/progress');
+const notifications = require('./notifications');
 
 const PORT = Number(process.env.PORT) || 3456;
 const HOST = process.env.HOST || '127.0.0.1'; // set HOST=0.0.0.0 to expose on LAN
@@ -2275,6 +2276,7 @@ async function handleRemoveEmailAccount(req, res, params, paths, uuid) {
 
 // WhatsApp session management (per user)
 const waClients = {}; // uuid -> { client, qr, status }
+const waSilentResume = new Set(); // uuids whose current init was auto-triggered (no UI watching)
 
 async function handleWhatsappStart(req, res, params, paths, uuid) {
     if (waClients[uuid]?.status === 'ready') return json(res, { status: 'already_connected' });
@@ -2307,9 +2309,23 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
         });
         waClients[uuid].status = 'qr_pending';
         console.log(`WhatsApp QR ready for user ${uuid}`);
+        // If we got here on a silent boot resume, the persisted session is
+        // gone — surface a banner so the user knows to come back and rescan.
+        if (waSilentResume.has(uuid)) {
+            notifications.set(dataDir, 'whatsapp', {
+                needsReauth: true,
+                pauseSync: true,
+                message: 'WhatsApp session expired — open Sources and rescan the QR.',
+            });
+            waSilentResume.delete(uuid);
+        }
     });
 
-    client.on('authenticated', () => { waClients[uuid].status = 'authenticated'; });
+    client.on('authenticated', () => {
+        waClients[uuid].status = 'authenticated';
+        notifications.dismiss(dataDir, 'whatsapp');
+        waSilentResume.delete(uuid);
+    });
 
     client.on('ready', async () => {
         waClients[uuid].status = 'ready';
@@ -2342,7 +2358,15 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
         }
     });
 
-    client.on('auth_failure', () => { waClients[uuid].status = 'auth_failure'; });
+    client.on('auth_failure', () => {
+        waClients[uuid].status = 'auth_failure';
+        notifications.set(dataDir, 'whatsapp', {
+            needsReauth: true,
+            pauseSync: true,
+            message: 'WhatsApp authentication failed — open Sources to reconnect.',
+        });
+        waSilentResume.delete(uuid);
+    });
 
     client.initialize().catch(e => {
         console.error('WhatsApp init error:', e);
@@ -2350,6 +2374,36 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     });
 
     json(res, { status: 'starting' });
+}
+
+// Boot-time silent resume. If the user has a previously paired WhatsApp session
+// on disk, re-initialize the client so the live message listener attaches and
+// stale incremental data catches up. If the persisted session is invalid we
+// surface a banner via notifications.set() and skip future resume attempts
+// (handleWhatsappStart's qr/auth_failure handlers do that themselves).
+function autoResumeWhatsapp(uuid) {
+    if (waClients[uuid]) return; // already running or in QR flow
+    const dataDir = getUserDataDir(uuid);
+    if (notifications.isPaused(dataDir, 'whatsapp')) return; // user hasn't reconnected yet
+    const authDir = path.join(dataDir, '.wwebjs_auth');
+    if (!fs.existsSync(authDir)) return; // user never connected — nothing to resume
+    const paths = getUserPaths(uuid);
+    waSilentResume.add(uuid);
+    const fakeRes = { writeHead: () => {}, end: () => {} };
+    handleWhatsappStart({}, fakeRes, [], paths, uuid)
+        .catch(e => {
+            waSilentResume.delete(uuid);
+            console.error('[autosync] WhatsApp auto-resume failed:', e.message);
+        });
+}
+
+function handleListNotifications(req, res, params, paths, uuid) {
+    json(res, { notifications: notifications.list(getUserDataDir(uuid)) });
+}
+
+function handleDismissNotification(req, res, [source], paths, uuid) {
+    notifications.dismiss(getUserDataDir(uuid), source);
+    json(res, { ok: true });
 }
 
 function handleWhatsappProfilePic(req, res, [encodedId], paths, uuid) {
@@ -3243,6 +3297,8 @@ const ROUTES = [
     ['GET',  /^\/api\/meetings\/([^/]+)\/debrief$/,      handleGetDebrief],
     ['POST', /^\/api\/meetings\/([^/]+)\/debrief$/,      handleSaveDebrief],
     ['POST', /^\/api\/whatsapp\/lid-map$/,               handleSaveLidMap],
+    ['GET',  /^\/api\/notifications$/,                   handleListNotifications],
+    ['POST', /^\/api\/notifications\/([a-zA-Z]+)\/dismiss$/, handleDismissNotification],
     ['GET',  /^\/api\/meta$/,                            (req, res) => json(res, {
         demo: IS_DEMO,
         dataDir: DATA,
@@ -3408,6 +3464,14 @@ server.listen(PORT, HOST, () => {
     } catch (e) {
         console.error('[sync] Failed to start sync daemon:', e.message);
     }
+
+    // Auto-resume WhatsApp if previously paired. Stagger 5s after boot so the
+    // sync daemon initializes first and we don't fight Puppeteer for the
+    // event loop during startup.
+    setTimeout(() => {
+        try { autoResumeWhatsapp(SINGLE_USER_UUID); }
+        catch (e) { console.error('[autosync] WhatsApp boot resume failed:', e.message); }
+    }, 5 * 1000);
 });
 
 // ---------------------------------------------------------------------------
@@ -3871,6 +3935,29 @@ nav {
 }
 .sync-warn-banner svg { flex-shrink: 0; margin-top: 1px; }
 .sync-warn-icon { width: 14px; height: 14px; }
+
+/* Sticky re-auth banner (set by auto-sync on session failure) */
+.notif-banner {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: flex-start; gap: 10px;
+  background: rgba(180, 83, 9, 0.96); color: #fff;
+  padding: 10px 14px; font-size: 0.78rem; line-height: 1.35;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.18);
+  border-bottom: 1px solid rgba(0,0,0,0.15);
+}
+.notif-banner-text { flex: 1; }
+.notif-banner-source { font-weight: 600; margin-right: 6px; text-transform: capitalize; }
+.notif-banner-action {
+  background: rgba(255,255,255,0.18); border: 1px solid rgba(255,255,255,0.3);
+  color: #fff; padding: 4px 10px; border-radius: 6px;
+  font-size: 0.72rem; cursor: pointer; white-space: nowrap;
+}
+.notif-banner-action:hover { background: rgba(255,255,255,0.28); }
+.notif-banner-dismiss {
+  background: transparent; border: 0; color: #fff; opacity: 0.7;
+  font-size: 1rem; cursor: pointer; padding: 0 4px; line-height: 1;
+}
+.notif-banner-dismiss:hover { opacity: 1; }
 
 /* Global sync toast (shown while a background import is running) */
 .sync-toast {
@@ -4675,6 +4762,8 @@ body { background: var(--bg); }
 </head>
 <body>
 
+<div id="notif-banners"></div>
+
 <div id="sync-toast" class="sync-toast" style="display:none" onclick="showView('sources')" role="status" aria-live="polite">
   <span class="sync-toast-spinner" aria-hidden="true"></span>
   <span class="sync-toast-text" id="sync-toast-text">Syncing WhatsApp…</span>
@@ -5116,6 +5205,45 @@ const SOURCE_LABELS = {
 };
 function labelForSource(key) { return SOURCE_LABELS[key] || key; }
 
+async function pollNotifications() {
+  const host = document.getElementById('notif-banners');
+  if (!host) return;
+  let notifs = {};
+  try {
+    const r = await fetch(BASE + '/api/notifications');
+    if (!r.ok) return;
+    const data = await r.json();
+    notifs = (data && data.notifications) || {};
+  } catch { return; }
+
+  const keys = Object.keys(notifs);
+  if (keys.length === 0) { host.innerHTML = ''; return; }
+
+  host.innerHTML = keys.map(key => {
+    const n = notifs[key] || {};
+    const label = labelForSource(key);
+    const msg = esc(n.message || (label + ' needs attention.'));
+    const target = key === 'whatsapp' ? "showView('sources')" : '';
+    return \`
+      <div class="notif-banner" role="alert">
+        <span class="notif-banner-text">
+          <span class="notif-banner-source">\${esc(label)}:</span>\${msg}
+        </span>
+        \${target ? \`<button class="notif-banner-action" onclick="\${target}">Open Sources</button>\` : ''}
+        <button class="notif-banner-action" onclick="dismissNotification('\${esc(key)}')">I've re-authed</button>
+        <button class="notif-banner-dismiss" aria-label="Dismiss" onclick="dismissNotification('\${esc(key)}')">×</button>
+      </div>
+    \`;
+  }).join('');
+}
+
+async function dismissNotification(key) {
+  try {
+    await fetch(BASE + '/api/notifications/' + encodeURIComponent(key) + '/dismiss', { method: 'POST' });
+  } catch { /* ignore */ }
+  pollNotifications();
+}
+
 async function pollSyncToast() {
   const toast = document.getElementById('sync-toast');
   const text = document.getElementById('sync-toast-text');
@@ -5401,6 +5529,9 @@ async function init() {
     pollSyncToast();
     syncToastPoller = setInterval(pollSyncToast, 2000);
   }
+  // Notification banners (re-auth, etc.) — poll every 30s
+  pollNotifications();
+  setInterval(pollNotifications, 30 * 1000);
 
   // Load contacts in background and populate People view when ready
   const listEl = document.getElementById('contact-list');
