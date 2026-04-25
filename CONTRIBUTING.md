@@ -34,18 +34,41 @@ Minty is **AGPL-3.0**. By contributing, you agree your contributions are license
 
 We do **not** use a CLA. If Minty ever offers a commercial license alongside AGPL, it will be through a separate proprietary codebase in `ee/`, not by relicensing community contributions. Your code stays AGPL-3.0, forever.
 
+## Where to start
+
+New here? Read [ARCHITECTURE.md](./ARCHITECTURE.md) first — 10-min tour of the codebase. Then:
+
+- **First time looking for something to do:** filter issues by [`good first issue`](https://github.com/zalatar242/minty/labels/good%20first%20issue) and [`help wanted`](https://github.com/zalatar242/minty/labels/help%20wanted). If none are open, the highest-leverage drive-by fixes are usually: fixing a bug you hit yourself, improving an importer for a source you actually use, or tightening the matcher with a test fixture.
+- **Adding a new importer:** see ARCHITECTURE.md → "Where to start as a contributor".
+- **Touching matching:** read `crm/MATCHING.md` and add a fixture under `tests/unit/`.
+
 ## Development
 
 ```bash
 git clone https://github.com/zalatar242/minty.git
 cd minty
 npm install
-npm run crm  # http://localhost:3456
+git config core.hooksPath .githooks   # enables pre-push preflight
+npm run crm                            # http://localhost:3456
 ```
 
 - All data goes in `data/` (gitignored)
 - Client JS lives inline in `crm/server.js` (intentional — single-file SPA)
 - No build step, no bundler
+
+## Testing
+
+```bash
+npm test                  # unit tests (node --test, ~seconds)
+npm run test:integration  # integration tests
+npm run test:smoke        # Playwright smoke E2E (needs `npx playwright install chromium` first)
+npm run test:e2e          # full E2E suite
+npm run preflight         # what runs on `git push` — unit + e2e smokes
+```
+
+The pre-push hook runs `scripts/preflight.sh` automatically once you've set `core.hooksPath` (above). Bypass with `git push --no-verify` only if you have a reason — CI runs the same checks.
+
+When fixing a bug, add a test that fails before your fix and passes after. When adding a feature, add a test that exercises the happy path. We don't have full coverage and that's fine — we have *enough* coverage to keep the matcher honest and the unified store consistent.
 
 ## AI-assisted contributions
 
