@@ -4715,7 +4715,7 @@ nav {
   .nav-link.active { border-left-color: transparent; border-top-color: var(--accent); background: rgba(99,102,241,0.06); }
   .nav-label { display: inline; font-size: 10px; letter-spacing: 0; }
   /* Primary tabs: Today, People, Network — secondary items hidden in bottom bar */
-  #nav-ask, #nav-groups, #nav-intros, #nav-sources, #nav-review, .nav-cmd-hint { display: none; }
+  #nav-ask, #nav-groups, #nav-intros, #nav-sources, #nav-review, #nav-settings, .nav-cmd-hint { display: none; }
   .nav-more-btn { display: flex !important; }
   /* Contact detail: full viewport, prominent back */
   .back-btn { font-size: 1.3rem; padding: 10px 14px; background: var(--bg-card); border-radius: 8px; margin-right: 4px; }
@@ -5021,6 +5021,15 @@ body { background: var(--bg); }
       </span>
       <span class="nav-label">Review</span>
       <span class="nav-badge" id="review-badge" style="display:none"></span>
+    </button>
+    <button class="nav-link" id="nav-settings" onclick="showView('settings')" title="Settings">
+      <span class="nav-icon">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="9" cy="9" r="2.5"/>
+          <path d="M14.7 11A1.5 1.5 0 0015 9.5l1.1-.9-1-1.7-1.4.4a1.5 1.5 0 00-1.3-.8l-.4-1.4h-2l-.4 1.4a1.5 1.5 0 00-1.3.8l-1.4-.4-1 1.7L4 9.5a1.5 1.5 0 00.3 1.5L3 11.9l1 1.7 1.4-.4a1.5 1.5 0 001.3.8l.4 1.4h2l.4-1.4a1.5 1.5 0 001.3-.8l1.4.4 1-1.7-1.1-.9z"/>
+        </svg>
+      </span>
+      <span class="nav-label">Settings</span>
     </button>
     <button class="nav-cmd-hint" onclick="openPalette()" title="Command palette (⌘K)">
       <span class="nav-icon" style="font-size:0.7rem;color:var(--text-muted)">⌘K</span>
