@@ -4,6 +4,7 @@ A rolling log of open-source-quality improvements made by an autonomous loop whi
 
 ## Shipped
 
+- **2026-04-25** — Added `.github/labels.json` (21 labels: workflow, severity, source-area, triage) + `scripts/sync-labels.js` and `npm run labels:sync` so labels are version-controlled and provisionable with `gh label create --force`. Pattern from Probot/`label-sync` ecosystem — declarative JSON > clicking through GitHub UI.
 - **2026-04-25** — Slimmed README "Project structure" to a 6-line redirect to ARCHITECTURE.md (was 26 lines duplicating it). Single source of truth.
 - **2026-04-25** — Added `docs/adr/README.md` formalising the ADR convention (when to write one, how, status lifecycle, index). Pattern from Michael Nygard's lightweight-ADR template.
 - **2026-04-25** — Converted issue templates from `.md` to GitHub's YAML form templates (`.yml`). Required fields, typed inputs, `source` dropdown for importer-bug triage. Pattern from Cal.com / Excalidraw — typed forms catch missing repro info before it hits the maintainer.
