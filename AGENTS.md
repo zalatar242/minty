@@ -65,7 +65,7 @@ This means AI work happens once per scheduled run, and the product stays free to
 4. **Verify the UI** — no JS errors in the browser console, API returns sensible data. The Chrome DevTools MCP is wired in `.mcp.json`, so you can ask the agent to drive a real browser instead of guessing.
 5. **Commit with a clear message**: `feat: [description]`, `fix: [description]`, `refactor: [description]`
 6. **One PR = one topic.** Bundled PRs get closed (see CONTRIBUTING.md)
-7. **Push runs preflight automatically** (lint + unit + e2e) via `.githooks/pre-push`. Bypass with `--no-verify` only when you have a reason.
+7. **Push runs preflight automatically** (unit + e2e) via `.githooks/pre-push`. Bypass with `--no-verify` only when you have a reason.
 
 ---
 

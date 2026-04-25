@@ -61,7 +61,9 @@ function init() {
         },
     });
     ready = true;
-    console.log('[observability] error monitoring active (' + new URL(DSN).host + ')');
+    let dsnHost = 'unknown-host';
+    try { dsnHost = new URL(DSN).host; } catch {}
+    console.log('[observability] error monitoring active (' + dsnHost + ')');
 }
 
 function captureException(err, context) {

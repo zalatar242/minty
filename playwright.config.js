@@ -4,7 +4,8 @@ const { defineConfig, devices } = require('@playwright/test');
 const path = require('path');
 
 const PORT = Number(process.env.MINTY_E2E_PORT) || 3789;
-const BASE_URL = process.env.MINTY_E2E_BASE_URL || `http://127.0.0.1:${PORT}`;
+const LOCAL_SERVER_URL = `http://127.0.0.1:${PORT}`;
+const BASE_URL = process.env.MINTY_E2E_BASE_URL || LOCAL_SERVER_URL;
 
 module.exports = defineConfig({
     testDir: './tests/e2e',
@@ -30,7 +31,7 @@ module.exports = defineConfig({
 
     webServer: {
         command: 'node crm/server.js',
-        url: `${BASE_URL}/api/meta`,
+        url: `${LOCAL_SERVER_URL}/api/meta`,
         reuseExistingServer: !process.env.CI,
         timeout: 30_000,
         cwd: path.resolve(__dirname),

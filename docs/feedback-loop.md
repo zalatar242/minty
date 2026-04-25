@@ -26,7 +26,7 @@ The Stagehand smoke is opt-in. It needs `ANTHROPIC_API_KEY` (or `OPENAI_API_KEY`
 
 ```
 npm run hooks:install   # one-time, sets core.hooksPath to .githooks
-npm run preflight       # runs lint + unit + e2e
+npm run preflight       # runs unit + e2e (e2e skipped if Chromium not installed)
 ```
 
 The pre-push hook runs preflight automatically. Override with `git push --no-verify` only when you have a reason. E2E is skipped if Playwright's Chromium isn't installed locally, so the hook stays usable on a fresh checkout.
