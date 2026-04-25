@@ -1302,6 +1302,8 @@ function handleGetSettings(_req, res) {
             return { contacts: cs.length, interactions: ix.length };
         } catch { return { contacts: 0, interactions: 0 }; }
     };
+    let playwrightAvailable = false;
+    try { require.resolve('playwright'); playwrightAvailable = true; } catch {}
     json(res, {
         currentMode: IS_DEMO ? 'demo' : 'real',
         dataDir: DATA,
@@ -1309,6 +1311,12 @@ function handleGetSettings(_req, res) {
         demo: { dir: demoDir, ...stat(demoDir) },
         real: { dir: realDir, ...stat(realDir) },
         envOverride: !!(process.env.CRM_DATA_DIR || process.env.MINTY_DEMO),
+        linkedinAutosync: {
+            enabled: LINKEDIN_AUTOSYNC_ENABLED,
+            persisted: readPersistedLinkedInAutosync(),
+            playwrightAvailable,
+            envForced: process.env.MINTY_LINKEDIN_AUTOSYNC === '1',
+        },
     });
 }
 
@@ -1338,6 +1346,28 @@ async function handleSetMode(req, res) {
  * Regenerates data-demo from scratch using scripts/seed-dev-data.js.
  * Useful after pulling new fixture changes.
  */
+/**
+ * POST /api/settings/linkedin-autosync  { enabled: boolean }
+ * Persists the auto-sync flag to minty-mode.json. Server-side gating is
+ * bound at boot (so the LinkedIn endpoints can stay closed when disabled),
+ * which means a toggle requires a restart — surfaced clearly to the UI.
+ */
+async function handleSetLinkedInAutosync(req, res) {
+    const body_ = await body(req);
+    const enabled = !!(body_ && body_.enabled);
+    let mode = {};
+    try { mode = JSON.parse(fs.readFileSync(MODE_FILE, 'utf8')) || {}; } catch { mode = {}; }
+    mode.linkedinAutosync = enabled;
+    mode.updatedAt = new Date().toISOString();
+    fs.writeFileSync(MODE_FILE, JSON.stringify(mode, null, 2));
+    json(res, {
+        ok: true,
+        savedEnabled: enabled,
+        currentEnabled: LINKEDIN_AUTOSYNC_ENABLED,
+        restartRequired: enabled !== LINKEDIN_AUTOSYNC_ENABLED,
+    });
+}
+
 async function handleSeedDemo(_req, res) {
     const { execFileSync } = require('child_process');
     try {
@@ -3203,12 +3233,23 @@ async function handleNetworkQuery(req, res, _params, paths) {
 }
 
 // ── LinkedIn auto-sync (opt-in, experimental) ──────────────────────────────
-// Gated behind MINTY_LINKEDIN_AUTOSYNC=1 env flag. All three endpoints return
-// 404 when the flag is unset — this is the feature's kill-switch. POST endpoints
-// also enforce Origin/Sec-Fetch-Site (via sources/linkedin/origin-check.js) to
-// prevent a drive-by webpage from spawning a Chromium process on the user's machine.
+// Two ways to enable, in order of precedence:
+//   1. MINTY_LINKEDIN_AUTOSYNC=1 env var (immediate, no restart needed for
+//      future runs but the current process must be set up that way at boot)
+//   2. minty-mode.json { linkedinAutosync: true } — toggled from Settings UI
+//      via POST /api/settings/linkedin-autosync. Read at server boot.
+//
+// All endpoints return 404 when the flag is unset — this is the feature's
+// kill-switch. POST endpoints also enforce Origin/Sec-Fetch-Site (via
+// sources/linkedin/origin-check.js) to prevent a drive-by webpage from
+// spawning a Chromium process on the user's machine.
 
-const LINKEDIN_AUTOSYNC_ENABLED = process.env.MINTY_LINKEDIN_AUTOSYNC === '1';
+function readPersistedLinkedInAutosync() {
+    try { return !!JSON.parse(fs.readFileSync(MODE_FILE, 'utf8')).linkedinAutosync; }
+    catch { return false; }
+}
+const LINKEDIN_AUTOSYNC_ENABLED = process.env.MINTY_LINKEDIN_AUTOSYNC === '1'
+    || readPersistedLinkedInAutosync();
 
 function readLinkedInState() {
     try {
@@ -3324,6 +3365,7 @@ const ROUTES = [
     ['GET',  /^\/api\/settings$/,                        handleGetSettings],
     ['POST', /^\/api\/settings\/mode$/,                  handleSetMode],
     ['POST', /^\/api\/settings\/seed-demo$/,             handleSeedDemo],
+    ['POST', /^\/api\/settings\/linkedin-autosync$/,     handleSetLinkedInAutosync],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -5367,169 +5409,6 @@ async function pollSyncToast() {
     return;
   }
   toast.style.display = 'none';
-}
-
-// ============================================================
-// Command palette (Cmd/Ctrl+K)
-// ============================================================
-let paletteResults = [];
-let paletteActiveIdx = 0;
-let paletteDebounce = null;
-
-function openPalette() {
-  const o = document.getElementById('palette-overlay');
-  if (!o) return;
-  o.classList.add('open');
-  const input = document.getElementById('palette-input');
-  input.value = '';
-  paletteActiveIdx = 0;
-  paletteQuery('');
-  setTimeout(() => { input.focus(); input.select(); }, 10);
-}
-
-function closePalette() {
-  document.getElementById('palette-overlay')?.classList.remove('open');
-}
-
-async function paletteQuery(q) {
-  try {
-    const r = await fetch(BASE + '/api/palette?q=' + encodeURIComponent(q));
-    if (!r.ok) return;
-    const data = await r.json();
-    paletteResults = data.results || [];
-    paletteActiveIdx = 0;
-    renderPalette();
-  } catch {}
-}
-
-function renderPalette() {
-  const el = document.getElementById('palette-results');
-  if (!el) return;
-  if (paletteResults.length === 0) {
-    el.innerHTML = '<div class="palette-empty">No matches yet — try a name, company, or message snippet.</div>';
-    return;
-  }
-  // Group by type for display
-  const order = ['contact', 'conversation', 'goal', 'company', 'nav'];
-  const labels = { contact: 'People', conversation: 'In conversations', goal: 'Goals', company: 'Companies', nav: 'Go to' };
-  const groups = {};
-  paletteResults.forEach((r, i) => {
-    if (!groups[r.type]) groups[r.type] = [];
-    groups[r.type].push({ ...r, _idx: i });
-  });
-  const parts = [];
-  for (const key of order) {
-    if (!groups[key]) continue;
-    parts.push('<div class="palette-group"><div class="palette-group-label">' + labels[key] + '</div>');
-    for (const r of groups[key]) {
-      parts.push(paletteItemHtml(r));
-    }
-    parts.push('</div>');
-  }
-  el.innerHTML = parts.join('');
-  paletteUpdateActive();
-}
-
-function paletteItemHtml(r) {
-  const active = r._idx === paletteActiveIdx ? ' active' : '';
-  const badge = r.type.charAt(0).toUpperCase() + r.type.slice(1);
-  const initials = (r.label || '?').split(/\\s+/).slice(0,2).map(s => s.charAt(0).toUpperCase()).join('');
-  const ring = r.type === 'contact' ? '<span class="palette-score-ring ' + tierFor(r.relationshipScore) + '"></span>' : '';
-  const avatar = r.type === 'contact' ? '<div class="palette-item-avatar">' + escapeHtml(initials) + '</div>' : '<div class="palette-item-avatar" style="background:linear-gradient(135deg,#1e2d45,#4b5563)">·</div>';
-  return '<div class="palette-item' + active + '" data-idx="' + r._idx + '" onclick="paletteSelect(' + r._idx + ')">'
-    + avatar
-    + ring
-    + '<div class="palette-item-body">'
-    + '<div class="palette-item-title">' + escapeHtml(r.label || '') + '</div>'
-    + (r.sublabel ? '<div class="palette-item-sub">' + escapeHtml(r.sublabel) + '</div>' : '')
-    + '</div>'
-    + '<span class="palette-item-type">' + badge + '</span>'
-    + '</div>';
-}
-
-function tierFor(score) {
-  if (score == null) return 'none';
-  if (score >= 70) return 'strong';
-  if (score >= 40) return 'good';
-  if (score >= 20) return 'warm';
-  if (score > 0)   return 'fading';
-  return 'none';
-}
-
-function escapeHtml(s) {
-  return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function paletteUpdateActive() {
-  document.querySelectorAll('.palette-item').forEach(el => {
-    el.classList.toggle('active', Number(el.getAttribute('data-idx')) === paletteActiveIdx);
-  });
-  const active = document.querySelector('.palette-item.active');
-  if (active) active.scrollIntoView({ block: 'nearest' });
-}
-
-function paletteSelect(idx) {
-  const r = paletteResults[idx];
-  if (!r) return;
-  closePalette();
-  if (r.type === 'nav') { showView(r.action); return; }
-  if (r.type === 'contact') { showContact(r.id); return; }
-  if (r.type === 'conversation') {
-    if (r.contactId) showContact(r.contactId);
-    return;
-  }
-  if (r.type === 'goal') {
-    showView('today');
-    return;
-  }
-  if (r.type === 'company') {
-    // Jump to Ask prefilled with "at <company>"
-    showView('ask');
-    const input = document.getElementById('ask-input');
-    if (input) { input.value = 'at ' + r.name; input.focus(); }
-    return;
-  }
-}
-
-document.addEventListener('keydown', (e) => {
-  const isOpen = document.getElementById('palette-overlay')?.classList.contains('open');
-  if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
-    e.preventDefault(); isOpen ? closePalette() : openPalette(); return;
-  }
-  if (!isOpen) return;
-  if (e.key === 'Escape') { e.preventDefault(); closePalette(); return; }
-  if (e.key === 'ArrowDown') {
-    e.preventDefault();
-    if (paletteResults.length === 0) return;
-    paletteActiveIdx = (paletteActiveIdx + 1) % paletteResults.length;
-    paletteUpdateActive(); return;
-  }
-  if (e.key === 'ArrowUp') {
-    e.preventDefault();
-    if (paletteResults.length === 0) return;
-    paletteActiveIdx = (paletteActiveIdx - 1 + paletteResults.length) % paletteResults.length;
-    paletteUpdateActive(); return;
-  }
-  if (e.key === 'Enter') {
-    e.preventDefault();
-    paletteSelect(paletteActiveIdx); return;
-  }
-});
-
-document.addEventListener('click', (e) => {
-  const overlay = document.getElementById('palette-overlay');
-  if (!overlay?.classList.contains('open')) return;
-  if (e.target === overlay) closePalette();
-});
-
-function wirePaletteInput() {
-  const input = document.getElementById('palette-input');
-  if (!input) return;
-  input.addEventListener('input', () => {
-    clearTimeout(paletteDebounce);
-    const q = input.value;
-    paletteDebounce = setTimeout(() => paletteQuery(q), 80);
-  });
 }
 
 // ============================================================
@@ -8683,6 +8562,24 @@ function renderSettings(s) {
     ? '<div class="settings-note settings-note-warn">Mode is being forced via an env var (CRM_DATA_DIR or MINTY_DEMO). Clear the env to let this setting take effect.</div>'
     : '';
 
+  // LinkedIn auto-sync section
+  const li = s.linkedinAutosync || {};
+  const liEnabled = !!li.enabled;
+  const liEnvForced = !!li.envForced;
+  const liPwInstalled = !!li.playwrightAvailable;
+  const liStatusBadge = liEnabled
+    ? '<span class="settings-mode-badge demo">enabled</span>'
+    : '<span class="settings-mode-badge" style="background:rgba(75,85,99,0.18);color:#9ca3af">disabled</span>';
+  const liEnvNote = liEnvForced
+    ? '<div class="settings-note settings-note-warn">Forced on by MINTY_LINKEDIN_AUTOSYNC=1 env var. Clear it if you want to toggle from this UI.</div>'
+    : '';
+  const liPwNote = !liPwInstalled
+    ? '<div class="settings-note settings-note-warn">Playwright is not installed. Run <code>npm run linkedin:setup</code> in your terminal to install Chromium (~300 MB), then come back.</div>'
+    : '';
+  const liToggleBtn = liEnvForced
+    ? ''
+    : '<button class="settings-btn" onclick="setLinkedinAutosync(' + (!liEnabled) + ')">' + (liEnabled ? 'Disable' : 'Enable') + ' LinkedIn auto-sync</button>';
+
   return \`
     <div class="settings-card">
       <div class="settings-row">
@@ -8710,6 +8607,31 @@ function renderSettings(s) {
     </div>
 
     <div class="settings-card">
+      <div class="settings-card-title">LinkedIn auto-sync</div>
+      <div class="settings-row">
+        <div class="settings-row-label">Status</div>
+        <div class="settings-row-value">\${liStatusBadge}</div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label">Playwright</div>
+        <div class="settings-row-value" style="font-size:11px;color:var(--text-secondary)">
+          \${liPwInstalled ? 'Installed ✓' : 'Not installed — required for headful sign-in'}
+        </div>
+      </div>
+      <div class="settings-row" style="font-size:11px;color:var(--text-muted);line-height:1.6">
+        Drives a real Chromium session to scrape your connections + messages
+        without waiting 24h for LinkedIn's ZIP export. Experimental and
+        ToS-adjacent. When enabled, the Sources page exposes 'Connect
+        LinkedIn' / 'Sync now' / stored-credential auto-login.
+      </div>
+      \${liEnvNote}
+      \${liPwNote}
+      <div class="settings-actions">
+        \${liToggleBtn}
+      </div>
+    </div>
+
+    <div class="settings-card">
       <div class="settings-card-title">About</div>
       <div class="settings-row"><div class="settings-row-label">Version</div><div class="settings-row-value">\${esc(s.dataDir.split('/').pop())} · v\${esc((window.__BASE__ || '') || 'dev')}</div></div>
       <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
@@ -8729,6 +8651,18 @@ async function setMode(mode) {
   if (r.error) { alert(r.error); return; }
   if (r.restartRequired) {
     alert('Mode saved as "' + r.savedMode + '". Restart Minty to apply:\\n\\n  Stop the current process (Ctrl+C in the terminal),\\n  then run:  npm run crm');
+  }
+  loadSettings();
+}
+
+async function setLinkedinAutosync(enabled) {
+  const r = await fetch(BASE + '/api/settings/linkedin-autosync', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled }),
+  }).then(r => r.json());
+  if (r.error) { alert(r.error); return; }
+  if (r.restartRequired) {
+    alert('LinkedIn auto-sync ' + (enabled ? 'enabled' : 'disabled') + '. Restart Minty to apply:\\n\\n  Stop the current process (Ctrl+C in the terminal),\\n  then run:  npm run crm');
   }
   loadSettings();
 }
@@ -9256,7 +9190,7 @@ Object.assign(window, {
   startEmailDevice, removeEmailAccount,
   copyName, copyIntro,
   loadGroupDetail, saveLidLabels,
-  loadSettings, setMode, seedDemo,
+  loadSettings, setMode, seedDemo, setLinkedinAutosync,
   reviewDecide, reviewBack,
   saveScoreOverride, clearScoreOverride, toggleScoreOverride,
   openDraftPanel, copyDraft,
