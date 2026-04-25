@@ -23,7 +23,28 @@ const sourceProgress = require('../sources/_shared/progress');
 
 const PORT = Number(process.env.PORT) || 3456;
 const HOST = process.env.HOST || '127.0.0.1'; // set HOST=0.0.0.0 to expose on LAN
-const DATA = path.join(__dirname, '../data');
+// Data directory — defaults to ./data, but the mode persisted in
+// `minty-mode.json` (or env vars at boot) chooses between real and demo.
+//   CRM_DATA_DIR=/abs/path  → use that exactly (highest priority)
+//   MINTY_DEMO=1            → force ./data-demo
+//   minty-mode.json:        → { mode: 'demo' | 'real' } persisted by the
+//                              Settings UI; survives restarts.
+const MODE_FILE = path.join(__dirname, '../minty-mode.json');
+function readPersistedMode() {
+    try { return JSON.parse(fs.readFileSync(MODE_FILE, 'utf8')).mode || null; }
+    catch { return null; }
+}
+function writePersistedMode(mode) {
+    fs.writeFileSync(MODE_FILE, JSON.stringify({ mode, updatedAt: new Date().toISOString() }, null, 2));
+}
+const PERSISTED_MODE = readPersistedMode();
+const DATA = process.env.CRM_DATA_DIR
+    ? path.resolve(process.env.CRM_DATA_DIR)
+    : (process.env.MINTY_DEMO === '1' || PERSISTED_MODE === 'demo'
+        ? path.join(__dirname, '../data-demo')
+        : path.join(__dirname, '../data'));
+const IS_DEMO = process.env.MINTY_DEMO === '1' || PERSISTED_MODE === 'demo'
+    || /(^|\/)data-demo($|\/)/.test(DATA);
 
 // Request body size caps (defense against memory DoS)
 const JSON_BODY_MAX   = 1 * 1024 * 1024;    // 1 MB for JSON POSTs
@@ -1262,6 +1283,71 @@ function loadWhatsAppChatsRaw() {
     try {
         return JSON.parse(fs.readFileSync(path.join(DATA, 'whatsapp/chats.json'), 'utf8')) || {};
     } catch { return {}; }
+}
+
+/**
+ * GET /api/settings — current mode, data dir, demo dataset stats.
+ */
+function handleGetSettings(_req, res) {
+    const demoDir = path.join(__dirname, '../data-demo');
+    const realDir = path.join(__dirname, '../data');
+    const stat = (dir) => {
+        try {
+            const cs = JSON.parse(fs.readFileSync(path.join(dir, 'unified/contacts.json'), 'utf8'));
+            const ix = JSON.parse(fs.readFileSync(path.join(dir, 'unified/interactions.json'), 'utf8'));
+            return { contacts: cs.length, interactions: ix.length };
+        } catch { return { contacts: 0, interactions: 0 }; }
+    };
+    json(res, {
+        currentMode: IS_DEMO ? 'demo' : 'real',
+        dataDir: DATA,
+        persistedMode: readPersistedMode(),
+        demo: { dir: demoDir, ...stat(demoDir) },
+        real: { dir: realDir, ...stat(realDir) },
+        envOverride: !!(process.env.CRM_DATA_DIR || process.env.MINTY_DEMO),
+    });
+}
+
+/**
+ * POST /api/settings/mode  { mode: 'demo' | 'real' }
+ * Persists the mode to minty-mode.json. Server-side data dir is bound at
+ * boot, so a switch needs a restart — we surface that clearly.
+ */
+async function handleSetMode(req, res) {
+    const body_ = await body(req);
+    const mode = body_ && body_.mode;
+    if (!['demo', 'real'].includes(mode)) {
+        return json(res, { error: 'mode must be "demo" or "real"' }, 400);
+    }
+    writePersistedMode(mode);
+    const current = IS_DEMO ? 'demo' : 'real';
+    json(res, {
+        ok: true,
+        savedMode: mode,
+        currentMode: current,
+        restartRequired: mode !== current,
+    });
+}
+
+/**
+ * POST /api/settings/seed-demo
+ * Regenerates data-demo from scratch using scripts/seed-dev-data.js.
+ * Useful after pulling new fixture changes.
+ */
+async function handleSeedDemo(_req, res) {
+    const { execFileSync } = require('child_process');
+    try {
+        const demoDir = path.join(__dirname, '../data-demo');
+        const out = execFileSync('node', [path.join(__dirname, '../scripts/seed-dev-data.js'), '--clean'], {
+            cwd: path.join(__dirname, '..'),
+            env: { ...process.env, CRM_DATA_DIR: demoDir },
+            encoding: 'utf8',
+            timeout: 60000,
+        });
+        json(res, { ok: true, output: out.split('\n').slice(-10).join('\n') });
+    } catch (e) {
+        json(res, { error: e.message }, 500);
+    }
 }
 
 function loadLidMap() {
@@ -3153,6 +3239,15 @@ const ROUTES = [
     ['GET',  /^\/api\/meetings\/([^/]+)\/debrief$/,      handleGetDebrief],
     ['POST', /^\/api\/meetings\/([^/]+)\/debrief$/,      handleSaveDebrief],
     ['POST', /^\/api\/whatsapp\/lid-map$/,               handleSaveLidMap],
+    ['GET',  /^\/api\/meta$/,                            (req, res) => json(res, {
+        demo: IS_DEMO,
+        dataDir: DATA,
+        persistedMode: readPersistedMode(),
+        version: require('../package.json').version,
+    })],
+    ['GET',  /^\/api\/settings$/,                        handleGetSettings],
+    ['POST', /^\/api\/settings\/mode$/,                  handleSetMode],
+    ['POST', /^\/api\/settings\/seed-demo$/,             handleSeedDemo],
     ['GET',  /^\/api\/wa-pic\/([^/]+)$/,                   handleWhatsappProfilePic],
     ['GET',  /^\/api\/contacts\/([^/]+)\/timeline$/,     handleGetTimeline],
     ['GET',  /^\/api\/contacts\/([^/]+)\/interactions$/, handleGetInteractions],
@@ -3286,8 +3381,9 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, HOST, () => {
     console.log('');
-    console.log('  🌿 Minty is running');
+    console.log('  🌿 Minty is running' + (IS_DEMO ? '  ✨ DEMO mode' : ''));
     console.log(`     Local:  http://localhost:${PORT}`);
+    console.log(`     Data:   ${DATA}`);
     if (HOST === '0.0.0.0') {
         const nets = os.networkInterfaces();
         for (const name of Object.keys(nets)) {
@@ -4236,6 +4332,46 @@ nav {
 }
 .lid-label-save:hover { background: var(--accent-hover); }
 .lid-label-save:disabled { opacity: 0.5; cursor: default; }
+
+/* ---- Settings ---- */
+.settings-card {
+  background: var(--bg-card); border: 1px solid var(--border);
+  border-radius: 10px; padding: 20px; margin-bottom: 16px;
+}
+.settings-card-title {
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em;
+  color: var(--text-muted); font-weight: 600; margin-bottom: 12px;
+}
+.settings-row {
+  display: flex; align-items: center; gap: 16px;
+  padding: 10px 0; border-bottom: 1px solid var(--border);
+}
+.settings-row:last-child { border-bottom: 0; }
+.settings-row-label { font-size: 13px; color: var(--text-secondary); flex-shrink: 0; min-width: 110px; }
+.settings-row-value { font-size: 13px; color: var(--text-primary); flex: 1; }
+.settings-mode-badge {
+  font-size: 11px; font-weight: 600; padding: 3px 10px;
+  border-radius: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+}
+.settings-mode-badge.real { background: rgba(34,197,94,0.15); color: #86efac; }
+.settings-mode-badge.demo { background: rgba(168,139,250,0.18); color: #c4b5fd; }
+.settings-actions { margin-top: 14px; display: flex; gap: 10px; }
+.settings-btn {
+  padding: 8px 16px; background: var(--accent); color: white;
+  border: 0; border-radius: 8px; font-size: 13px; font-weight: 500;
+  cursor: pointer; font-family: inherit;
+}
+.settings-btn:hover { background: var(--accent-hover); }
+.settings-btn-secondary {
+  background: transparent; color: var(--text-secondary);
+  border: 1px solid var(--border); font-size: 11px; padding: 4px 10px;
+}
+.settings-btn-secondary:hover { border-color: var(--accent); color: var(--text-primary); }
+.settings-note {
+  margin: 12px 0; padding: 10px 12px; border-radius: 8px;
+  font-size: 12px; color: var(--text-secondary);
+}
+.settings-note-warn { background: rgba(251,191,36,0.08); border: 1px solid rgba(251,191,36,0.25); color: #fcd34d; }
 .group-detail-body { flex: 1; display: flex; overflow: hidden; gap: 0; }
 .group-feed { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
 .group-msg { background: #1a1f2e; border-radius: 8px; padding: 8px 12px; }
@@ -4699,6 +4835,13 @@ body { background: var(--bg); }
     </svg>
     Review
   </button>
+  <button class="more-sheet-item" id="more-settings" onclick="showView('settings');closeMoreSheet()">
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="9" cy="9" r="2.5"/>
+      <path d="M14.7 11A1.5 1.5 0 0015 9.5l1.1-.9-1-1.7-1.4.4a1.5 1.5 0 00-1.3-.8l-.4-1.4h-2l-.4 1.4a1.5 1.5 0 00-1.3.8l-1.4-.4-1 1.7L4 9.5a1.5 1.5 0 00.3 1.5L3 11.9l1 1.7 1.4-.4a1.5 1.5 0 001.3.8l.4 1.4h2l.4-1.4a1.5 1.5 0 001.3-.8l1.4.4 1-1.7-1.1-.9z"/>
+    </svg>
+    Settings
+  </button>
 </div>
 
 <!-- Command palette overlay -->
@@ -4899,6 +5042,13 @@ body { background: var(--bg); }
 
   <!-- Contact detail -->
   <div id="view-contact" style="display:none"></div>
+
+  <!-- Settings -->
+  <div id="view-settings" style="display:none;padding:32px 28px;overflow-y:auto;max-width:720px">
+    <h2 style="font-size:1.25rem;font-weight:700;color:var(--text-primary);letter-spacing:-0.025em;margin-bottom:4px">Settings</h2>
+    <p style="font-size:0.76rem;color:var(--text-muted);margin-bottom:24px;line-height:1.5">Configure how Minty stores and serves your data.</p>
+    <div id="settings-body"><div class="loading">Loading…</div></div>
+  </div>
 
   <!-- Review queue -->
   <div id="view-review" style="display:none">
@@ -5346,12 +5496,14 @@ function showView(view) {
   document.getElementById('view-intros').style.display    = view === 'intros'    ? 'flex' : 'none';
   document.getElementById('view-review').style.display    = view === 'review'    ? 'flex' : 'none';
   document.getElementById('view-sources').style.display   = view === 'sources'   ? 'block' : 'none';
+  const settingsView = document.getElementById('view-settings');
+  if (settingsView) settingsView.style.display = view === 'settings' ? 'block' : 'none';
   // Close more sheet if open
   closeMoreSheet();
   document.querySelectorAll('.nav-link').forEach(el => el.classList.remove('active'));
   document.querySelectorAll('.more-sheet-item').forEach(el => el.classList.remove('active'));
   // Secondary views: mark "More" tab active on mobile
-  const moreViews = ['ask', 'groups', 'intros', 'sources', 'review'];
+  const moreViews = ['ask', 'groups', 'intros', 'sources', 'review', 'settings'];
   if (moreViews.includes(view)) {
     document.getElementById('nav-more')?.classList.add('active');
     const moreItem = document.getElementById(\`more-\${view}\`);
@@ -5366,6 +5518,7 @@ function showView(view) {
   if (view === 'digest')    loadDigest();
   if (view === 'network')   loadNetwork();
   if (view === 'intros')    loadIntros();
+  if (view === 'settings')  loadSettings();
   if (view === 'sources') {
     loadSources();
     if (!sourcesRefreshTimer) {
@@ -8196,6 +8349,90 @@ function getSyncDotClass(key) {
   return ms > threshold ? 'sync-dot-stale' : 'sync-dot-ok';
 }
 
+async function loadSettings() {
+  const el = document.getElementById('settings-body');
+  if (!el) return;
+  el.innerHTML = '<div class="loading">Loading…</div>';
+  try {
+    const s = await fetch(BASE + '/api/settings').then(r => r.json());
+    el.innerHTML = renderSettings(s);
+  } catch (e) {
+    el.innerHTML = '<div style="color:#ef4444">Failed to load: ' + esc(e.message) + '</div>';
+  }
+}
+
+function renderSettings(s) {
+  const isDemo = s.currentMode === 'demo';
+  const otherMode = isDemo ? 'real' : 'demo';
+  const otherLabel = isDemo ? 'Real data' : 'Demo data';
+  const demoStat = s.demo.contacts ? s.demo.contacts + ' contacts · ' + s.demo.interactions + ' interactions' : 'not seeded yet';
+  const realStat = s.real.contacts ? s.real.contacts + ' contacts · ' + s.real.interactions + ' interactions' : 'no data imported';
+
+  const envOverrideNote = s.envOverride
+    ? '<div class="settings-note settings-note-warn">Mode is being forced via an env var (CRM_DATA_DIR or MINTY_DEMO). Clear the env to let this setting take effect.</div>'
+    : '';
+
+  return \`
+    <div class="settings-card">
+      <div class="settings-row">
+        <div class="settings-row-label">Current mode</div>
+        <div class="settings-row-value">
+          <span class="settings-mode-badge \${isDemo ? 'demo' : 'real'}">\${esc(s.currentMode)}</span>
+          <span style="color:var(--text-muted);font-size:11px;margin-left:8px">\${esc(s.dataDir)}</span>
+        </div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label">Real data</div>
+        <div class="settings-row-value" style="font-size:11px;color:var(--text-secondary)">\${esc(realStat)}</div>
+      </div>
+      <div class="settings-row">
+        <div class="settings-row-label">Demo data</div>
+        <div class="settings-row-value" style="font-size:11px;color:var(--text-secondary)">
+          \${esc(demoStat)}
+          <button class="settings-btn settings-btn-secondary" style="margin-left:10px" onclick="seedDemo()">Regenerate</button>
+        </div>
+      </div>
+      \${envOverrideNote}
+      <div class="settings-actions">
+        <button class="settings-btn" onclick="setMode('\${otherMode}')">Switch to \${otherLabel}</button>
+      </div>
+    </div>
+
+    <div class="settings-card">
+      <div class="settings-card-title">About</div>
+      <div class="settings-row"><div class="settings-row-label">Version</div><div class="settings-row-value">\${esc(s.dataDir.split('/').pop())} · v\${esc((window.__BASE__ || '') || 'dev')}</div></div>
+      <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
+        Demo mode keeps a separate ./data-demo directory so synthetic fixtures
+        never touch your real WhatsApp/email/etc. Switching modes requires a
+        server restart — Minty surfaces the command for you.
+      </div>
+    </div>
+  \`;
+}
+
+async function setMode(mode) {
+  const r = await fetch(BASE + '/api/settings/mode', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode }),
+  }).then(r => r.json());
+  if (r.error) { alert(r.error); return; }
+  if (r.restartRequired) {
+    alert('Mode saved as "' + r.savedMode + '". Restart Minty to apply:\\n\\n  Stop the current process (Ctrl+C in the terminal),\\n  then run:  npm run crm');
+  }
+  loadSettings();
+}
+
+async function seedDemo() {
+  const btn = event.target;
+  btn.disabled = true; btn.textContent = 'Regenerating…';
+  try {
+    const r = await fetch(BASE + '/api/settings/seed-demo', { method: 'POST' }).then(r => r.json());
+    if (r.error) { alert('Failed: ' + r.error); }
+    loadSettings();
+  } catch (e) { alert(e.message); }
+  finally { btn.disabled = false; btn.textContent = 'Regenerate'; }
+}
+
 async function loadSources() {
   const [sourcesData, syncData] = await Promise.all([
     fetch(BASE + '/api/sources').then(r => r.json()),
@@ -8708,6 +8945,7 @@ Object.assign(window, {
   startEmailDevice, removeEmailAccount,
   copyName, copyIntro,
   loadGroupDetail, saveLidLabels,
+  loadSettings, setMode, seedDemo,
   reviewDecide, reviewBack,
   saveScoreOverride, clearScoreOverride, toggleScoreOverride,
   openDraftPanel, copyDraft,

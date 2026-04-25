@@ -6,6 +6,8 @@ node_modules/
 
 # Exported data (personal, often large)
 data/
+data-demo/
+minty-mode.json
 
 # Env / secrets
 .env
