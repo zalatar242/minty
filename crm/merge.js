@@ -80,12 +80,16 @@ function loadWhatsApp(index) {
         // @g.us entries are WhatsApp group chats — track separately, not as people
         const isGroup = id.endsWith('@g.us');
         const phone = (!isLid && !isGroup && c.number) ? `+${c.number}` : null;
-        const stableId = !isLid ? waStableId(c.number || id.replace(/@.*/, '')) : null;
+        // Stable id ties this contact to the same record in loadWhatsAppRosters,
+        // so a participant we see twice (once in contacts.json, once via a group
+        // roster) doesn't fork into two unified contacts.
+        const stableId = isLid ? `wa_lid_${id}` : waStableId(c.number || id.replace(/@.*/, ''));
         const contact = index.upsert(phone ? [phone] : [], [], c.name, stableId);
         // Keep first source data — @lid entries for the same person are merged by name
         if (!contact.sources.whatsapp) contact.sources.whatsapp = { id, ...c };
         if (!contact.name) contact.name = c.name;
         if (isGroup) { contact.isGroup = true; groups++; }
+        if (isLid && !contact.name) contact.isAnonymousLid = true;
     }
     console.log(`Merged ${Object.keys(contacts).length} WhatsApp contacts (${groups} group chats tagged)`);
 }
@@ -107,6 +111,7 @@ function loadWhatsAppRosters(index, outDir) {
     const groupMemberships = {}; // chatId -> { name, participants, size, owner, ... }
     let rosterUpserts = 0;
     let silentLurkerAdds = 0;
+    let lidLurkers = 0;
 
     for (const [chatName, chat] of Object.entries(chats)) {
         const meta = chat && chat.meta;
@@ -114,9 +119,16 @@ function loadWhatsAppRosters(index, outDir) {
         const chatId = meta.id;
         const memberContactIds = [];
 
-        for (const p of meta.participants) {
-            const pid = p && p.id;
-            if (!pid) continue;
+        // Real WhatsApp exports store participants as plain strings (the
+        // serialised id), but the in-app exporter sometimes stores them as
+        // objects with { id, isAdmin, isSuperAdmin }. Normalise here so both
+        // shapes work.
+        const normalisedParticipants = meta.participants
+            .map(p => (typeof p === 'string' ? { id: p } : p))
+            .filter(p => p && p.id);
+
+        for (const p of normalisedParticipants) {
+            const pid = p.id;
             // Resolve @lid -> @c.us if we have the mapping
             const resolvedId = pid.endsWith('@lid') && lidMap[pid] ? lidMap[pid] : pid;
             const isLid = resolvedId.endsWith('@lid');
@@ -128,14 +140,21 @@ function loadWhatsAppRosters(index, outDir) {
 
             const contact = index.upsert(phone ? [phone] : [], [], null, stableId);
             if (!wasInContacts && !contact.sources.whatsapp) silentLurkerAdds++;
+            if (isLid) lidLurkers++;
 
             if (!contact.sources.whatsapp) {
                 contact.sources.whatsapp = {
                     id: resolvedId,
                     number: phone ? phone.replace('+', '') : null,
                     fromRoster: true,
+                    isLid,
                 };
             }
+            // Mark anonymous LID-only contacts so the UI can show "Group
+            // member" with a roster-position fallback rather than a raw
+            // anonymised id.
+            if (isLid && !contact.name) contact.isAnonymousLid = true;
+
             if (!contact.groupMemberships) contact.groupMemberships = [];
             if (!contact.groupMemberships.some(g => g.chatId === chatId)) {
                 contact.groupMemberships.push({
@@ -174,7 +193,7 @@ function loadWhatsAppRosters(index, outDir) {
 
     console.log(
         `Rosters: ${rosterUpserts} upserts across ${Object.keys(groupMemberships).length} groups ` +
-        `(+${silentLurkerAdds} silent-lurker contacts)`
+        `(+${silentLurkerAdds} silent-lurker contacts, ${lidLurkers} anon-lid)`
     );
 }
 
@@ -268,12 +287,24 @@ function buildInteractions() {
     const interactions = [];
 
     // WhatsApp
+    //
+    // For 1:1 chats: m.from is the counterparty's @c.us id (or 'me' if user
+    //                sent it); m.author is undefined or === m.from.
+    // For group chats: m.from is the GROUP id (<chatId>@g.us) and m.author is
+    //                  the actual sender's @c.us / @lid id. So we need to
+    //                  prefer `author` for groups so timelines / search /
+    //                  scoring attribute messages to the right person.
     const waChats = load(path.join(DATA, 'whatsapp/chats.json'));
     if (waChats) {
         for (const [chatName, chat] of Object.entries(waChats)) {
+            const isGroup = !!(chat.meta && chat.meta.isGroup);
             for (const m of chat.messages || []) {
+                const realFrom = isGroup
+                    ? (m.author || m.from)
+                    : (m.from || m.author);
                 interactions.push(createInteraction('whatsapp', {
                     ...m,
+                    from: realFrom,
                     chatName,
                     chatId: chat.meta && chat.meta.id,
                 }));
