@@ -22,3 +22,9 @@ minty-mode.json
 /scratch/scratch-profile/
 /scratch/session-probe.png
 .gstack/
+
+# E2E + Playwright artifacts
+data-e2e/
+playwright-report/
+test-results/
+.playwright-mcp/
