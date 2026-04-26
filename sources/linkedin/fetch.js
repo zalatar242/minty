@@ -62,6 +62,17 @@ const DETAIL_CONCURRENCY = (() => {
     return (!Number.isFinite(n) || n < 1) ? 1 : Math.floor(n);
 })();
 
+// Per-thread message scrape parallelism. Same shape as DETAIL_CONCURRENCY:
+// each worker is a tab against the same authenticated context. Defaults
+// to DETAIL_CONCURRENCY so users tuning that value get matching behaviour
+// for both phases. Override with LINKEDIN_MESSAGE_CONCURRENCY=N.
+const MESSAGE_CONCURRENCY = (() => {
+    const raw = process.env.LINKEDIN_MESSAGE_CONCURRENCY;
+    if (!raw) return DETAIL_CONCURRENCY;
+    const n = Number(raw);
+    return (!Number.isFinite(n) || n < 1) ? 1 : Math.floor(n);
+})();
+
 // --- sync-state.json -------------------------------------------------------
 // Delegated to sources/linkedin/sync-state.js which handles atomic writes
 // (openSync + fsyncSync + rename). We hold the lock during the entire scrape,
@@ -448,7 +459,7 @@ async function scrapeContactDetails(context, connections) {
 
 // --- Scrape: messaging -----------------------------------------------------
 
-async function scrapeMessages(page) {
+async function scrapeMessages(context, page) {
     await page.goto(SELECTORS.MESSAGING_INBOX.url, { waitUntil: 'domcontentloaded' });
     assertOk(page);
     await page.waitForTimeout(THROTTLE_MS);
@@ -553,25 +564,24 @@ async function scrapeMessages(page) {
         ? ` (${skippedAsUnchanged} thread${skippedAsUnchanged === 1 ? '' : 's'} skipped as unchanged since last sync)`
         : '';
     console.log(`Scraping ${capped.length} message thread${capped.length === 1 ? '' : 's'}${unboundedNote}${skipNote} — estimated ${estMinutes} min. Ctrl+C to abort.`);
-    const allRows = []; // [{ record, context }]
 
-    for (let i = 0; i < capped.length; i++) {
-        const t = capped[i];
+    // Per-thread work, hoisted out of the loop so a worker pool can dispatch
+    // it concurrently. Returns the rows for this thread (or [] on failure).
+    // Throws only on SESSION errors so they propagate up and abort the whole
+    // scrape — everything else is logged and swallowed per-thread.
+    async function scrapeOneThread(wpage, t) {
         const threadUrl = t.href && t.href.startsWith('/')
             ? 'https://www.linkedin.com' + t.href
             : (t.href || SELECTORS.MESSAGE_THREAD.urlTemplate.replace('{id}', t.id));
         try {
-            await page.goto(threadUrl, { waitUntil: 'domcontentloaded' });
-            assertOk(page);
-            await page.waitForTimeout(THROTTLE_MS);
+            await wpage.goto(threadUrl, { waitUntil: 'domcontentloaded' });
+            assertOk(wpage);
+            await wpage.waitForTimeout(THROTTLE_MS);
             // Adaptive scroll: load older messages by scrolling to top repeatedly,
             // but stop as soon as two consecutive scrolls don't load new bubbles.
-            // Most threads have < 50 messages and stabilize in 1-2 scrolls; the
-            // old fixed 5-iteration loop wasted 3-4 scrolls on those. Capped at 8
-            // iterations so pathological threads can't hang.
             let prevCount = -1, stableStreak = 0;
             for (let k = 0; k < 8; k++) {
-                const count = await page.evaluate((sels) => {
+                const count = await wpage.evaluate((sels) => {
                     for (const s of sels.container) {
                         const m = document.querySelector(s);
                         if (m) { m.scrollTop = 0; break; }
@@ -582,14 +592,11 @@ async function scrapeMessages(page) {
                     }
                     return 0;
                 }, { container: SELECTORS.MESSAGE_THREAD.messageListContainer, bubble: SELECTORS.MESSAGE_THREAD.messageBubble });
-                // Two consecutive stable counts = done. Single-tick stability
-                // is too eager on slow networks where LinkedIn lazy-loads —
-                // count might plateau briefly between batches.
                 if (count === prevCount) { stableStreak++; if (stableStreak >= 2) break; }
                 else { stableStreak = 0; prevCount = count; }
-                await page.waitForTimeout(THROTTLE_MS);
+                await wpage.waitForTimeout(THROTTLE_MS);
             }
-            const threadData = await page.evaluate((sels) => {
+            const threadData = await wpage.evaluate((sels) => {
                 const pickText = (root, ss) => {
                     for (const s of ss) { const el = root.querySelector(s); if (el) return (el.textContent || '').trim(); }
                     return '';
@@ -639,25 +646,58 @@ async function scrapeMessages(page) {
             const participants = Array.from(new Set(
                 threadData.bubbles.map((b) => b.fromName).filter(Boolean)
             ));
-            for (const b of threadData.bubbles) {
-                allRows.push({
-                    record: b,
-                    context: {
-                        conversationId: t.id,
-                        conversationTitle: threadData.title,
-                        folder: t.folder,
-                        subject: threadData.subject || '',
-                        participants,
-                    },
-                });
-            }
+            return threadData.bubbles.map((b) => ({
+                record: b,
+                context: {
+                    conversationId: t.id,
+                    conversationTitle: threadData.title,
+                    folder: t.folder,
+                    subject: threadData.subject || '',
+                    participants,
+                },
+            }));
         } catch (err) {
             if (err && err.code === 'SESSION') throw err;
+            return [];
         }
-        if (i % 5 === 0) setProgress('messages', i, capped.length);
     }
+
+    // Worker pool — mirrors scrapeContactDetails's shape. Worker 0 reuses
+    // the inbox-enumeration page; siblings spawn their own. Output keyed by
+    // thread index so we can flatten preserving original thread order.
+    const rowsByThread = new Array(capped.length);
+    let cursor = 0, done = 0, sessionErr = null;
+
+    async function worker(workerIndex) {
+        const wpage = workerIndex === 0 ? page : await context.newPage();
+        try {
+            while (true) {
+                if (sessionErr) return;
+                const idx = cursor++;
+                if (idx >= capped.length) return;
+                try {
+                    rowsByThread[idx] = await scrapeOneThread(wpage, capped[idx]);
+                } catch (err) {
+                    if (err && err.code === 'SESSION') { sessionErr = err; return; }
+                    rowsByThread[idx] = [];
+                }
+                done++;
+                if (done % 5 === 0 || done === capped.length) {
+                    setProgress('messages', done, capped.length);
+                }
+            }
+        } finally {
+            if (workerIndex !== 0) { try { await wpage.close(); } catch { /* ignore */ } }
+        }
+    }
+
+    const workerCount = Math.min(MESSAGE_CONCURRENCY, capped.length);
+    if (workerCount > 1) console.log(`[linkedin/fetch] message threads parallelized across ${workerCount} tabs`);
+    await Promise.all(Array.from({ length: Math.max(workerCount, 1) }, (_, i) => worker(i)));
+    if (sessionErr) throw sessionErr;
+
     setProgress('messages', capped.length, capped.length);
-    return allRows;
+    return rowsByThread.flatMap((rows) => rows || []);
 }
 
 // --- Scrape: pending invitations (opt-in) ----------------------------------
@@ -791,7 +831,7 @@ async function run() {
             toCsvFile(CONNECTIONS_HEADER, connectionRowsToCsvMatrix(detailed)));
 
         // 5. Messages.
-        const msgRows = await scrapeMessages(page);
+        const msgRows = await scrapeMessages(context, page);
         const records = msgRows.map((m) => m.record);
         const contexts = new Map(msgRows.map((m) => [m.record, m.context]));
         writeCsvAtomic(STAGING_DIR, 'messages.csv',
