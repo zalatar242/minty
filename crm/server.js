@@ -65,7 +65,11 @@ const UPLOAD_BODY_MAX = 50 * 1024 * 1024;   // 50 MB for multipart uploads
     };
     for (const [f, contents] of Object.entries(defaults)) {
         const p = path.join(dir, f);
-        if (!fs.existsSync(p)) fs.writeFileSync(p, contents);
+        try {
+            fs.writeFileSync(p, contents, { flag: 'wx' });
+        } catch (e) {
+            if (e.code !== 'EEXIST') throw e;
+        }
     }
 })();
 
@@ -144,18 +148,27 @@ function getUserPaths(uuid) {
 const _contactsCache = {};
 function loadContacts(paths) {
     const key = paths.contacts;
+    let fd;
     try {
-        const mtime = fs.statSync(key).mtimeMs;
+        // Open + fstat + read on the same FD so the mtime always matches the
+        // bytes we read (avoids TOCTOU between statSync and readFileSync if
+        // the file is replaced mid-call).
+        fd = fs.openSync(key, 'r');
+        const mtime = fs.fstatSync(fd).mtimeMs;
         let raw;
         if (_contactsCache[key] && _contactsCache[key].mtime === mtime) {
             raw = _contactsCache[key].raw;
         } else {
-            raw = JSON.parse(fs.readFileSync(key, 'utf8'));
+            raw = JSON.parse(fs.readFileSync(fd, 'utf8'));
             _contactsCache[key] = { mtime, raw };
         }
         return paths.selfIds?.size ? raw.filter(c => !paths.selfIds.has(c.id)) : raw;
     } catch {
         return [];
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch { /* already closed */ }
+        }
     }
 }
 
