@@ -572,7 +572,7 @@ const { computeContactMetrics: computeEngagementMetrics, labelMetrics } = requir
 function computeContactEngagement(contact, paths, uuid) {
     try {
         const list = getContactInteractions(contact, paths, uuid);
-        if (!list || !list.length) return null;
+        if (!list.length) return null;
         const selfIds = new Set(['me', ...(paths.selfIds || [])]);
         // Add the user's own phone if we can infer one (seed data uses 'me', so this is mostly a no-op).
         const decorated = list.map(i => Object.assign({}, i, { _contactId: contact.id }));
@@ -839,7 +839,6 @@ function handleGetDigest(req, res, params, paths) {
 const INVESTOR_RE  = /\b(investor|vc|venture|partner|angel|fund|capital|managing director)\b/i;
 const FOUNDER_RE   = /\b(founder|ceo|co-founder|cofounder|building|startup|stealth)\b/i;
 const HIRING_RE    = /\b(head of|director|vp\b|vice president|talent|recruiting|hiring manager)\b/i;
-const JOBSEEK_RE   = /\b(looking for|open to|seeking|new opportunity|job search)\b/i;
 
 function contactRole(c) {
     const pos = (c.sources?.linkedin?.position || c.sources?.googleContacts?.title || c.apollo?.title || '').toLowerCase();
@@ -3150,7 +3149,7 @@ function handleGetToday(req, res, params, paths, uuid) {
         const syncState = JSON.parse(fs.readFileSync(syncStatePath, 'utf8'));
         const rawMeetings = syncState.calendar?.upcomingMeetings || [];
         // Re-enrich with current contact data and filter to today+tomorrow
-        const { buildEmailIndex, enrichAttendees, isMeetingToday, sortMeetings } = require('./calendar');
+        const { buildEmailIndex, enrichAttendees, sortMeetings } = require('./calendar');
         const emailIndex = buildEmailIndex(contacts);
         const today = new Date().toISOString().slice(0, 10);
         const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
@@ -3266,7 +3265,6 @@ function handleGetToday(req, res, params, paths, uuid) {
 
 // GET /api/calendar/upcoming — next 7 days of meetings, enriched with contact data
 function handleGetCalendarUpcoming(req, res, params, paths, uuid) {
-    const { syncCalendarForAccount } = require('./sync');
     const syncStatePath = path.join(path.dirname(paths.contacts), '..', 'sync-state.json');
     let syncState = {};
     try { syncState = JSON.parse(fs.readFileSync(syncStatePath, 'utf8')); } catch { syncState = {}; }
