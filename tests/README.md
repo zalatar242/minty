@@ -42,4 +42,6 @@ E2E tests seed a fresh `data-e2e/` directory via `tests/e2e/global-setup.js` —
 
 ## CI
 
-`.github/workflows/ci.yml` runs `npm test` + smokes on every PR against `main`, on Node 20/22, on Linux/macOS/Windows. The release workflow re-runs the matrix on tag push.
+`.github/workflows/ci.yml` runs `npm test` on every PR against `main`, on Node 20/22, on Linux/macOS/Windows.
+`.github/workflows/e2e.yml` runs Playwright E2E/smoke coverage.
+The release workflow re-runs the matrix on tag push.

@@ -35,7 +35,3 @@ These are queued for a human because they need taste calls or repo-admin access:
 - **`.github/FUNDING.yml`.** Not added unilaterally — needs a sponsor URL (GitHub Sponsors, Open Collective, Buy Me A Coffee) and the maintainer's call on whether to solicit at all this early. If desired, reply with the sponsor URL and one will be added in one commit.
 
 - **ADR 0001 status.** Currently `Proposed`. If the WhatsApp-library decision is final, flip to `Accepted` and update the date. If still being weighed, leave as is.
-
-- **README hero screenshot/GIF.** README has a TODO comment where a real screenshot/GIF of the contact list + detail view should go. Record at v0.3.x and drop into `docs/hero.png` (or `.gif`); the placeholder already points there.
-
-- **GitHub repo metadata** (description + topics) — set via the GitHub UI, not the codebase. Suggested topics: `personal-crm`, `prm`, `self-hosted`, `privacy`, `local-first`, `whatsapp`, `gmail`, `linkedin`, `telegram`, `nodejs`, `agpl`. Suggested description matches `package.json`: *"Privacy-first personal CRM — unifies WhatsApp, Gmail, LinkedIn, Telegram, SMS, and Google Contacts locally. Surfaces who you should reach out to, and why."*

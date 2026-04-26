@@ -10,7 +10,7 @@ Minty is a **single-process Node.js app** that pulls personal data from many sou
 
 Everything runs on one machine. No database server, no cloud, no auth — the **filesystem is the database** and the **OS user is the auth boundary**. AI features call out to a *local* Claude Code CLI or a *local* Ollama model; there is no first-party cloud LLM integration in core (see CONTRIBUTING.md "out of scope").
 
-The whole stack is plain CommonJS. No build step, no bundler, no transpiler. Client JS lives inline in `crm/server.js`. This is deliberate — see VISION.md.
+The whole stack is plain CommonJS. No build step, no bundler, no transpiler. The SPA shell (HTML/CSS/JS) lives in `crm/ui.html.js` and is served by `crm/server.js`. This is deliberate — see VISION.md.
 
 ## Map of code
 
@@ -141,5 +141,5 @@ These are load-bearing. Break one and something breaks somewhere far away.
 
 - **Adding a new importer:** copy one of the simpler ones (`sources/telegram/import.js`) and follow its file layout. Write to `data/<your-source>/`, then add a merge step in `crm/merge.js`.
 - **Improving matching:** read `crm/MATCHING.md`, then change `crm/match.js`. Add a fixture to `tests/`.
-- **UI work:** everything is in `crm/server.js`. Inline JS, inline CSS, by design. Hot-reload by restarting `npm run crm`.
+- **UI work:** edit `crm/ui.html.js` for SPA HTML/CSS/JS; edit `crm/server.js` for routes/API wiring. Hot-reload by restarting `npm run crm`.
 - **Performance on large datasets:** the merge path is the usual bottleneck. `tests/integration/` has fixture-based perf tests.
