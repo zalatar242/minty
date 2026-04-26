@@ -1366,6 +1366,7 @@ function handleGetSettings(_req, res) {
         envOverride: !!(process.env.CRM_DATA_DIR || process.env.MINTY_DEMO),
         runtimeConfig: userConfig.getRedactedConfig(DATA),
         playwrightAvailable: linkedInPlaywrightAvailable(),
+        linkedinState: readLinkedInState(),
     });
 }
 
@@ -2375,6 +2376,11 @@ async function handleRemoveEmailAccount(req, res, params, paths, uuid) {
 // WhatsApp session management (per user)
 const waClients = {}; // uuid -> { client, qr, status }
 const waSilentResume = new Set(); // uuids whose current init was auto-triggered (no UI watching)
+// Transient export-failure retry counter, kept across re-inits so a failing
+// chat can't trigger an infinite reconnect loop. Reset on a successful export.
+const waRetryCounts = {};
+const WA_MAX_RETRIES = 2;
+const WA_RETRY_DELAY_MS = 10 * 1000;
 
 async function handleWhatsappStart(req, res, params, paths, uuid) {
     const existing = waClients[uuid];
@@ -2402,6 +2408,36 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     const authDir = path.join(dataDir, '.wwebjs_auth');
     const waDir = path.join(dataDir, 'whatsapp');
     fs.mkdirSync(waDir, { recursive: true });
+
+    // Self-heal stale Chromium SingletonLock/Cookie/Socket symlinks left
+    // behind by a Puppeteer that crashed without cleanup. Without this, the
+    // next client.initialize() hangs in "initializing" forever waiting for
+    // a lock no live process holds.
+    try {
+        const sessionDir = path.join(authDir, `session-${uuid}`);
+        if (fs.existsSync(sessionDir)) {
+            for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+                const p = path.join(sessionDir, name);
+                try {
+                    const stat = fs.lstatSync(p);
+                    if (!stat.isSymbolicLink()) continue;
+                    const target = fs.readlinkSync(p);
+                    const m = target.match(/-(\d+)$/);
+                    let alive = false;
+                    if (m) {
+                        try { process.kill(Number(m[1]), 0); alive = true; }
+                        catch { alive = false; }
+                    }
+                    if (!alive) {
+                        fs.unlinkSync(p);
+                        console.log(`[whatsapp] cleared stale ${name} for ${uuid}`);
+                    }
+                } catch { /* ignore — file gone or unreadable */ }
+            }
+        }
+    } catch (e) {
+        console.error('[whatsapp] singleton-lock cleanup failed:', e.message);
+    }
 
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: uuid, dataPath: authDir }),
@@ -2472,10 +2508,44 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
             runIncrementalMerge();
             updateUserSource(uuid, 'whatsapp', { status: 'connected', connectedAt: new Date().toISOString() });
             waClients[uuid].status = 'done';
+            waRetryCounts[uuid] = 0;
+            notifications.dismiss(dataDir, 'whatsapp');
             ensureSyncDaemon(uuid).attachWhatsApp(client);
         } catch (e) {
             console.error('WhatsApp export error:', e);
             waClients[uuid].status = 'error';
+            // Detached Frame / Target closed / Session closed are Puppeteer
+            // transient errors that fire mid-export when the WhatsApp Web tab
+            // recycles. The export saves chats.json per chat, so a fresh
+            // client.initialize() on the same LocalAuth session resumes from
+            // where it stopped. Retry up to WA_MAX_RETRIES then bail to a
+            // banner.
+            const isTransient = /detached Frame|Target closed|Session closed|Protocol error|Execution context|Page crashed/i.test(e.message || '');
+            const retryCount = (waRetryCounts[uuid] || 0);
+            if (isTransient && retryCount < WA_MAX_RETRIES) {
+                waRetryCounts[uuid] = retryCount + 1;
+                console.log(`[whatsapp] transient export error — retry ${retryCount + 1}/${WA_MAX_RETRIES} in ${WA_RETRY_DELAY_MS / 1000}s`);
+                notifications.set(dataDir, 'whatsapp', {
+                    message: `WhatsApp export hit a transient error (Chromium frame detached). Retrying ${retryCount + 1}/${WA_MAX_RETRIES} in ${WA_RETRY_DELAY_MS / 1000}s…`,
+                    pauseSync: false,
+                });
+                try { await client.destroy(); } catch { /* swallow */ }
+                delete waClients[uuid];
+                waSilentResume.delete(uuid);
+                setTimeout(() => {
+                    try { autoResumeWhatsapp(uuid); }
+                    catch (err) { console.error('[whatsapp] retry init failed:', err.message); }
+                }, WA_RETRY_DELAY_MS);
+                return;
+            }
+            // Non-transient (or out of retries) — surface to the UI.
+            const msg = (e.message || 'unknown').slice(0, 240);
+            notifications.set(dataDir, 'whatsapp', {
+                message: `WhatsApp export failed: ${msg}. Open Sources → WhatsApp → Reconnect to retry.`,
+                pauseSync: false,
+            });
+            waRetryCounts[uuid] = 0;
+            waSilentResume.delete(uuid);
         }
     });
 
@@ -2762,9 +2832,12 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
     }
 
     const firstRun = !resuming;
-    // Pull every locally-available message per chat. WhatsApp Web's IndexedDB
-    // is the real ceiling — we just stop capping below that.
-    const limit = opts.limit ?? Infinity;
+    // 10k/chat is the ceiling. Unlimited (Infinity) caused Puppeteer
+    // detached-Frame failures on very large chats — the in-memory
+    // message array got too big and the WhatsApp Web tab recycled.
+    // 10k covers virtually all real chat history; bump WHATSAPP_MSG_LIMIT
+    // env var if you genuinely have a chat deeper than that.
+    const limit = opts.limit ?? (Number(process.env.WHATSAPP_MSG_LIMIT) || 10000);
     let msgCount = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);
 
     for (let i = 0; i < chats.length; i++) {
@@ -2899,6 +2972,19 @@ async function handleTriggerSync(req, res, [source], paths, uuid) {
     const validSources = ['email', 'googleContacts', 'linkedin', 'telegram', 'sms', 'whatsapp'];
     if (!validSources.includes(source)) {
         return json(res, { error: 'Unknown source: ' + source }, 400);
+    }
+    // When auto-sync is enabled for LinkedIn, "Sync now" should trigger a
+    // headless-browser scrape (fetch.js), not the ZIP importer. The default
+    // triggerSync() path runs import.js with a default EXPORT_DIR that has
+    // no CSVs, which is technically a no-op now but isn't what the user
+    // intends when they click the button.
+    if (source === 'linkedin' && userConfig.isLinkedInAutosyncEnabled(DATA)) {
+        const daemon = ensureSyncDaemon(uuid);
+        if (typeof daemon?.triggerLinkedInSync === 'function') {
+            daemon.triggerLinkedInSync();
+            return json(res, { ok: true, message: 'LinkedIn auto-sync started — progress will appear in the toast.' });
+        }
+        return json(res, { ok: false, message: 'Auto-sync daemon not ready — try reloading the page.' }, 503);
     }
     try {
         const result = await triggerSync(uuid, source, getUserDataDir(uuid));
@@ -3377,7 +3463,7 @@ function handleLinkedInStatus(req, res) {
 function handleLinkedInConnect(req, res) {
     if (!linkedInGate(req, res)) return;
     if (!linkedInPlaywrightAvailable()) {
-        json(res, { error: 'playwright-missing', message: 'Run: npm run linkedin:setup' }, 503); return;
+        json(res, { error: 'playwright-missing', message: 'Playwright is not installed. Run npm install in the project directory once.' }, 503); return;
     }
     const state = readLinkedInState();
     if (state.status === 'syncing') { json(res, { error: 'sync in progress' }, 409); return; }
@@ -3396,12 +3482,12 @@ function handleLinkedInConnect(req, res) {
 function handleLinkedInSync(req, res) {
     if (!linkedInGate(req, res)) return;
     if (!linkedInPlaywrightAvailable()) {
-        json(res, { error: 'playwright-missing', message: 'Run: npm run linkedin:setup' }, 503); return;
+        json(res, { error: 'playwright-missing', message: 'Playwright is not installed. Run npm install in the project directory once.' }, 503); return;
     }
     const state = readLinkedInState();
     if (state.status === 'syncing') { json(res, { error: 'sync in progress' }, 409); return; }
     if (state.status === 'disconnected') {
-        json(res, { error: 'not connected', message: 'Run: npm run linkedin:connect (or click Enable auto-sync)' }, 400); return;
+        json(res, { error: 'not connected', message: 'Click Connect to LinkedIn in Settings first.' }, 400); return;
     }
     const { spawn } = require('child_process');
     const scriptPath = path.resolve(__dirname, '../sources/linkedin/fetch.js');
@@ -4086,9 +4172,19 @@ nav {
 .sync-warn-banner svg { flex-shrink: 0; margin-top: 1px; }
 .sync-warn-icon { width: 14px; height: 14px; }
 
-/* Sticky re-auth banner (set by auto-sync on session failure) */
+/* Sticky re-auth banner (set by auto-sync on session failure).
+   #notif-banners is the fixed-position top strip; .notif-banner is each
+   alert inside it. Without position:fixed the alert inherited body's
+   flex-row layout and got squeezed between the sidebar and main. */
+#notif-banners {
+  position: fixed; top: 0; left: 0; right: 0;
+  z-index: 100;
+  display: flex; flex-direction: column;
+  pointer-events: none;
+}
+#notif-banners:empty { display: none; }
 .notif-banner {
-  position: sticky; top: 0; z-index: 50;
+  pointer-events: auto;
   display: flex; align-items: flex-start; gap: 10px;
   background: rgba(180, 83, 9, 0.96); color: #fff;
   padding: 10px 14px; font-size: 0.78rem; line-height: 1.35;
@@ -4715,7 +4811,7 @@ nav {
   .nav-link.active { border-left-color: transparent; border-top-color: var(--accent); background: rgba(99,102,241,0.06); }
   .nav-label { display: inline; font-size: 10px; letter-spacing: 0; }
   /* Primary tabs: Today, People, Network — secondary items hidden in bottom bar */
-  #nav-ask, #nav-groups, #nav-intros, #nav-sources, #nav-review, .nav-cmd-hint { display: none; }
+  #nav-ask, #nav-groups, #nav-intros, #nav-sources, #nav-review, #nav-settings, .nav-cmd-hint { display: none; }
   .nav-more-btn { display: flex !important; }
   /* Contact detail: full viewport, prominent back */
   .back-btn { font-size: 1.3rem; padding: 10px 14px; background: var(--bg-card); border-radius: 8px; margin-right: 4px; }
@@ -5022,6 +5118,15 @@ body { background: var(--bg); }
       <span class="nav-label">Review</span>
       <span class="nav-badge" id="review-badge" style="display:none"></span>
     </button>
+    <button class="nav-link" id="nav-settings" onclick="showView('settings')" title="Settings">
+      <span class="nav-icon">
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="9" cy="9" r="2.5"/>
+          <path d="M14.7 11A1.5 1.5 0 0015 9.5l1.1-.9-1-1.7-1.4.4a1.5 1.5 0 00-1.3-.8l-.4-1.4h-2l-.4 1.4a1.5 1.5 0 00-1.3.8l-1.4-.4-1 1.7L4 9.5a1.5 1.5 0 00.3 1.5L3 11.9l1 1.7 1.4-.4a1.5 1.5 0 001.3.8l.4 1.4h2l.4-1.4a1.5 1.5 0 001.3-.8l1.4.4 1-1.7-1.1-.9z"/>
+        </svg>
+      </span>
+      <span class="nav-label">Settings</span>
+    </button>
     <button class="nav-cmd-hint" onclick="openPalette()" title="Command palette (⌘K)">
       <span class="nav-icon" style="font-size:0.7rem;color:var(--text-muted)">⌘K</span>
     </button>
@@ -5273,6 +5378,13 @@ body { background: var(--bg); }
 
   <!-- Sources -->
   <div id="view-sources" style="display:none">
+    <div id="sources-welcome" style="display:none;max-width:720px;margin-bottom:20px;padding:18px 20px;background:linear-gradient(135deg,rgba(99,102,241,0.12),rgba(139,92,246,0.08));border:1px solid rgba(99,102,241,0.25);border-radius:12px">
+      <div style="font-size:1.05rem;font-weight:700;color:#f0f4ff;margin-bottom:6px">👋 Welcome to Minty</div>
+      <div style="font-size:0.8rem;color:#a5b4cf;line-height:1.55;margin-bottom:0">
+        Connect your first source below to see who matters in your network.
+        WhatsApp + LinkedIn give the most signal — both stay 100% local on your machine.
+      </div>
+    </div>
     <div style="margin-bottom:24px;max-width:720px;display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
       <div>
         <h2 style="font-size:1.25rem;font-weight:700;color:#f0f4ff;letter-spacing:-0.025em;margin-bottom:4px">Data Sources</h2>
@@ -5698,6 +5810,14 @@ async function init() {
       if (listEl) listEl.innerHTML = '<div class="loading" style="color:#ef4444">Render error: ' + e.message + '</div>';
     }
     loadReviewCount();
+    // First-time UX: zero contacts means a fresh install. Drop the user
+    // straight onto Sources with a welcome banner so the first thing they
+    // see is the path to importing data, not an empty Today screen.
+    if (allContacts.length === 0) {
+      const welcome = document.getElementById('sources-welcome');
+      if (welcome) welcome.style.display = 'block';
+      try { showView('sources'); } catch {}
+    }
   }).catch(e => {
     if (listEl) listEl.innerHTML = '<div class="loading" style="color:#ef4444">Failed to load contacts: ' + e.message + '</div>';
   });
@@ -8699,43 +8819,56 @@ function renderSettings(s) {
 }
 
 function renderLinkedinAutosyncCard(s) {
-  const cfg = s.runtimeConfig || {};
-  const enabled = !!cfg.linkedinAutosync;
-  const envForced = !!cfg.envForces?.linkedinAutosync;
   const pwAvailable = !!s.playwrightAvailable;
+  const li = s.linkedinState || { status: 'disconnected' };
+  const liStatus = li.status || 'disconnected';
+  const lastSyncIso = li.lastSyncAt || li.lastSync;
+  const lastSyncStr = lastSyncIso ? fmtSyncAge(lastSyncIso) : null;
 
-  const badge = enabled
-    ? '<span class="settings-mode-badge real">enabled</span>'
-    : '<span class="settings-mode-badge demo">disabled</span>';
+  const badgeMap = {
+    disconnected:  ['demo',    'not connected'],
+    connecting:    ['pending', 'connecting…'],
+    connected:     ['real',    'connected'],
+    syncing:       ['pending', 'syncing…'],
+    challenge:     ['demo',    'needs reconnect'],
+    error:         ['demo',    'error'],
+  };
+  const [badgeClass, badgeLabel] = badgeMap[liStatus] || badgeMap.disconnected;
 
-  const envNote = envForced
-    ? '<div class="settings-note settings-note-warn">MINTY_LINKEDIN_AUTOSYNC env var is set — unset it to control from the UI.</div>'
+  const lastSyncNote = lastSyncStr
+    ? '<div class="settings-row" style="font-size:11px;color:var(--text-muted)">Last sync: ' + esc(lastSyncStr) + '</div>'
     : '';
 
   const pwNote = !pwAvailable
-    ? '<div class="settings-note settings-note-warn">Playwright not installed — run <code>npm run linkedin:setup</code> in your terminal first.</div>'
+    ? '<div class="settings-note settings-note-warn">Playwright is not installed. Run <code>npm install</code> in the project directory once, then reload — no further terminal commands needed after that.</div>'
     : '';
 
-  const blocked = envForced || !pwAvailable;
-  const action = enabled
-    ? '<button class="settings-btn settings-btn-secondary" onclick="setLinkedinAutosync(false)">Disable</button>'
-    : '<button class="settings-btn" onclick="setLinkedinAutosync(true)"' + (blocked ? ' disabled' : '') + '>Enable</button>';
+  const buttons = [];
+  if (pwAvailable) {
+    if (liStatus === 'disconnected' || liStatus === 'challenge') {
+      buttons.push('<button class="settings-btn" onclick="connectLinkedIn()">' + (liStatus === 'challenge' ? 'Reconnect to LinkedIn' : 'Connect to LinkedIn') + '</button>');
+    } else if (liStatus === 'connected' || liStatus === 'error') {
+      buttons.push('<button class="settings-btn" onclick="syncLinkedInNow()">Sync now</button>');
+      buttons.push('<button class="settings-btn settings-btn-secondary" onclick="connectLinkedIn()">Reconnect</button>');
+    }
+    // syncing/connecting: no actions; the toast surfaces progress.
+  }
 
   return \`
     <div class="settings-card">
-      <div class="settings-card-title">LinkedIn auto-sync</div>
+      <div class="settings-card-title">LinkedIn</div>
       <div class="settings-row">
         <div class="settings-row-label">Status</div>
-        <div class="settings-row-value">\${badge}</div>
+        <div class="settings-row-value"><span class="settings-mode-badge \${badgeClass}">\${esc(badgeLabel)}</span></div>
       </div>
+      \${lastSyncNote}
       <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
-        Pulls connections + messages on a 24h schedule via a headless browser.
-        Experimental and ToS-adjacent. Requires <code>npm run linkedin:connect</code>
-        once to authenticate.
+        Click <b>Connect to LinkedIn</b> once and a Chromium window opens for
+        you to log in — no terminal needed. After that, connections + messages
+        sync automatically every 24h. Experimental and ToS-adjacent.
       </div>
       \${pwNote}
-      \${envNote}
-      <div class="settings-actions">\${action}</div>
+      <div class="settings-actions">\${buttons.join(' ')}</div>
     </div>
   \`;
 }
@@ -9055,10 +9188,9 @@ function renderSourceForm(key, status, connected) {
       }[li.status] || 'Connected';
       const color = (li.status === 'error' || li.status === 'challenge') ? '#f87171' : (li.status === 'syncing' ? '#fbbf24' : '#34d399');
       const cta = li.status === 'challenge' ? '<button class="source-btn secondary" style="font-size:0.7rem;padding:4px 10px" onclick="connectLinkedIn()">Reconnect</button>'
-                : '<button class="source-btn secondary sync-now-btn" style="font-size:0.7rem;padding:4px 10px" onclick="syncLinkedIn()" ' + (li.status === 'syncing' ? 'disabled' : '') + '>Sync now</button>';
+                : '<button class="source-btn secondary sync-now-btn" style="font-size:0.7rem;padding:4px 10px" onclick="syncLinkedInNow()" ' + (li.status === 'syncing' ? 'disabled' : '') + '>Sync now</button>';
       el.innerHTML = '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
-        + '<span style="font-size:0.76rem;color:' + color + '">● ' + copy + '</span>' + cta + '</div>'
-        + '<div style="margin-top:8px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();switchLinkedInMode(\\'zip\\')" style="color:#6366f1">Prefer the safer ZIP import? Switch to file upload</a></div>';
+        + '<span style="font-size:0.76rem;color:' + color + '">● ' + copy + '</span>' + cta + '</div>';
       if (li.status === 'syncing') startLinkedInPoll();
       return;
     }
@@ -9067,10 +9199,27 @@ function renderSourceForm(key, status, connected) {
       + '<button class="source-btn secondary" style="width:100%" onclick="document.getElementById(\\'file-linkedin\\').click()">Choose file — Connections.csv, messages.csv, Invitations.csv</button>'
       + '<label class="drop-zone" id="dz-linkedin" ondragover="dzOver(event,\\'linkedin\\')" ondragleave="dzLeave(\\'linkedin\\')" ondrop="dzDrop(event,\\'linkedin\\')" style="margin-top:6px;padding:10px;font-size:0.72rem">or drop here</label>'
       + '<div class="source-log" id="log-linkedin"></div>';
-    const footer = !autoEnabled ? '' : pwMissing
-      ? '<div style="margin-top:10px;font-size:0.7rem;color:#8892a4">Auto-sync needs Playwright. Run <code>npm run linkedin:setup</code> in your terminal.</div>'
-      : '<div style="margin-top:10px;font-size:0.7rem"><a href="#" onclick="event.preventDefault();connectLinkedIn()" style="color:#6366f1">Enable auto-sync (experimental — ToS-adjacent, see README)</a></div>';
-    el.innerHTML = zipBtn + footer;
+    // Two-method picker: browser-connect is primary (recommended for
+    // ongoing sync), ZIP upload is a secondary disclosure for users who
+    // prefer not to grant a headless-browser session.
+    const pwBlocker = autoEnabled && pwMissing
+      ? '<div style="margin-top:6px;font-size:0.7rem;color:#8892a4">Playwright not installed — run <code>npm install</code> in the project directory once, then reload.</div>'
+      : '';
+    const browserPrimary = autoEnabled
+      ? (pwMissing
+          ? ''
+          : '<button class="source-btn" style="width:100%" onclick="connectLinkedIn()">Connect to LinkedIn</button>'
+            + '<div style="margin-top:6px;font-size:0.7rem;color:#8892a4">Opens a Chromium window for one-time login. Auto-syncs on a 24h schedule afterwards. Experimental — ToS-adjacent.</div>')
+      : '';
+    const zipDisclosure =
+        '<details style="margin-top:14px">'
+      + '  <summary style="font-size:0.75rem;color:var(--text-muted);cursor:pointer;list-style:none;display:flex;align-items:center;gap:6px;user-select:none;-webkit-user-select:none">'
+      + '    <span style="font-size:0.5rem;opacity:0.5">▶</span> '
+      + (autoEnabled ? 'Or upload a ZIP file instead' : 'Upload a ZIP file')
+      + '  </summary>'
+      + '  <div style="margin-top:8px">' + zipBtn + '</div>'
+      + '</details>';
+    el.innerHTML = browserPrimary + pwBlocker + zipDisclosure;
     return;
   }
 
@@ -9096,24 +9245,36 @@ function startLinkedInPoll() {
   }, 5000);
 }
 async function syncLinkedIn() {
-  const r = await fetch(BASE + '/api/linkedin/sync', { method: 'POST', credentials: 'same-origin' });
-  if (r.status === 403) return alert('CSRF check failed. Reload the page and try again.');
-  if (r.status === 503) return alert('Playwright not installed. Run: npm run linkedin:setup');
-  if (r.status === 409) return alert('A sync is already in progress.');
-  if (r.status === 400) return alert('Connect LinkedIn first (Enable auto-sync).');
+  // Kept as a thin alias so legacy onclick handlers stay working — all
+  // call sites now use syncLinkedInNow() directly. This re-enters that
+  // path but also refreshes the Sources view afterwards.
+  await syncLinkedInNow();
   await loadSources();
   startLinkedInPoll();
 }
 async function connectLinkedIn() {
   if (!confirm('This opens a Chromium window on this machine for you to log into LinkedIn. Continue?')) return;
   const r = await fetch(BASE + '/api/linkedin/connect', { method: 'POST', credentials: 'same-origin' });
+  const d = await r.json().catch(() => ({}));
   if (r.status === 403) return alert('CSRF check failed. Reload and try again.');
-  if (r.status === 503) return alert('Playwright not installed. Run: npm run linkedin:setup');
-  if (r.status === 409) return alert('A sync is already running. Wait for it to finish.');
-  alert('Chromium window should be opening on this machine. Log into LinkedIn there, then close the window.');
+  if (r.status === 503) return alert(d.message || 'Playwright is not installed. Run "npm install" in the project directory once.');
+  if (r.status === 409) return alert(d.message || 'A sync is already running. Wait for it to finish.');
+  alert('A Chromium window is opening on this machine. Log into LinkedIn there, then close the window when done.');
+  // Refresh Settings if it's open so the card reflects the new state.
+  if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
+}
+
+async function syncLinkedInNow() {
+  const r = await fetch(BASE + '/api/linkedin/sync', { method: 'POST', credentials: 'same-origin' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return alert(d.message || d.error || ('Sync failed: ' + r.status));
+  alert('LinkedIn sync started. You\\'ll see progress in the toast.');
+  if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
 }
 function switchLinkedInMode(/* mode */) {
-  alert('Mode switching is not persisted in Phase 1. For the ZIP flow, use: npm run linkedin:import-zip');
+  // Legacy hook — the Sources view's LinkedIn card now shows both flows
+  // (browser connect + ZIP disclosure) in a single layout, so users no
+  // longer need to "switch modes". Kept as a no-op for any cached UI.
 }
 
 function reconnectSource(key) { renderSourceForm(key, {}, false); }

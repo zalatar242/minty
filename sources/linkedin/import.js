@@ -155,12 +155,21 @@ function importInvitations() {
 
 function run() {
     P.startProgress(DATA_DIR, 'linkedin', { step: 'init', message: 'Reading LinkedIn export…' });
+    // Auto-create the export dir so a missing path is a friendly no-op
+    // rather than a scary error. This keeps the various import-trigger
+    // paths (file watcher, manual /api/sync/trigger, etc.) safe even when
+    // nothing's been uploaded — auto-sync's fetch.js still spawns this
+    // script with LINKEDIN_EXPORT_DIR pointing at its staging dir, so the
+    // happy path stays the same.
     if (!fs.existsSync(EXPORT_DIR)) {
-        const msg = `LinkedIn export directory not found: ${EXPORT_DIR}`;
-        P.failProgress(DATA_DIR, 'linkedin', new Error(msg));
-        console.error(msg);
-        console.error('Set LINKEDIN_EXPORT_DIR env var or place export in ./linkedin_export/');
-        process.exit(1);
+        try { fs.mkdirSync(EXPORT_DIR, { recursive: true }); } catch { /* best-effort */ }
+    }
+    const csvFiles = ['Connections.csv', 'messages.csv', 'Invitations.csv']
+        .filter(f => fs.existsSync(path.join(EXPORT_DIR, f)));
+    if (csvFiles.length === 0) {
+        console.log(`[linkedin/import] no CSVs in ${EXPORT_DIR} — nothing to import yet.`);
+        P.finishProgress(DATA_DIR, 'linkedin', { message: 'No export to import — skipped.' });
+        return;
     }
 
     fs.mkdirSync(OUT_DIR, { recursive: true });

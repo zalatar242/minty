@@ -559,6 +559,21 @@ async function run() {
 
         // 2+3. Connections + detail.
         const listRecords = await scrapeConnectionsList(page);
+        // Diagnostic: if scraping returns zero connections (stale selectors,
+        // headless detection, throttled session), save a screenshot + the
+        // landing-page URL so the user has something to inspect.
+        if (listRecords.length === 0) {
+            try {
+                const debugDir = path.join(LINKEDIN_DIR, '.debug');
+                fs.mkdirSync(debugDir, { recursive: true });
+                const ts = Date.now();
+                const shotPath = path.join(debugDir, `connections-empty-${ts}.png`);
+                await page.screenshot({ path: shotPath, fullPage: true });
+                fs.writeFileSync(path.join(debugDir, `connections-empty-${ts}.url`), page.url());
+                console.log(`[linkedin/fetch] 0 connections returned — diagnostic screenshot at ${shotPath}`);
+                console.log(`[linkedin/fetch] page URL: ${page.url()}`);
+            } catch (e) { console.error('[linkedin/fetch] debug capture failed:', e.message); }
+        }
         const detailed = await scrapeContactDetails(context, listRecords);
 
         // 4. Row-floor (Eng M3) then atomic write.

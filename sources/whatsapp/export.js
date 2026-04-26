@@ -109,10 +109,10 @@ client.on('ready', async () => {
     console.log(`Found ${chats.length} chats. Exporting...`);
 
     const firstRun = Object.keys(existingChats).length === 0 && !lastExportUnix;
-    // Pull every locally-available message per chat. WhatsApp Web's IndexedDB
-    // is the real ceiling — we just stop capping below that.
-    const fetchLimit = Infinity;
-    if (firstRun) console.log('First run — fetching all locally-available messages per chat. Big accounts can take a while.');
+    // 10k/chat ceiling. Unlimited caused Puppeteer detached-Frame failures
+    // on huge chats. Bump WHATSAPP_MSG_LIMIT to override.
+    const fetchLimit = Number(process.env.WHATSAPP_MSG_LIMIT) || 10000;
+    if (firstRun) console.log(`First run — up to ${fetchLimit.toLocaleString()} messages/chat. Set WHATSAPP_MSG_LIMIT env var to change.`);
 
     const result = { ...existingChats };
     let totalMsgs = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);

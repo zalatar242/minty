@@ -23,7 +23,12 @@ const fs = require('fs');
 const path = require('path');
 
 const DEFAULTS = Object.freeze({
-    linkedinAutosync: false,
+    // On by default — toggling on alone doesn't initiate any scraping;
+    // the user still has to click "Connect to LinkedIn" to log in once.
+    // Setting this to true just means the 24h periodic tick is wired up
+    // and ready to fire after a successful connect, without making the
+    // user dig through Settings to flip it on first.
+    linkedinAutosync: true,
     demoMode: false,
     google: {
         clientId: '',
