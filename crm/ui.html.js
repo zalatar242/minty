@@ -5120,6 +5120,7 @@ function renderLinkedinAutosyncCard(s) {
     connected:     ['real',    'connected'],
     syncing:       ['pending', 'syncing…'],
     challenge:     ['demo',    'needs reconnect'],
+    expired:       ['demo',    'session expired'],
     error:         ['demo',    'error'],
   };
   const [badgeClass, badgeLabel] = badgeMap[liStatus] || badgeMap.disconnected;
@@ -5133,12 +5134,22 @@ function renderLinkedinAutosyncCard(s) {
     : '';
 
   const buttons = [];
+  let needsAuthBanner = '';
   if (pwAvailable) {
-    if (liStatus === 'disconnected' || liStatus === 'challenge') {
-      buttons.push('<button class="settings-btn" onclick="connectLinkedIn()">' + (liStatus === 'challenge' ? 'Reconnect to LinkedIn' : 'Connect to LinkedIn') + '</button>');
-    } else if (liStatus === 'connected' || liStatus === 'error') {
+    if (liStatus === 'disconnected') {
+      buttons.push('<button class="settings-btn" onclick="connectLinkedIn()">Connect to LinkedIn</button>');
+    } else if (liStatus === 'challenge' || liStatus === 'expired') {
+      // Session-level failure — user MUST re-auth before anything else
+      // works. Show a single, prominent action and an inline why.
+      needsAuthBanner = '<div class="settings-note settings-note-warn">Your LinkedIn session has expired. Click <b>Re-authenticate with LinkedIn</b> below — a Chromium window opens, you log in, close it. Then sync resumes automatically.</div>';
+      buttons.push('<button class="settings-btn" onclick="connectLinkedIn()">Re-authenticate with LinkedIn</button>');
+    } else if (liStatus === 'connected') {
       buttons.push('<button class="settings-btn" onclick="syncLinkedInNow()">Sync now</button>');
-      buttons.push('<button class="settings-btn settings-btn-secondary" onclick="connectLinkedIn()">Reconnect</button>');
+      buttons.push('<button class="settings-btn settings-btn-secondary" onclick="connectLinkedIn()">Reconnect (re-auth)</button>');
+    } else if (liStatus === 'error') {
+      // Generic error — could be transient. Offer both retry and re-auth.
+      buttons.push('<button class="settings-btn" onclick="syncLinkedInNow()">Try sync again</button>');
+      buttons.push('<button class="settings-btn settings-btn-secondary" onclick="connectLinkedIn()">Re-authenticate with LinkedIn</button>');
     }
     // syncing/connecting: no actions; the toast surfaces progress.
   }
@@ -5170,6 +5181,7 @@ function renderLinkedinAutosyncCard(s) {
         <div class="settings-row-label">Status</div>
         <div class="settings-row-value"><span class="settings-mode-badge \${badgeClass}">\${esc(badgeLabel)}</span></div>
       </div>
+      \${needsAuthBanner}
       \${lastSyncNote}
       <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
         Click <b>Connect to LinkedIn</b> once and a Chromium window opens for
