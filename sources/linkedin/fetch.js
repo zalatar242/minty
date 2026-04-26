@@ -158,6 +158,20 @@ async function scrapeConnectionsList(page) {
     await page.goto(SELECTORS.CONNECTIONS_LIST.url, { waitUntil: 'domcontentloaded' });
     assertOk(page);
 
+    // domcontentloaded fires before LinkedIn's React app paints the list —
+    // body can still be empty for several seconds. Wait until at least one
+    // /in/ link has rendered, or we know the page is genuinely empty
+    // (rate-limit / soft-block / challenge served as a 200 with empty body).
+    try {
+        await page.waitForFunction(
+            () => document.querySelectorAll('a[href*="/in/"]').length > 0,
+            { timeout: 30_000 },
+        );
+    } catch {
+        const len = await page.evaluate(() => (document.body.innerText || '').length);
+        console.log(`[linkedin/fetch] connections page never rendered any /in/ links after 30s (body=${len} chars). LinkedIn may be rate-limiting headless traffic — try again in a few minutes.`);
+    }
+
     // Read the visible "X connections" header so we know the target count
     // and can show real progress / detect short reads.
     const expectedTotal = await page.evaluate(() => {
