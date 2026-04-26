@@ -23,6 +23,7 @@ const CONNECTIONS_HEADER = [
     'Company',
     'Position',
     'Connected On',
+    'Location',
 ];
 
 // ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ function normalizeConnection(record) {
         'Company': (r.company || coFromOcc || '').trim(),
         'Position': (r.position || posFromOcc || '').trim(),
         'Connected On': (r.connectedOn || '').trim(),
+        'Location': (r.location || '').trim(),
     };
 }
 

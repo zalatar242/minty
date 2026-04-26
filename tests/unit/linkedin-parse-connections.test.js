@@ -179,6 +179,7 @@ test('normalizeConnection: empty record → all empty strings (plus URL empty)',
         'Company': '',
         'Position': '',
         'Connected On': '',
+        'Location': '',
     });
 });
 
@@ -202,6 +203,14 @@ test('normalizeConnection: full record populates all fields', () => {
     assert.equal(out['Company'], 'Acme');
     assert.equal(out['Position'], 'CTO');
     assert.equal(out['Connected On'], '15 Jan 2024');
+});
+
+test('normalizeConnection: location passes through trimmed', () => {
+    const out = normalizeConnection({
+        fullName: 'Ada Lovelace',
+        location: '  San Francisco Bay Area  ',
+    });
+    assert.equal(out['Location'], 'San Francisco Bay Area');
 });
 
 test('normalizeConnection: explicit position/company override occupation-parsed values', () => {
@@ -258,6 +267,7 @@ test('connectionRowsToCsvMatrix: single row column order matches CONNECTIONS_HEA
         'Analytical',
         'Engineer',
         '1843',
+        '',
     ]);
 });
 

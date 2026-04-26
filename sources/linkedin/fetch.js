@@ -297,11 +297,14 @@ async function scrapeOneContactDetail(page, c) {
     const slugMatch = c.profileUrl && /\/in\/([^/?#]+)/.exec(c.profileUrl);
     if (!slugMatch) return c;
     const overlayUrl = SELECTORS.CONTACT_INFO_MODAL.urlTemplate.replace('{slug}', slugMatch[1]);
-    let email = '', connectedOn = '';
+    let email = '', connectedOn = '', location = '';
     try {
         await page.goto(overlayUrl, { waitUntil: 'domcontentloaded' });
         assertOk(page);
-        ({ email, connectedOn } = await page.evaluate((sels) => {
+        // The overlay URL also loads the underlying profile page; we read
+        // location from there in the same evaluate so we don't pay a
+        // second navigation per contact (would double total scrape time).
+        ({ email, connectedOn, location } = await page.evaluate((sels) => {
             const pickAttr = (ss, attr) => {
                 for (const s of ss) { const el = document.querySelector(s); if (el && el.getAttribute(attr)) return el.getAttribute(attr); }
                 return '';
@@ -311,16 +314,60 @@ async function scrapeOneContactDetail(page, c) {
                 return '';
             };
             const mailto = pickAttr(sels.email, 'href');
+
+            // Location heuristic: LinkedIn's profile-card location label is a
+            // small, leaf text element near the headline matching a
+            // "City, Region[, Country]" pattern (or a metro like
+            // "San Francisco Bay Area"). DOM classes drift, so we look for
+            // structural signals: short text, leaf node, geographic shape.
+            const LOC_RE = /^[A-ZÀ-Ý][\p{L}'.\- ]+(?:,\s*[A-ZÀ-Ý][\p{L}'.\- ]+){0,3}$/u;
+            const looksLikeLocation = (s) => {
+                if (!s || s.length < 3 || s.length > 100) return false;
+                if (/^(About|Experience|Education|Skills|Activity|Projects|Languages|Interests|Recommendations|Contact info|Connections?|Followers?)/i.test(s)) return false;
+                if (/[@:/]|^https?/i.test(s)) return false;
+                return LOC_RE.test(s);
+            };
+            // Try common selectors first.
+            const locSelectors = [
+                'div[data-test-profile-location]',
+                'div.text-body-small.inline.t-black--light.break-words',
+                'span.text-body-small.inline.t-black--light.break-words',
+                '.pv-text-details__left-panel .text-body-small',
+            ];
+            let loc = '';
+            for (const s of locSelectors) {
+                const el = document.querySelector(s);
+                if (el && looksLikeLocation((el.textContent || '').trim())) {
+                    loc = (el.textContent || '').trim();
+                    break;
+                }
+            }
+            // Fallback: scan the top profile section for leaf nodes that
+            // look location-shaped. Stop at the first match — order matters
+            // because LinkedIn renders the headline above the location.
+            if (!loc) {
+                const top = document.querySelector('main') || document.body;
+                if (top) {
+                    const candidates = top.querySelectorAll('section span, section div');
+                    for (const el of candidates) {
+                        if (el.children.length > 0) continue; // leaf only
+                        const t = (el.textContent || '').trim();
+                        if (looksLikeLocation(t)) { loc = t; break; }
+                    }
+                }
+            }
+
             return {
                 email: mailto ? mailto.replace(/^mailto:/i, '').trim() : pickText(sels.email),
                 connectedOn: pickText(sels.connectedOn).replace(/^connected\s+/i, '').trim(),
+                location: loc,
             };
         }, SELECTORS.CONTACT_INFO_MODAL));
     } catch (err) {
         if (err && err.code === 'SESSION') throw err;
         // Individual overlay failures are non-fatal.
     }
-    return Object.assign({}, c, { email, connectedOn });
+    return Object.assign({}, c, { email, connectedOn, location });
 }
 
 async function scrapeContactDetails(context, connections) {

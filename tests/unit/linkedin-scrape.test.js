@@ -37,7 +37,7 @@ const FIXTURE_DIR = path.join(__dirname, '..', '..', 'sources', 'linkedin', 'fix
 test('CONNECTIONS_HEADER matches plan CSV column contract', () => {
     assert.deepEqual(CONNECTIONS_HEADER, [
         'First Name', 'Last Name', 'URL', 'Email Address',
-        'Company', 'Position', 'Connected On',
+        'Company', 'Position', 'Connected On', 'Location',
     ]);
 });
 

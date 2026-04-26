@@ -78,6 +78,7 @@ function importConnections() {
         company: r['Company'] || null,
         position: r['Position'] || null,
         connectedOn: r['Connected On'] || null,
+        location: r['Location'] || null,
         source: 'linkedin',
     }));
 }
