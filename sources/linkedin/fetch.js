@@ -233,34 +233,72 @@ async function scrapeConnectionsList(page) {
     if (records.length === 0) {
         records = await page.evaluate(() => {
             const out = [];
-            const seen = new Set();
-            const SKIP_NAME = /^(Message|Follow|Connect|Pending|Withdraw|View profile|Show all|See all|Status is online)$/i;
+            const SKIP_NAME = /^(Message|Follow|Connect|Pending|Withdraw|View profile|Show all|See all|Status is online|Mutual connections?|1st(\s+degree)?|2nd|3rd|\.\.\.|⋯)$/i;
+            const looksLikeName = (s) => s && s.length > 1 && s.length < 80 && !/[\n@:/]/.test(s) && !SKIP_NAME.test(s);
+
+            // Group anchors by slug — each connection gets ~2 anchors on the
+            // page (avatar + name). We pick whichever has the most useful
+            // info and skip the rest.
+            const bySlug = new Map();
             for (const a of document.querySelectorAll('a[href*="/in/"]')) {
                 const m = (a.getAttribute('href') || '').match(/\/in\/([^/?#]+)/);
                 if (!m) continue;
-                const slug = m[1];
-                if (seen.has(slug)) continue;
-                // Skip nav links to own profile (top "Me" menu, sidebars)
                 if (a.closest('nav, header')) continue;
-                // Climb until the ancestor would own a *second* /in/ link;
-                // that means we just passed the card boundary.
-                let card = a;
-                for (let i = 0; i < 8; i++) {
-                    const parent = card.parentElement;
-                    if (!parent) break;
-                    if (parent.querySelectorAll('a[href*="/in/"]').length > 1) break;
-                    card = parent;
+                const slug = m[1];
+                if (!bySlug.has(slug)) bySlug.set(slug, []);
+                bySlug.get(slug).push(a);
+            }
+
+            for (const anchors of bySlug.values()) {
+                let fullName = '';
+                let occupation = '';
+                let chosenAnchor = anchors[0];
+
+                // Strategy 1: aria-label / aria-hidden span / direct text on
+                // any of the anchors (LinkedIn's accessible-name pattern
+                // varies by anchor — try each).
+                for (const a of anchors) {
+                    const aria = (a.getAttribute('aria-label') || '').trim();
+                    if (looksLikeName(aria)) { fullName = aria; chosenAnchor = a; break; }
+                    const hiddenSpan = a.querySelector('[aria-hidden="true"]');
+                    const hiddenTxt = hiddenSpan ? (hiddenSpan.textContent || '').trim() : '';
+                    if (looksLikeName(hiddenTxt)) { fullName = hiddenTxt; chosenAnchor = a; break; }
+                    const direct = (a.textContent || '').replace(/\s+/g, ' ').trim();
+                    if (looksLikeName(direct)) { fullName = direct; chosenAnchor = a; break; }
                 }
-                const lines = (card.innerText || '')
-                    .split('\n').map((s) => s.trim()).filter(Boolean)
-                    .filter((s) => !SKIP_NAME.test(s));
-                if (!lines.length) continue;
-                const fullName = lines[0];
-                const occupation = lines[1] || '';
-                seen.add(slug);
+
+                // Strategy 2: card-climb. Stop when the parent owns >1
+                // *distinct* slugs (was: any second /in/ link, which
+                // double-counted each connection's avatar+name).
+                {
+                    let card = chosenAnchor;
+                    for (let i = 0; i < 8; i++) {
+                        const parent = card.parentElement;
+                        if (!parent) break;
+                        const others = new Set();
+                        for (const oa of parent.querySelectorAll('a[href*="/in/"]')) {
+                            const om = (oa.getAttribute('href') || '').match(/\/in\/([^/?#]+)/);
+                            if (om) others.add(om[1]);
+                        }
+                        if (others.size > 1) break;
+                        card = parent;
+                    }
+                    const lines = (card.innerText || '')
+                        .split('\n').map((s) => s.trim()).filter(Boolean)
+                        .filter((s) => !SKIP_NAME.test(s));
+                    if (!fullName && lines.length && looksLikeName(lines[0])) fullName = lines[0];
+                    // Find occupation as the first non-name, non-skip line
+                    for (const ln of lines) {
+                        if (ln === fullName) continue;
+                        if (/^Connected on /i.test(ln)) continue; // date noise
+                        if (looksLikeName(ln) && ln.length > 5) { occupation = ln; break; }
+                    }
+                }
+
+                if (!fullName) continue;
                 out.push({
                     fullName,
-                    profileUrl: a.href,
+                    profileUrl: chosenAnchor.href,
                     occupation,
                 });
             }
