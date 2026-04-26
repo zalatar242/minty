@@ -156,7 +156,7 @@ async function scrapeConnectionsList(page) {
         if (i % 5 === 0) setProgress('connections', i, -1);
     }
 
-    const records = await page.evaluate((sels) => {
+    let records = await page.evaluate((sels) => {
         const pickText = (root, ss) => {
             for (const s of ss) { const el = root.querySelector(s); if (el) return (el.textContent || '').trim(); }
             return '';
@@ -176,6 +176,49 @@ async function scrapeConnectionsList(page) {
             occupation: pickText(c, sels.occupation),
         }));
     }, SELECTORS.CONNECTIONS_LIST);
+
+    // Fallback when LinkedIn's DOM has drifted past our static selectors.
+    // We enumerate every unique /in/<slug>/ link on the page, climb to the
+    // tightest ancestor that owns exactly that one profile-link (the "card"),
+    // and parse name + headline from its first visible text lines.
+    if (records.length === 0) {
+        records = await page.evaluate(() => {
+            const out = [];
+            const seen = new Set();
+            const SKIP_NAME = /^(Message|Follow|Connect|Pending|Withdraw|View profile|Show all|See all|Status is online)$/i;
+            for (const a of document.querySelectorAll('a[href*="/in/"]')) {
+                const m = (a.getAttribute('href') || '').match(/\/in\/([^/?#]+)/);
+                if (!m) continue;
+                const slug = m[1];
+                if (seen.has(slug)) continue;
+                // Skip nav links to own profile (top "Me" menu, sidebars)
+                if (a.closest('nav, header')) continue;
+                // Climb until the ancestor would own a *second* /in/ link;
+                // that means we just passed the card boundary.
+                let card = a;
+                for (let i = 0; i < 8; i++) {
+                    const parent = card.parentElement;
+                    if (!parent) break;
+                    if (parent.querySelectorAll('a[href*="/in/"]').length > 1) break;
+                    card = parent;
+                }
+                const lines = (card.innerText || '')
+                    .split('\n').map((s) => s.trim()).filter(Boolean)
+                    .filter((s) => !SKIP_NAME.test(s));
+                if (!lines.length) continue;
+                const fullName = lines[0];
+                const occupation = lines[1] || '';
+                seen.add(slug);
+                out.push({
+                    fullName,
+                    profileUrl: a.href,
+                    occupation,
+                });
+            }
+            return out;
+        });
+        if (records.length > 0) console.log(`[linkedin/fetch] static selectors empty — fell back to href-walk and found ${records.length} connections`);
+    }
 
     setProgress('connections', records.length, records.length);
     return records;
@@ -570,8 +613,13 @@ async function run() {
                 const shotPath = path.join(debugDir, `connections-empty-${ts}.png`);
                 await page.screenshot({ path: shotPath, fullPage: true });
                 fs.writeFileSync(path.join(debugDir, `connections-empty-${ts}.url`), page.url());
+                // Also dump the HTML so we can iterate selectors locally
+                // without another scrape round-trip.
+                const html = await page.content();
+                fs.writeFileSync(path.join(debugDir, `connections-empty-${ts}.html`), html);
                 console.log(`[linkedin/fetch] 0 connections returned — diagnostic screenshot at ${shotPath}`);
                 console.log(`[linkedin/fetch] page URL: ${page.url()}`);
+                console.log(`[linkedin/fetch] HTML dump at ${path.join(debugDir, `connections-empty-${ts}.html`)}`);
             } catch (e) { console.error('[linkedin/fetch] debug capture failed:', e.message); }
         }
         const detailed = await scrapeContactDetails(context, listRecords);
