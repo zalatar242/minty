@@ -53,7 +53,7 @@ npm run crm             # http://localhost:3456
 ```
 
 - All data goes in `data/` (gitignored)
-- Client JS lives inline in `crm/server.js` (intentional — single-file SPA)
+- Client JS lives inline in `crm/ui.html.js` (intentional — single-file SPA shell, required by `server.js`)
 - No build step, no bundler
 
 ## Testing

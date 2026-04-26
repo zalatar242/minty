@@ -32,7 +32,8 @@ This is one process. The pieces:
 
 | File | Role |
 |---|---|
-| `server.js` | HTTP server + the entire SPA (HTML/CSS/JS inline). Largest file by far; intentional. |
+| `server.js` | HTTP server, route handlers, batch jobs. |
+| `ui.html.js` | The single-page app shell (HTML/CSS/JS as one big template literal). Edit here, restart server. |
 | `merge.js` | Loads per-source data, normalises, dedups, writes `data/unified/contacts.json` and `interactions.json`. |
 | `match.js` | Cross-source matching algorithm. Reads MATCHING.md for the spec. |
 | `schema.js` | Canonical record shapes for `Contact` and `Interaction`. Start here. |
