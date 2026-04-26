@@ -160,8 +160,14 @@ async function scrapeConnectionsList(page) {
     // anything when the connections list lives inside an inner scroll
     // container (the 2026 layout). scrollIntoView on the deepest visible
     // /in/ link works regardless of which ancestor is scrollable.
+    //
+    // When the count plateaus we (a) wait longer (back-off lets LinkedIn's
+    // rate limiter recover) and (b) look for any "Show more" / "Load more"
+    // / "See more" button to click — some chunk boundaries pause
+    // auto-loading until you press one.
+    const STALL_THRESHOLD = 15;
     let lastCount = 0, stableTicks = 0;
-    for (let i = 0; i < MAX_CONNECTIONS && stableTicks < 5; i++) {
+    for (let i = 0; i < MAX_CONNECTIONS && stableTicks < STALL_THRESHOLD; i++) {
         const count = await page.evaluate(() => {
             const links = Array.from(document.querySelectorAll('a[href*="/in/"]'))
                 .filter((a) => !a.closest('nav, header'));
@@ -171,12 +177,31 @@ async function scrapeConnectionsList(page) {
             // Belt-and-suspenders: also nudge window + main scrolling root.
             try { window.scrollBy(0, 2000); } catch {}
             try { (document.scrollingElement || document.documentElement).scrollTop += 2000; } catch {}
+
+            // Click any visible "Show more" / "Load more" / "See more" button.
+            // LinkedIn sometimes pauses infinite-scroll at chunk boundaries
+            // until you press one — without this we'd plateau at a few hundred
+            // even though thousands more exist.
+            for (const b of document.querySelectorAll('button')) {
+                const t = (b.textContent || '').trim();
+                if (/^(show|load|see)\s+more(\s+results?)?$/i.test(t) && !b.disabled) {
+                    const r = b.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) { b.click(); break; }
+                }
+            }
             return links.length;
         });
-        await page.waitForTimeout(THROTTLE_MS);
+        // Back-off: wait longer when we're stalled so LinkedIn's lazy-load
+        // (and any post-button-click XHR) has time to land.
+        const waitMs = THROTTLE_MS + Math.min(stableTicks * THROTTLE_MS, THROTTLE_MS * 6);
+        await page.waitForTimeout(waitMs);
         if (count === lastCount) stableTicks++;
         else { stableTicks = 0; lastCount = count; }
-        if (i % 5 === 0) setProgress('connections', count, expectedTotal || -1);
+        // Progress every 5 iterations OR when we cross every 100-row mark.
+        if (i % 5 === 0 || (count >= 100 && Math.floor(count / 100) > Math.floor(lastCount / 100))) {
+            setProgress('connections', count, expectedTotal || -1);
+            console.log(`[linkedin/fetch] scroll i=${i} count=${count}${expectedTotal ? '/' + expectedTotal : ''} stalled=${stableTicks}`);
+        }
         if (expectedTotal && count >= expectedTotal) break; // we have everything
     }
 
