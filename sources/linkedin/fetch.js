@@ -22,6 +22,57 @@ const { classifyUrl } = require('./session-detect');
 const { toCsvFile } = require('./csv');
 const SELECTORS = require('./selectors');
 const { CONNECTIONS_HEADER, connectionRowsToCsvMatrix } = require('./parse-connections');
+
+// --- Resume helpers --------------------------------------------------------
+// Read existing Connections.csv from prior runs so we can skip detail-fetch
+// for already-enriched contacts and naturally rate-limit our LinkedIn
+// queries. csv-parse is an optional dep — graceful no-op if missing.
+
+function loadEnrichedFromCsv(filepath) {
+    if (!fs.existsSync(filepath)) return new Map();
+    let parse;
+    try { parse = require('csv-parse/sync').parse; }
+    catch { return new Map(); }
+    let rows;
+    try {
+        const raw = fs.readFileSync(filepath, 'utf8');
+        rows = parse(raw, { columns: true, skip_empty_lines: true, relax_column_count: true });
+    } catch { return new Map(); }
+    const out = new Map();
+    for (const r of rows) {
+        const url = r['URL'] || '';
+        const m = /\/in\/([^/?#]+)/.exec(url);
+        if (!m) continue;
+        // "Enriched" = at least one detail-pass field is populated. The
+        // detail pass writes location + connectedOn (and email when shared).
+        // Skip if it's just a list-phase row (no detail fields).
+        const hasDetail = !!(r['Location'] || r['Connected On'] || r['Email Address']);
+        if (!hasDetail) continue;
+        out.set(m[1], r);
+    }
+    return out;
+}
+
+function slugFromProfileUrl(url) {
+    const m = /\/in\/([^/?#]+)/.exec(url || '');
+    return m ? m[1] : null;
+}
+
+// Convert a row from Connections.csv (column-keyed) into the shape that
+// scrapeContactDetails returns (camelCase fields), so resumed rows merge
+// cleanly with freshly-scraped ones.
+function csvRowToConnectionRecord(row, baseFromList) {
+    return {
+        ...baseFromList,
+        // Don't trust the CSV's name parts — they go through splitName from
+        // fullName at write time. Keep baseFromList's fullName/profileUrl.
+        email: row['Email Address'] || '',
+        company: row['Company'] || baseFromList.company || '',
+        position: row['Position'] || baseFromList.position || '',
+        connectedOn: row['Connected On'] || '',
+        location: row['Location'] || '',
+    };
+}
 const { MESSAGES_HEADER, messageRowsToCsvMatrix } = require('./parse-messages');
 
 const ROOT = path.resolve(__dirname, '../../');
@@ -501,6 +552,30 @@ async function scrapeContactDetails(context, connections, opts = {}) {
     let sessionErr = null;
     const onBatch = typeof opts.onBatch === 'function' ? opts.onBatch : null;
     const batchEvery = Number(opts.batchEvery) || 50;
+    // Resume: pre-fill `results` for any contact whose enriched row is
+    // already on disk. The workers below then skip them — fewer LinkedIn
+    // queries, less rate-limit risk. Each resumed contact is logged at
+    // 'details' progress without ever opening a tab.
+    const existing = (opts.existing instanceof Map) ? opts.existing : new Map();
+    let resumedCount = 0;
+    if (existing.size > 0) {
+        for (let i = 0; i < total; i++) {
+            const slug = slugFromProfileUrl(connections[i].profileUrl);
+            if (slug && existing.has(slug)) {
+                results[i] = csvRowToConnectionRecord(existing.get(slug), connections[i]);
+                resumedCount++;
+            }
+        }
+        if (resumedCount > 0) {
+            console.log(`[linkedin/fetch] resuming: ${resumedCount}/${total} contacts already enriched on disk — skipping their detail-fetch`);
+            done = resumedCount;
+            setProgress('details', done, total);
+            if (onBatch) {
+                try { onBatch(connections.map((c, i) => results[i] || c), done, total); }
+                catch { /* ignore */ }
+            }
+        }
+    }
 
     // Returns the in-progress full array — entries enriched so far, the rest
     // fall back to the raw list record. So callers can write a partial CSV
@@ -516,6 +591,10 @@ async function scrapeContactDetails(context, connections, opts = {}) {
                 if (sessionErr) break;
                 const idx = cursor++;
                 if (idx >= total) break;
+                // Resume: skip the actual fetch when this slot was pre-filled
+                // from the on-disk CSV. Saves a LinkedIn page-load per
+                // already-known contact — the whole point of this branch.
+                if (results[idx] !== undefined) continue;
                 try {
                     results[idx] = await scrapeOneContactDetail(page, connections[idx]);
                 } catch (err) {
@@ -895,16 +974,34 @@ async function run() {
                 console.log(`[linkedin/fetch] HTML dump at ${path.join(debugDir, `connections-empty-${ts}.html`)}`);
             } catch (e) { console.error('[linkedin/fetch] debug capture failed:', e.message); }
         }
+        // Resume: load existing enriched rows so we don't re-fetch contacts
+        // we already have full data on. This is the main rate-limit lever —
+        // a second sync run only hits LinkedIn for new connections + ones
+        // that haven't been detail-enriched yet, often dropping query volume
+        // by >90%.
+        const existingEnriched = loadEnrichedFromCsv(path.join(STAGING_DIR, 'Connections.csv'));
+        if (existingEnriched.size > 0) {
+            console.log(`[linkedin/fetch] resume: ${existingEnriched.size} contacts already enriched in staging CSV — will skip their detail-fetch`);
+        }
+
         // Early CSV flush — write list-only data BEFORE the slow detail
         // pass. If the user Ctrl+C's during details, they keep all the
         // names/URLs/occupations from the list phase. Detail-pass enrichment
         // (email, location, connectedOn) layers in via incremental flushes
-        // every batchEvery completions.
+        // every batchEvery completions. We MERGE with existingEnriched so
+        // the early-write doesn't clobber prior detail data on disk.
         if (listRecords.length > 0) {
             try {
+                const merged = listRecords.map((c) => {
+                    const slug = slugFromProfileUrl(c.profileUrl);
+                    if (slug && existingEnriched.has(slug)) {
+                        return csvRowToConnectionRecord(existingEnriched.get(slug), c);
+                    }
+                    return c;
+                });
                 writeCsvAtomic(STAGING_DIR, 'Connections.csv',
-                    toCsvFile(CONNECTIONS_HEADER, connectionRowsToCsvMatrix(listRecords)));
-                console.log(`[linkedin/fetch] early-write Connections.csv with ${listRecords.length} rows (no detail enrichment yet)`);
+                    toCsvFile(CONNECTIONS_HEADER, connectionRowsToCsvMatrix(merged)));
+                console.log(`[linkedin/fetch] early-write Connections.csv with ${listRecords.length} rows (${existingEnriched.size} carried over from prior runs)`);
             } catch (e) {
                 console.error('[linkedin/fetch] early CSV write failed:', e.message);
             }
@@ -912,6 +1009,7 @@ async function run() {
 
         const detailed = await scrapeContactDetails(context, listRecords, {
             batchEvery: 50,
+            existing: existingEnriched,
             onBatch: (snapshot, done, total) => {
                 try {
                     writeCsvAtomic(STAGING_DIR, 'Connections.csv',
