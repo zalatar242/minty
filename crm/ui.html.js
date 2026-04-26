@@ -5148,9 +5148,13 @@ function renderLinkedinAutosyncCard(s) {
   // archive via email/account, not via the live session.
   let exportRow = '';
   let exportButton = '';
-  if (exportReq && exportReq.status === 'pending' && exportReq.requestedAt) {
+  if (exportReq && exportReq.status === 'completed' && exportReq.completedAt) {
+    const age = fmtSyncAge(exportReq.completedAt);
+    exportRow = '<div class="settings-row" style="font-size:11px;color:#34d399">✓ Data export completed ' + esc(age || 'recently') + ' — archive imported automatically.</div>';
+  } else if (exportReq && exportReq.status === 'pending' && exportReq.requestedAt) {
     const age = fmtSyncAge(exportReq.requestedAt);
-    exportRow = '<div class="settings-row" style="font-size:11px;color:var(--text-muted)">Data export: requested ' + esc(age || 'recently') + '. LinkedIn will email you when it\\'s ready (typically 24-72h).</div>';
+    exportRow = '<div class="settings-row" style="font-size:11px;color:var(--text-muted)">Data export: requested ' + esc(age || 'recently') + '. LinkedIn emails you when it\\'s ready (typically 24-72h). Auto-checks daily — click <b>Check now</b> after the email lands to import immediately.</div>';
+    if (pwAvailable) buttons.push('<button class="settings-btn settings-btn-secondary" onclick="checkLinkedInExport()">Check now</button>');
   } else if (exportReq && exportReq.status === 'auth-required') {
     exportRow = '<div class="settings-note settings-note-warn">Last data export request needed re-auth. Click <b>Connect to LinkedIn</b> above, then request again.</div>';
     if (pwAvailable) exportButton = '<button class="settings-btn settings-btn-secondary" onclick="requestLinkedInExport()">Request data export</button>';
@@ -5193,6 +5197,14 @@ async function requestLinkedInExport() {
   if (r.status === 503) return alert(d.message || 'Playwright not installed.');
   if (!r.ok) return alert(d.error || d.message || ('Request failed: ' + r.status));
   alert(d.message || 'A Chromium window is opening. Confirm there to submit the request.');
+  if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
+}
+
+async function checkLinkedInExport() {
+  const r = await fetch(BASE + '/api/linkedin/check-export', { method: 'POST', credentials: 'same-origin' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) return alert(d.error || d.message || ('Check failed: ' + r.status));
+  alert(d.message || 'Checking with LinkedIn now.');
   if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
 }
 

@@ -3530,6 +3530,24 @@ function handleLinkedInGetExportRequest(req, res, params, paths, uuid) {
     }
 }
 
+function handleLinkedInCheckExport(req, res, params, paths, uuid) {
+    if (!linkedInGate(req, res)) return;
+    if (!linkedInPlaywrightAvailable()) {
+        json(res, { error: 'playwright-missing' }, 503); return;
+    }
+    try {
+        const daemon = ensureSyncDaemon(uuid);
+        if (typeof daemon?.triggerExportCheck === 'function') {
+            daemon.triggerExportCheck();
+            json(res, { ok: true, message: 'Checking with LinkedIn — progress will appear in the terminal log.' });
+        } else {
+            json(res, { error: 'daemon-not-ready' }, 503);
+        }
+    } catch (e) {
+        json(res, { error: e.message }, 500);
+    }
+}
+
 function handleLinkedInSync(req, res) {
     if (!linkedInGate(req, res)) return;
     if (!linkedInPlaywrightAvailable()) {
@@ -3559,6 +3577,7 @@ const ROUTES = [
     ['POST', /^\/api\/linkedin\/sync$/,                   handleLinkedInSync],
     ['POST', /^\/api\/linkedin\/request-export$/,         handleLinkedInRequestExport],
     ['GET',  /^\/api\/linkedin\/export-request$/,         handleLinkedInGetExportRequest],
+    ['POST', /^\/api\/linkedin\/check-export$/,           handleLinkedInCheckExport],
     ['POST', /^\/api\/sources\/upload\/([^/]+)$/,         handleUploadSource],
     ['POST', /^\/api\/sources\/email$/,                   handleConnectEmail],
     ['POST', /^\/api\/sources\/email\/device-start$/,     handleEmailDeviceStart],

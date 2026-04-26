@@ -933,6 +933,51 @@ function startSyncDaemon(uuid, userDataDir) {
 
     cleanups.push(() => { if (liChild) liChild.kill('SIGTERM'); });
 
+    // ── LinkedIn export-archive download poll (daily) ──────────────────
+    // After the user clicks "Request data export" in Settings, LinkedIn
+    // takes 24-72h to prepare the archive. This poll wakes once a day,
+    // hits the data-export page, and if the archive is ready it
+    // downloads + unzips + imports — auto-feeding the much richer ZIP
+    // dataset into contacts.json without any further user action.
+    // The script is idempotent (no-op if no pending request, throttled
+    // to once per 23h via internal lastCheckedAt tracking).
+    let exportCheckChild = null;
+    function runExportCheck(reason) {
+        if (exportCheckChild) return;
+        if (!userConfig.isLinkedInAutosyncEnabled(userDataDir)) return;
+        console.log(`[autosync] LinkedIn export-archive check (${reason})`);
+        exportCheckChild = spawn(process.execPath, ['sources/linkedin/check-export-ready.js'], {
+            cwd: ROOT,
+            env: { ...process.env, CRM_DATA_DIR: userDataDir },
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        let stderr = '';
+        exportCheckChild.stderr.on('data', (d) => { stderr += String(d); process.stderr.write(d); });
+        exportCheckChild.stdout.on('data', (d) => process.stdout.write(d));
+        exportCheckChild.on('exit', (code) => {
+            exportCheckChild = null;
+            if (code === 0) {
+                // Status file already updated by the script.
+            } else if (code === 3) {
+                notifications.set(userDataDir, 'linkedin', {
+                    needsReauth: true,
+                    pauseSync: false,
+                    message: 'LinkedIn session expired — open Settings → LinkedIn → Reconnect, then re-request the data export.',
+                });
+            } else if (code !== 0 && /still preparing|archive not ready/i.test(stderr)) {
+                // benign — try again tomorrow
+            } else if (code !== 0) {
+                console.error(`[autosync] export-check exit ${code}`);
+            }
+        });
+    }
+    const EXPORT_CHECK_MS = 24 * 60 * 60 * 1000;
+    const exportInterval = setInterval(() => runExportCheck('tick'), EXPORT_CHECK_MS);
+    cleanups.push(() => clearInterval(exportInterval));
+    const exportInitial = setTimeout(() => runExportCheck('boot'), 2 * 60 * 1000);
+    cleanups.push(() => clearTimeout(exportInitial));
+    cleanups.push(() => { if (exportCheckChild) exportCheckChild.kill('SIGTERM'); });
+
     console.log(`[sync] Daemon started for user ${uuid}`);
 
     return {
@@ -946,6 +991,11 @@ function startSyncDaemon(uuid, userDataDir) {
         /** Called by the Settings UI right after the toggle flips on. */
         triggerLinkedInSync() {
             runLinkedInSync('manual');
+        },
+        /** Manually trigger an export-archive check (e.g. after user
+         *  receives the LinkedIn email and wants to import immediately). */
+        triggerExportCheck() {
+            runExportCheck('manual');
         },
         /** Call this after a whatsapp-web.js client becomes ready */
         attachWhatsApp(client) {
