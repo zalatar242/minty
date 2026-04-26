@@ -21,7 +21,7 @@ Every feature must pass the test: *"Does this help the user activate their netwo
 
 - **All API routes** live in `crm/server.js`
 - **All data transforms / computations** go in `crm/merge.js` or a new `crm/[feature].js`
-- **Client-side JS** lives inline in the HTML template in `server.js` (single-file SPA — known debt, *reduce* don't grow)
+- **Client-side JS** lives inline in the HTML template in `crm/ui.html.js` (single-file SPA — known debt, *reduce* don't grow)
 - **Data** lives in `data/unified/` — `contacts.json`, `interactions.json`, `insights.json`, `digest.json`
 - **Sync state** lives in `data/sync-state.json`
 - **No TypeScript** — plain Node.js CommonJS only
@@ -72,7 +72,8 @@ This means AI work happens once per scheduled run, and the product stays free to
 ## Codebase quick reference
 
 **Core modules** (in `crm/`):
-- `server.js` — HTTP server + full SPA HTML/CSS/JS (large — reduce, don't grow)
+- `server.js` — HTTP server, route handlers, batch jobs (~3.7k lines)
+- `ui.html.js` — full SPA HTML/CSS/JS as one template literal (large — reduce, don't grow)
 - `schema.js` — `createContact()` and `createInteraction()` data shapes
 - `merge.js` — contact merge pipeline (dedup, stable IDs)
 - `match.js` — cross-source matching heuristics
