@@ -29,6 +29,14 @@ const DEFAULTS = Object.freeze({
     // and ready to fire after a successful connect, without making the
     // user dig through Settings to flip it on first.
     linkedinAutosync: true,
+    // ON by default with smart incremental sync. The earlier always-on +
+    // 10k-msg-per-chat backfill caused a TOS ban; the new behaviour is
+    // tame: boot resumes the connection, but the per-chat loop SKIPS any
+    // chat whose chat.lastMessage.timestamp <= the last message we
+    // already have on disk. Net effect: a 27k-contact account where 50
+    // chats have new activity = ~50 fetches, not 27k. The live message
+    // listener still keeps things real-time fresh while CRM is running.
+    whatsappAutoResume: true,
     demoMode: false,
     google: {
         clientId: '',

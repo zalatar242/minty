@@ -109,10 +109,13 @@ client.on('ready', async () => {
     console.log(`Found ${chats.length} chats. Exporting...`);
 
     const firstRun = Object.keys(existingChats).length === 0 && !lastExportUnix;
-    // 10k/chat ceiling. Unlimited caused Puppeteer detached-Frame failures
-    // on huge chats. Bump WHATSAPP_MSG_LIMIT to override.
-    const fetchLimit = Number(process.env.WHATSAPP_MSG_LIMIT) || 10000;
-    if (firstRun) console.log(`First run — up to ${fetchLimit.toLocaleString()} messages/chat. Set WHATSAPP_MSG_LIMIT env var to change.`);
+    // 500/chat default. Higher caps got the maintainer's account
+    // temporarily banned — WhatsApp's spam detection treats large-volume
+    // message reading as exfiltration-like. 500 covers ~99% of meaningful
+    // conversation history. Bump WHATSAPP_MSG_LIMIT to opt in to more,
+    // accepting the elevated ban risk.
+    const fetchLimit = Number(process.env.WHATSAPP_MSG_LIMIT) || 500;
+    if (firstRun) console.log(`First run — up to ${fetchLimit.toLocaleString()} messages/chat. Set WHATSAPP_MSG_LIMIT env var to fetch more (higher TOS-ban risk).`);
 
     const result = { ...existingChats };
     let totalMsgs = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);

@@ -2848,12 +2848,13 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
     }
 
     const firstRun = !resuming;
-    // 10k/chat is the ceiling. Unlimited (Infinity) caused Puppeteer
-    // detached-Frame failures on very large chats — the in-memory
-    // message array got too big and the WhatsApp Web tab recycled.
-    // 10k covers virtually all real chat history; bump WHATSAPP_MSG_LIMIT
-    // env var if you genuinely have a chat deeper than that.
-    const limit = opts.limit ?? (Number(process.env.WHATSAPP_MSG_LIMIT) || 10000);
+    // 500/chat default. Earlier 10k/Infinity caps got the user temporarily
+    // banned for "TOS violation" — WhatsApp's spam detection treats reading
+    // many thousands of messages from many thousands of chats as
+    // exfiltration-like activity. 500 covers virtually every meaningful
+    // conversation thread and stays well within human-like reading volume.
+    // Power users can opt in to deeper backfill via WHATSAPP_MSG_LIMIT=N.
+    const limit = opts.limit ?? (Number(process.env.WHATSAPP_MSG_LIMIT) || 500);
     let msgCount = Object.values(result).reduce((n, c) => n + (c.messages?.length || 0), 0);
 
     for (let i = 0; i < chats.length; i++) {
@@ -2919,21 +2920,48 @@ async function exportWhatsapp(client, waDir, onProgress = () => {}, opts = {}) {
             }
         } catch { /* not all chats support pinned / upstream may fail */ }
 
+        // Smart-skip: if chat.lastMessage.timestamp <= the most-recent
+        // message we already have on disk for this chat, there's nothing
+        // new to fetch. Skipping entirely (no fetchMessages call at all)
+        // is the main lever that keeps incremental syncs from looking
+        // like spam to WhatsApp's detection. Net effect on a 27k-contact
+        // account: ~50 fetches per resume instead of ~27,000.
+        let skipFetch = false;
+        const newLastMs = chat.lastMessage?.timestamp ? chat.lastMessage.timestamp * 1000 : null;
+        const existingMessages = result[name]?.messages;
+        if (newLastMs && Array.isArray(existingMessages) && existingMessages.length > 0) {
+            const newest = existingMessages.reduce((max, m) => {
+                const t = m.timestamp ? new Date(m.timestamp).getTime() : 0;
+                return t > max ? t : max;
+            }, 0);
+            if (newest > 0 && newLastMs <= newest) skipFetch = true;
+        }
+
+        // Per-chat jitter — slows the export to human-like pacing. Skip
+        // the wait when we're skipping the fetch too (no LinkedIn-side
+        // work happens, no need to back off the loop).
+        if (i > 0 && !skipFetch) {
+            const jitterMs = 800 + Math.floor(Math.random() * 700);
+            await new Promise((r) => setTimeout(r, jitterMs));
+        }
+
         // Attempt message fetch; tolerate failure (known wweb.js waitForChatLoading issue).
         let newMessages = [];
-        try {
-            const fetched = await chat.fetchMessages({ limit });
-            const seen = existingIds[name] || new Set();
-            newMessages = fetched
-                .filter(m => !seen.has(m.id._serialized))
-                .map(m => ({
-                    id: m.id._serialized,
-                    timestamp: new Date(m.timestamp * 1000).toISOString(),
-                    from: m.from, body: m.body, type: m.type,
-                }));
-        } catch (e) {
-            console.error(`[whatsapp] fetchMessages failed for ${name}:`, e.message);
-            // fall through — meta is still written
+        if (!skipFetch) {
+            try {
+                const fetched = await chat.fetchMessages({ limit });
+                const seen = existingIds[name] || new Set();
+                newMessages = fetched
+                    .filter(m => !seen.has(m.id._serialized))
+                    .map(m => ({
+                        id: m.id._serialized,
+                        timestamp: new Date(m.timestamp * 1000).toISOString(),
+                        from: m.from, body: m.body, type: m.type,
+                    }));
+            } catch (e) {
+                console.error(`[whatsapp] fetchMessages failed for ${name}:`, e.message);
+                // fall through — meta is still written
+            }
         }
 
         const existing = result[name];
@@ -3773,13 +3801,20 @@ server.listen(PORT, HOST, () => {
         console.error('[sync] Failed to start sync daemon:', e.message);
     }
 
-    // Auto-resume WhatsApp if previously paired. Stagger 5s after boot so the
-    // sync daemon initializes first and we don't fight Puppeteer for the
-    // event loop during startup.
-    setTimeout(() => {
-        try { autoResumeWhatsapp(SINGLE_USER_UUID); }
-        catch (e) { console.error('[autosync] WhatsApp boot resume failed:', e.message); }
-    }, 5 * 1000);
+    // Auto-resume WhatsApp on boot — opt-in only. The earlier always-on
+    // behaviour combined with deep message-history backfill triggered
+    // WhatsApp's spam detection and got the maintainer temporarily banned.
+    // Now: gated on userConfig.whatsappAutoResume (default false). Users
+    // who want it can flip the toggle in Settings; default users get
+    // explicit-click behaviour from Sources → WhatsApp.
+    if (userConfig.getConfig(DATA).whatsappAutoResume === true) {
+        setTimeout(() => {
+            try { autoResumeWhatsapp(SINGLE_USER_UUID); }
+            catch (e) { console.error('[autosync] WhatsApp boot resume failed:', e.message); }
+        }, 5 * 1000);
+    } else {
+        console.log('[autosync] WhatsApp boot resume disabled (set whatsappAutoResume=true in Settings to enable)');
+    }
 });
 
 // ---------------------------------------------------------------------------
