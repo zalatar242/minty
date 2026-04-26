@@ -173,11 +173,21 @@ async function scrapeConnectionsList(page) {
     }
 
     // Read the visible "X connections" header so we know the target count
-    // and can show real progress / detect short reads.
-    const expectedTotal = await page.evaluate(() => {
-        const m = (document.body.innerText || '').match(/([\d,]+)\s+connections?/i);
-        return m ? Number(m[1].replace(/,/g, '')) : null;
-    });
+    // and can show real progress / detect short reads. The "X connections"
+    // text can render after the first /in/ links land (or use a non-breaking
+    // space / singular "connection"), so retry up to 3x with a small delay.
+    const readExpectedTotal = async () => {
+        for (let attempt = 0; attempt < 3; attempt++) {
+            const n = await page.evaluate(() => {
+                const m = (document.body.innerText || '').match(/([\d,]+)\s*connections?\b/i);
+                return m ? Number(m[1].replace(/,/g, '')) : null;
+            });
+            if (n) return n;
+            await page.waitForTimeout(500);
+        }
+        return null;
+    };
+    let expectedTotal = await readExpectedTotal();
     if (expectedTotal) console.log(`[linkedin/fetch] page reports ${expectedTotal.toLocaleString()} total connections`);
 
     // Drive infinite-scroll by repeatedly scrolling the last profile-link
@@ -190,7 +200,7 @@ async function scrapeConnectionsList(page) {
     // rate limiter recover) and (b) look for any "Show more" / "Load more"
     // / "See more" button to click — some chunk boundaries pause
     // auto-loading until you press one.
-    const STALL_THRESHOLD = 15;
+    const STALL_THRESHOLD = 25;
     let lastCount = 0, stableTicks = 0;
     for (let i = 0; i < MAX_CONNECTIONS && stableTicks < STALL_THRESHOLD; i++) {
         const count = await page.evaluate(() => {
@@ -222,6 +232,21 @@ async function scrapeConnectionsList(page) {
         await page.waitForTimeout(waitMs);
         if (count === lastCount) stableTicks++;
         else { stableTicks = 0; lastCount = count; }
+        // Capture page state JUST BEFORE we give up — one tick before the
+        // for-loop's stall guard exits. Lets us diagnose plateaus without
+        // having to reproduce a multi-thousand-connection scrape.
+        if (stableTicks === STALL_THRESHOLD - 1) {
+            try {
+                const debugDir = path.join(LINKEDIN_DIR, '.debug');
+                fs.mkdirSync(debugDir, { recursive: true });
+                const ts = Date.now();
+                const pngPath = path.join(debugDir, `connections-stalled-${ts}.png`);
+                const htmlPath = path.join(debugDir, `connections-stalled-${ts}.html`);
+                await page.screenshot({ path: pngPath, fullPage: true });
+                fs.writeFileSync(htmlPath, await page.content());
+                console.log(`[linkedin/fetch] scroll stalled at count=${count}${expectedTotal ? '/' + expectedTotal : ''} — diagnostic at ${pngPath} and ${htmlPath}`);
+            } catch (e) { console.error('[linkedin/fetch] stalled-scroll debug failed:', e.message); }
+        }
         // Progress every 5 iterations OR when we cross every 100-row mark.
         if (i % 5 === 0 || (count >= 100 && Math.floor(count / 100) > Math.floor(lastCount / 100))) {
             setProgress('connections', count, expectedTotal || -1);

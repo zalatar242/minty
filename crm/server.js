@@ -1379,6 +1379,10 @@ function handleGetSettings(_req, res) {
         runtimeConfig: userConfig.getRedactedConfig(DATA),
         playwrightAvailable: linkedInPlaywrightAvailable(),
         linkedinState: readLinkedInState(),
+        linkedinExportRequest: (() => {
+            try { return JSON.parse(fs.readFileSync(path.join(DATA, 'linkedin', '.export-request.json'), 'utf8')); }
+            catch { return null; }
+        })(),
     });
 }
 
@@ -3490,6 +3494,42 @@ function handleLinkedInConnect(req, res) {
     res.end(JSON.stringify({ ok: true, pid: child.pid, message: 'Check your terminal / desktop for the Chromium window.' }));
 }
 
+function handleLinkedInRequestExport(req, res) {
+    if (!linkedInGate(req, res)) return;
+    if (!linkedInPlaywrightAvailable()) {
+        json(res, { error: 'playwright-missing', message: 'Playwright is not installed. Run npm install in the project directory once.' }, 503); return;
+    }
+    const reqPath = path.join(DATA, 'linkedin', '.export-request.json');
+    let existing = null;
+    try { existing = JSON.parse(fs.readFileSync(reqPath, 'utf8')); } catch { /* none */ }
+    if (existing && existing.status === 'pending' && existing.requestedAt) {
+        const ageMs = Date.now() - new Date(existing.requestedAt).getTime();
+        if (!Number.isNaN(ageMs) && ageMs < 7 * 24 * 60 * 60 * 1000) {
+            return json(res, { ok: false, error: 'already-pending', requestedAt: existing.requestedAt }, 409);
+        }
+    }
+    const { spawn } = require('child_process');
+    const scriptPath = path.resolve(__dirname, '../sources/linkedin/request-export.js');
+    const child = spawn(process.execPath, [scriptPath], {
+        detached: false, stdio: 'ignore', env: { ...process.env, CRM_DATA_DIR: DATA },
+    });
+    child.unref();
+    _linkedinChildren.set(child.pid, child);
+    child.on('exit', () => _linkedinChildren.delete(child.pid));
+    res.writeHead(202, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, pid: child.pid, message: 'A Chromium window is opening so you can confirm. After you submit, LinkedIn will email you when the archive is ready (typically 24-72h).' }));
+}
+
+function handleLinkedInGetExportRequest(req, res, params, paths, uuid) {
+    const reqPath = path.join(DATA, 'linkedin', '.export-request.json');
+    try {
+        const raw = fs.readFileSync(reqPath, 'utf8');
+        json(res, { request: JSON.parse(raw) });
+    } catch {
+        json(res, { request: null });
+    }
+}
+
 function handleLinkedInSync(req, res) {
     if (!linkedInGate(req, res)) return;
     if (!linkedInPlaywrightAvailable()) {
@@ -3517,6 +3557,8 @@ const ROUTES = [
     ['GET',  /^\/api\/linkedin\/status$/,                 handleLinkedInStatus],
     ['POST', /^\/api\/linkedin\/connect$/,                handleLinkedInConnect],
     ['POST', /^\/api\/linkedin\/sync$/,                   handleLinkedInSync],
+    ['POST', /^\/api\/linkedin\/request-export$/,         handleLinkedInRequestExport],
+    ['GET',  /^\/api\/linkedin\/export-request$/,         handleLinkedInGetExportRequest],
     ['POST', /^\/api\/sources\/upload\/([^/]+)$/,         handleUploadSource],
     ['POST', /^\/api\/sources\/email$/,                   handleConnectEmail],
     ['POST', /^\/api\/sources\/email\/device-start$/,     handleEmailDeviceStart],

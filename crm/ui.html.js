@@ -5112,6 +5112,7 @@ function renderLinkedinAutosyncCard(s) {
   const liStatus = li.status || 'disconnected';
   const lastSyncIso = li.lastSyncAt || li.lastSync;
   const lastSyncStr = lastSyncIso ? fmtSyncAge(lastSyncIso) : null;
+  const exportReq = s.linkedinExportRequest || null;
 
   const badgeMap = {
     disconnected:  ['demo',    'not connected'],
@@ -5142,6 +5143,22 @@ function renderLinkedinAutosyncCard(s) {
     // syncing/connecting: no actions; the toast surfaces progress.
   }
 
+  // Export-request status. Independent of the scrape lifecycle — even users
+  // who never click Connect can use this path because LinkedIn delivers the
+  // archive via email/account, not via the live session.
+  let exportRow = '';
+  let exportButton = '';
+  if (exportReq && exportReq.status === 'pending' && exportReq.requestedAt) {
+    const age = fmtSyncAge(exportReq.requestedAt);
+    exportRow = '<div class="settings-row" style="font-size:11px;color:var(--text-muted)">Data export: requested ' + esc(age || 'recently') + '. LinkedIn will email you when it\\'s ready (typically 24-72h).</div>';
+  } else if (exportReq && exportReq.status === 'auth-required') {
+    exportRow = '<div class="settings-note settings-note-warn">Last data export request needed re-auth. Click <b>Connect to LinkedIn</b> above, then request again.</div>';
+    if (pwAvailable) exportButton = '<button class="settings-btn settings-btn-secondary" onclick="requestLinkedInExport()">Request data export</button>';
+  } else if (pwAvailable) {
+    exportButton = '<button class="settings-btn settings-btn-secondary" onclick="requestLinkedInExport()">Request data export from LinkedIn</button>';
+  }
+  if (exportButton) buttons.push(exportButton);
+
   return \`
     <div class="settings-card">
       <div class="settings-card-title">LinkedIn</div>
@@ -5155,10 +5172,28 @@ function renderLinkedinAutosyncCard(s) {
         you to log in — no terminal needed. After that, connections + messages
         sync automatically every 24h. Experimental and ToS-adjacent.
       </div>
+      \${exportRow}
+      <div class="settings-row" style="font-size:11px;color:var(--text-muted)">
+        Want LinkedIn's official data archive instead of (or alongside) the live
+        scrape? <b>Request data export</b> opens a Chromium window that asks
+        LinkedIn for it — they email you when it's ready. Less ToS-adjacent,
+        more complete.
+      </div>
       \${pwNote}
       <div class="settings-actions">\${buttons.join(' ')}</div>
     </div>
   \`;
+}
+
+async function requestLinkedInExport() {
+  if (!confirm('This opens a Chromium window so you can confirm a data-export request to LinkedIn. They\\'ll email you when the archive is ready (typically 24-72h). Continue?')) return;
+  const r = await fetch(BASE + '/api/linkedin/request-export', { method: 'POST', credentials: 'same-origin' });
+  const d = await r.json().catch(() => ({}));
+  if (r.status === 409) return alert('A request is already pending — wait for the email or try again after 7 days.');
+  if (r.status === 503) return alert(d.message || 'Playwright not installed.');
+  if (!r.ok) return alert(d.error || d.message || ('Request failed: ' + r.status));
+  alert(d.message || 'A Chromium window is opening. Confirm there to submit the request.');
+  if (typeof loadSettings === 'function' && document.getElementById('settings-body')) loadSettings();
 }
 
 function renderGoogleOAuthCard(s) {
