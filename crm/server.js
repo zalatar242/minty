@@ -2409,6 +2409,36 @@ async function handleWhatsappStart(req, res, params, paths, uuid) {
     const waDir = path.join(dataDir, 'whatsapp');
     fs.mkdirSync(waDir, { recursive: true });
 
+    // Self-heal stale Chromium SingletonLock/Cookie/Socket symlinks left
+    // behind by a Puppeteer that crashed without cleanup. Without this, the
+    // next client.initialize() hangs in "initializing" forever waiting for
+    // a lock no live process holds.
+    try {
+        const sessionDir = path.join(authDir, `session-${uuid}`);
+        if (fs.existsSync(sessionDir)) {
+            for (const name of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+                const p = path.join(sessionDir, name);
+                try {
+                    const stat = fs.lstatSync(p);
+                    if (!stat.isSymbolicLink()) continue;
+                    const target = fs.readlinkSync(p);
+                    const m = target.match(/-(\d+)$/);
+                    let alive = false;
+                    if (m) {
+                        try { process.kill(Number(m[1]), 0); alive = true; }
+                        catch { alive = false; }
+                    }
+                    if (!alive) {
+                        fs.unlinkSync(p);
+                        console.log(`[whatsapp] cleared stale ${name} for ${uuid}`);
+                    }
+                } catch { /* ignore — file gone or unreadable */ }
+            }
+        }
+    } catch (e) {
+        console.error('[whatsapp] singleton-lock cleanup failed:', e.message);
+    }
+
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: uuid, dataPath: authDir }),
         puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'], protocolTimeout: 600000 },
