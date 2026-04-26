@@ -147,13 +147,37 @@ async function scrapeConnectionsList(page) {
     await page.goto(SELECTORS.CONNECTIONS_LIST.url, { waitUntil: 'domcontentloaded' });
     assertOk(page);
 
-    let prevHeight = 0, stableTicks = 0;
-    for (let i = 0; i < MAX_CONNECTIONS && stableTicks < 3; i++) {
-        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+    // Read the visible "X connections" header so we know the target count
+    // and can show real progress / detect short reads.
+    const expectedTotal = await page.evaluate(() => {
+        const m = (document.body.innerText || '').match(/([\d,]+)\s+connections?/i);
+        return m ? Number(m[1].replace(/,/g, '')) : null;
+    });
+    if (expectedTotal) console.log(`[linkedin/fetch] page reports ${expectedTotal.toLocaleString()} total connections`);
+
+    // Drive infinite-scroll by repeatedly scrolling the last profile-link
+    // card into view. window.scrollTo(body.scrollHeight) doesn't trigger
+    // anything when the connections list lives inside an inner scroll
+    // container (the 2026 layout). scrollIntoView on the deepest visible
+    // /in/ link works regardless of which ancestor is scrollable.
+    let lastCount = 0, stableTicks = 0;
+    for (let i = 0; i < MAX_CONNECTIONS && stableTicks < 5; i++) {
+        const count = await page.evaluate(() => {
+            const links = Array.from(document.querySelectorAll('a[href*="/in/"]'))
+                .filter((a) => !a.closest('nav, header'));
+            if (links.length) {
+                links[links.length - 1].scrollIntoView({ block: 'end' });
+            }
+            // Belt-and-suspenders: also nudge window + main scrolling root.
+            try { window.scrollBy(0, 2000); } catch {}
+            try { (document.scrollingElement || document.documentElement).scrollTop += 2000; } catch {}
+            return links.length;
+        });
         await page.waitForTimeout(THROTTLE_MS);
-        const h = await page.evaluate(() => document.body.scrollHeight);
-        if (h === prevHeight) stableTicks++; else { stableTicks = 0; prevHeight = h; }
-        if (i % 5 === 0) setProgress('connections', i, -1);
+        if (count === lastCount) stableTicks++;
+        else { stableTicks = 0; lastCount = count; }
+        if (i % 5 === 0) setProgress('connections', count, expectedTotal || -1);
+        if (expectedTotal && count >= expectedTotal) break; // we have everything
     }
 
     let records = await page.evaluate((sels) => {
@@ -218,6 +242,20 @@ async function scrapeConnectionsList(page) {
             return out;
         });
         if (records.length > 0) console.log(`[linkedin/fetch] static selectors empty — fell back to href-walk and found ${records.length} connections`);
+    }
+
+    // Diagnostic: short read (got far fewer than the "X connections" header
+    // promised). Save HTML + screenshot so we can fix the scroll strategy or
+    // selector logic without another scrape round-trip.
+    if (expectedTotal && records.length < Math.min(expectedTotal * 0.5, expectedTotal - 5)) {
+        try {
+            const debugDir = path.join(LINKEDIN_DIR, '.debug');
+            fs.mkdirSync(debugDir, { recursive: true });
+            const ts = Date.now();
+            await page.screenshot({ path: path.join(debugDir, `connections-short-${ts}.png`), fullPage: true });
+            fs.writeFileSync(path.join(debugDir, `connections-short-${ts}.html`), await page.content());
+            console.log(`[linkedin/fetch] short read: scraped ${records.length} of ${expectedTotal} connections — diagnostic at ${debugDir}/connections-short-${ts}.{png,html}`);
+        } catch (e) { console.error('[linkedin/fetch] short-read debug failed:', e.message); }
     }
 
     setProgress('connections', records.length, records.length);
