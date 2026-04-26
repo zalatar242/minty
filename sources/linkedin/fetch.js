@@ -284,7 +284,29 @@ async function scrapeConnectionsList(page) {
         records = await page.evaluate(() => {
             const out = [];
             const SKIP_NAME = /^(Message|Follow|Connect|Pending|Withdraw|View profile|Show all|See all|Status is online|Mutual connections?|1st(\s+degree)?|2nd|3rd|\.\.\.|⋯)$/i;
-            const looksLikeName = (s) => s && s.length > 1 && s.length < 80 && !/[\n@:/]/.test(s) && !SKIP_NAME.test(s);
+            // Real names: 1-4 capitalized words separated by single spaces, with
+            // optional lowercase particles (de, la, von, der, di...). Anything
+            // longer is almost certainly headline-text bleeding in (LinkedIn
+            // links sometimes wrap the entire row, so a.textContent picks up
+            // the headline too — that's how we ended up with
+            // "Pierre Merzeau Entrepreneur pragmatique" as a single "name").
+            const PARTICLES = new Set(['de', 'la', 'von', 'der', 'di', 'da', 'el', 'le', 'van', 'den', 'al', 'du', 'des']);
+            const looksLikeName = (s) => {
+                if (!s || s.length < 2 || s.length > 60) return false;
+                if (/[\n@:/]/.test(s)) return false;
+                if (SKIP_NAME.test(s)) return false;
+                const words = s.split(/\s+/);
+                if (words.length === 0 || words.length > 4) return false;
+                for (const w of words) {
+                    if (!w) continue;
+                    if (PARTICLES.has(w.toLowerCase())) continue;
+                    // Non-particle words must start with a capital letter
+                    // (Latin or accented). Catches "Entrepreneur pragmatique"
+                    // because "pragmatique" is lowercase.
+                    if (!/^\p{Lu}/u.test(w)) return false;
+                }
+                return true;
+            };
 
             // Group anchors by slug — each connection gets ~2 anchors on the
             // page (avatar + name). We pick whichever has the most useful
@@ -306,15 +328,28 @@ async function scrapeConnectionsList(page) {
 
                 // Strategy 1: aria-label / aria-hidden span / direct text on
                 // any of the anchors (LinkedIn's accessible-name pattern
-                // varies by anchor — try each).
+                // varies by anchor — try each). Strip "View NAME's profile"
+                // boilerplate from aria-label since LinkedIn uses both that
+                // and the bare-name form across the page.
+                const tryExtractFromAria = (raw) => {
+                    if (!raw) return '';
+                    const t = raw.trim();
+                    const m = t.match(/^view\s+(.+?)(?:['']s\s+profile|\s+profile|,\s|$)/i);
+                    return m && m[1] ? m[1].trim() : t;
+                };
                 for (const a of anchors) {
-                    const aria = (a.getAttribute('aria-label') || '').trim();
+                    const aria = tryExtractFromAria(a.getAttribute('aria-label'));
                     if (looksLikeName(aria)) { fullName = aria; chosenAnchor = a; break; }
                     const hiddenSpan = a.querySelector('[aria-hidden="true"]');
                     const hiddenTxt = hiddenSpan ? (hiddenSpan.textContent || '').trim() : '';
                     if (looksLikeName(hiddenTxt)) { fullName = hiddenTxt; chosenAnchor = a; break; }
-                    const direct = (a.textContent || '').replace(/\s+/g, ' ').trim();
-                    if (looksLikeName(direct)) { fullName = direct; chosenAnchor = a; break; }
+                    // a.textContent includes ALL nested text, which is wrong
+                    // when the link wraps a whole row. Only use it when the
+                    // anchor itself is a leaf (no element children).
+                    if (a.children.length === 0) {
+                        const direct = (a.textContent || '').replace(/\s+/g, ' ').trim();
+                        if (looksLikeName(direct)) { fullName = direct; chosenAnchor = a; break; }
+                    }
                 }
 
                 // Strategy 2: card-climb. Stop when the parent owns >1
@@ -458,13 +493,21 @@ async function scrapeOneContactDetail(page, c) {
     return Object.assign({}, c, { email, connectedOn, location });
 }
 
-async function scrapeContactDetails(context, connections) {
+async function scrapeContactDetails(context, connections, opts = {}) {
     if (SKIP_DETAILS) return connections;
     const total = connections.length;
     const results = new Array(total);
-    // Shared cursor to allocate indices to workers; shared done counter for progress.
     let cursor = 0, done = 0;
     let sessionErr = null;
+    const onBatch = typeof opts.onBatch === 'function' ? opts.onBatch : null;
+    const batchEvery = Number(opts.batchEvery) || 50;
+
+    // Returns the in-progress full array — entries enriched so far, the rest
+    // fall back to the raw list record. So callers can write a partial CSV
+    // at any time without losing not-yet-detailed rows.
+    function snapshot() {
+        return connections.map((c, i) => results[i] || c);
+    }
 
     async function worker(workerIndex) {
         const page = workerIndex === 0 ? context.pages()[0] || await context.newPage() : await context.newPage();
@@ -481,6 +524,10 @@ async function scrapeContactDetails(context, connections) {
                 }
                 done++;
                 if (done % 10 === 0 || done === total) setProgress('details', done, total);
+                if (onBatch && (done % batchEvery === 0 || done === total)) {
+                    try { onBatch(snapshot(), done, total); }
+                    catch (e) { /* don't let a flush error kill the scrape */ }
+                }
                 await sleep(THROTTLE_MS);
             }
         } finally {
@@ -492,7 +539,6 @@ async function scrapeContactDetails(context, connections) {
     await Promise.all(Array.from({ length: workerCount }, (_, i) => worker(i)));
     if (sessionErr) throw sessionErr;
     setProgress('details', total, total);
-    // Preserve original order; any missing (race condition, shouldn't happen) falls back to input.
     return connections.map((c, i) => results[i] || c);
 }
 
@@ -849,7 +895,35 @@ async function run() {
                 console.log(`[linkedin/fetch] HTML dump at ${path.join(debugDir, `connections-empty-${ts}.html`)}`);
             } catch (e) { console.error('[linkedin/fetch] debug capture failed:', e.message); }
         }
-        const detailed = await scrapeContactDetails(context, listRecords);
+        // Early CSV flush — write list-only data BEFORE the slow detail
+        // pass. If the user Ctrl+C's during details, they keep all the
+        // names/URLs/occupations from the list phase. Detail-pass enrichment
+        // (email, location, connectedOn) layers in via incremental flushes
+        // every batchEvery completions.
+        if (listRecords.length > 0) {
+            try {
+                writeCsvAtomic(STAGING_DIR, 'Connections.csv',
+                    toCsvFile(CONNECTIONS_HEADER, connectionRowsToCsvMatrix(listRecords)));
+                console.log(`[linkedin/fetch] early-write Connections.csv with ${listRecords.length} rows (no detail enrichment yet)`);
+            } catch (e) {
+                console.error('[linkedin/fetch] early CSV write failed:', e.message);
+            }
+        }
+
+        const detailed = await scrapeContactDetails(context, listRecords, {
+            batchEvery: 50,
+            onBatch: (snapshot, done, total) => {
+                try {
+                    writeCsvAtomic(STAGING_DIR, 'Connections.csv',
+                        toCsvFile(CONNECTIONS_HEADER, connectionRowsToCsvMatrix(snapshot)));
+                    if (done % 250 === 0 || done === total) {
+                        console.log(`[linkedin/fetch] flushed Connections.csv at ${done}/${total} detail pass`);
+                    }
+                } catch (e) {
+                    console.error('[linkedin/fetch] incremental CSV flush failed:', e.message);
+                }
+            },
+        });
 
         // 4. Row-floor (Eng M3) then atomic write.
         try { enforceRowFloor('Connections.csv', detailed.length); }
