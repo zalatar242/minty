@@ -28,6 +28,25 @@ const { CONNECTIONS_HEADER, connectionRowsToCsvMatrix } = require('./parse-conne
 // for already-enriched contacts and naturally rate-limit our LinkedIn
 // queries. csv-parse is an optional dep — graceful no-op if missing.
 
+// Same shape as the in-page looksLikeName helper, but Node-runnable so we
+// can use it on CSV row data. KEEP IN SYNC with the version in
+// scrapeConnectionsList's evaluate block.
+const NAME_PARTICLES = new Set(['de', 'la', 'von', 'der', 'di', 'da', 'el', 'le', 'van', 'den', 'al', 'du', 'des']);
+const NAME_SKIP_RE = /^(Message|Follow|Connect|Pending|Withdraw|View profile|Show all|See all|Status is online|Mutual connections?|1st(\s+degree)?|2nd|3rd|\.\.\.|⋯)$/i;
+
+function looksLikeNameNode(s) {
+    if (!s || s.length < 2 || s.length > 60) return false;
+    if (/[\n@:/]/.test(s)) return false;
+    if (NAME_SKIP_RE.test(s)) return false;
+    const words = s.split(/\s+/).filter(Boolean);
+    if (words.length === 0 || words.length > 4) return false;
+    for (const w of words) {
+        if (NAME_PARTICLES.has(w.toLowerCase())) continue;
+        if (!/^\p{Lu}/u.test(w)) return false;
+    }
+    return true;
+}
+
 function loadEnrichedFromCsv(filepath) {
     if (!fs.existsSync(filepath)) return new Map();
     let parse;
@@ -39,6 +58,7 @@ function loadEnrichedFromCsv(filepath) {
         rows = parse(raw, { columns: true, skip_empty_lines: true, relax_column_count: true });
     } catch { return new Map(); }
     const out = new Map();
+    let excludedPolluted = 0;
     for (const r of rows) {
         const url = r['URL'] || '';
         const m = /\/in\/([^/?#]+)/.exec(url);
@@ -48,7 +68,22 @@ function loadEnrichedFromCsv(filepath) {
         // Skip if it's just a list-phase row (no detail fields).
         const hasDetail = !!(r['Location'] || r['Connected On'] || r['Email Address']);
         if (!hasDetail) continue;
+        // Pollution check: earlier versions of the href-walk parser captured
+        // headline text into the name fields, so "Last Name" ended up as
+        // e.g. "Merzeau Entrepreneur pragmatique". Re-validating the
+        // assembled fullName against the strict name shape catches those —
+        // polluted rows get excluded from the resume map so they're
+        // re-fetched on the next sync (one-time cleanup; cheap because
+        // most rows ARE clean once the parser is correct).
+        const fullName = ((r['First Name'] || '') + ' ' + (r['Last Name'] || '')).trim();
+        if (!looksLikeNameNode(fullName)) {
+            excludedPolluted++;
+            continue;
+        }
         out.set(m[1], r);
+    }
+    if (excludedPolluted > 0) {
+        console.log(`[linkedin/fetch] resume: excluded ${excludedPolluted} polluted-name rows from prior runs — they'll be re-fetched with the corrected parser`);
     }
     return out;
 }
