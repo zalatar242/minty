@@ -878,7 +878,10 @@ function startSyncDaemon(uuid, userDataDir) {
     function runLinkedInSync(reason) {
         if (!userConfig.isLinkedInAutosyncEnabled(userDataDir)) return;
         if (liChild) return;
-        if (notifications.isPaused(userDataDir, 'linkedin')) return;
+        // Manual triggers (UI button) bypass the paused-by-notification gate
+        // so the user can retry after re-auth without having to dismiss the
+        // banner first. Periodic ticks still respect it.
+        if (reason !== 'manual' && notifications.isPaused(userDataDir, 'linkedin')) return;
 
         const s = loadSyncState(statePath);
         if (reason === 'boot' && s.linkedin?.lastSyncAt

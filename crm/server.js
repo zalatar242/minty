@@ -2943,6 +2943,19 @@ async function handleTriggerSync(req, res, [source], paths, uuid) {
     if (!validSources.includes(source)) {
         return json(res, { error: 'Unknown source: ' + source }, 400);
     }
+    // When auto-sync is enabled for LinkedIn, "Sync now" should trigger a
+    // headless-browser scrape (fetch.js), not the ZIP importer. The default
+    // triggerSync() path runs import.js with a default EXPORT_DIR that has
+    // no CSVs, which is technically a no-op now but isn't what the user
+    // intends when they click the button.
+    if (source === 'linkedin' && userConfig.isLinkedInAutosyncEnabled(DATA)) {
+        const daemon = ensureSyncDaemon(uuid);
+        if (typeof daemon?.triggerLinkedInSync === 'function') {
+            daemon.triggerLinkedInSync();
+            return json(res, { ok: true, message: 'LinkedIn auto-sync started — progress will appear in the toast.' });
+        }
+        return json(res, { ok: false, message: 'Auto-sync daemon not ready — try reloading the page.' }, 503);
+    }
     try {
         const result = await triggerSync(uuid, source, getUserDataDir(uuid));
         json(res, result);
